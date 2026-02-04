@@ -380,7 +380,8 @@ git_read_branch_fast :: proc(dir: string) -> (branch: string, ok: bool) {
 /* State Cache (prevents flicker during API calls)                                    */
 /* ---------------------------------------------------------------------------------- */
 
-CACHE_PATH :: "/dev/shm/statusline-cache"
+// Cache path includes grandparent PID (Claude's PID) to isolate multiple instances
+CACHE_PATH_PREFIX :: "/dev/shm/statusline-cache."
 
 CachedState :: struct {
     used_pct:     i64,
@@ -388,8 +389,48 @@ CachedState :: struct {
     cost_usd:     f64,
 }
 
+// Get grandparent PID (Claude's PID) by reading /proc/<ppid>/status
+get_grandparent_pid :: proc() -> int {
+    ppid := int(posix.getppid())
+
+    // Read /proc/<ppid>/status to find grandparent
+    path_buf: [32]u8
+    path := fmt.bprintf(path_buf[:], "/proc/%d/status", ppid)
+    path_cstr := strings.clone_to_cstring(path, context.temp_allocator)
+
+    fd := posix.open(path_cstr, {})
+    if fd < 0 do return ppid  // fallback to parent
+    defer posix.close(fd)
+
+    buf: [1024]u8
+    n := posix.read(fd, raw_data(&buf), len(buf))
+    if n <= 0 do return ppid
+
+    content := string(buf[:n])
+    // Find "PPid:\t<number>"
+    ppid_prefix :: "PPid:\t"
+    idx := strings.index(content, ppid_prefix)
+    if idx < 0 do return ppid
+
+    start := idx + len(ppid_prefix)
+    rest := content[start:]
+    end := strings.index(rest, "\n")
+    if end < 0 do end = len(rest)
+
+    gppid, ok := strconv.parse_int(strings.trim_space(rest[:end]))
+    return ok ? gppid : ppid
+}
+
+get_cache_path :: proc() -> string {
+    @(static) path_buf: [64]u8
+    gppid := get_grandparent_pid()
+    return fmt.bprintf(path_buf[:], "%s%d", CACHE_PATH_PREFIX, gppid)
+}
+
 read_cached_state :: proc() -> CachedState {
-    fd := posix.open(CACHE_PATH, {})
+    cache_path := get_cache_path()
+    cache_cstr := strings.clone_to_cstring(cache_path, context.temp_allocator)
+    fd := posix.open(cache_cstr, {})
     if fd < 0 do return {}
     defer posix.close(fd)
 
@@ -401,12 +442,46 @@ read_cached_state :: proc() -> CachedState {
 }
 
 write_cached_state :: proc(state: CachedState) {
-    fd := posix.open(CACHE_PATH, {.WRONLY, .CREAT, .TRUNC}, {.IRUSR, .IWUSR})
+    cache_path := get_cache_path()
+    cache_cstr := strings.clone_to_cstring(cache_path, context.temp_allocator)
+    fd := posix.open(cache_cstr, {.WRONLY, .CREAT, .TRUNC}, {.IRUSR, .IWUSR})
     if fd < 0 do return
     defer posix.close(fd)
     s := state  // local copy so we can take address
     buf := transmute([^]u8)&s
     posix.write(fd, buf, size_of(CachedState))
+}
+
+// Clean up orphaned cache files from dead Claude processes
+cleanup_stale_caches :: proc() {
+    PREFIX :: "statusline-cache."
+    SHM_DIR :: "/dev/shm"
+
+    dir := posix.opendir(SHM_DIR)
+    if dir == nil do return
+    defer posix.closedir(dir)
+
+    for {
+        entry := posix.readdir(dir)
+        if entry == nil do break
+
+        name := string(cstring(&entry.d_name[0]))
+        if !strings.has_prefix(name, PREFIX) do continue
+
+        // Extract PID from filename
+        pid_str := name[len(PREFIX):]
+        pid, ok := strconv.parse_int(pid_str)
+        if !ok || pid <= 0 do continue
+
+        // Check if process is still alive (kill with signal 0 just checks, doesn't kill)
+        if posix.kill(posix.pid_t(pid), .NONE) == .OK do continue
+
+        // Process is dead, remove the cache file
+        path_buf: [64]u8
+        path := fmt.bprintf(path_buf[:], "%s/%s", SHM_DIR, name)
+        path_cstr := strings.clone_to_cstring(path, context.temp_allocator)
+        posix.unlink(path_cstr)
+    }
 }
 
 /* ---------------------------------------------------------------------------------- */
@@ -448,6 +523,9 @@ build_git_segment :: proc(buf: ^OutBuf, gs: ^GitStatus) {
 
 main :: proc() {
     t_start := time.tick_now()
+
+    // Clean up orphaned cache files from dead Claude processes
+    cleanup_stale_caches()
 
     // Read stdin
     input_buf: [8192]u8
