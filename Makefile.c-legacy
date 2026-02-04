@@ -1,0 +1,24 @@
+#~ nj: Claude Statusline Build
+
+CC       := cc
+CFLAGS   := -O3 -Wall -Wextra -Wno-unused-parameter -pthread
+LDFLAGS  := -pthread
+
+PREFIX   := $(HOME)/.claude
+BIN      := statusline
+
+.PHONY: all clean install
+
+all: $(BIN)
+
+$(BIN): statusline.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+clean:
+	rm -f $(BIN)
+
+install: $(BIN)
+	cp $(BIN) $(PREFIX)/$(BIN)
+	@echo "Installed to $(PREFIX)/$(BIN)"
+	@echo "Update ~/.claude/settings.json:"
+	@echo '  "statusLine": {"type": "command", "command": "$(PREFIX)/$(BIN)"}'
