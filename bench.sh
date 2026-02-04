@@ -1,13 +1,14 @@
 #!/bin/bash
 # Benchmark statusline implementations
 
-INPUT='{
-  "model": {"id": "claude-opus-4-5-20251101", "display_name": "Opus 4.5"},
-  "workspace": {"current_dir": "/home/nathanjones/Projects/mysuu-portal"},
-  "cost": {"total_cost_usd": 0.64, "total_duration_ms": 295637, "total_lines_added": 156, "total_lines_removed": 23},
-  "context_window": {"used_percentage": 42, "input_tokens": 10, "output_tokens": 3, "cache_creation_input_tokens": 51, "cache_read_input_tokens": 47250},
-  "vim": {"mode": "INSERT"}
-}'
+CWD="$(pwd)"
+INPUT="{
+  \"model\": {\"id\": \"claude-opus-4-5-20251101\", \"display_name\": \"Opus 4.5\"},
+  \"workspace\": {\"current_dir\": \"$CWD\"},
+  \"cost\": {\"total_cost_usd\": 0.64, \"total_duration_ms\": 295637, \"total_lines_added\": 156, \"total_lines_removed\": 23},
+  \"context_window\": {\"used_percentage\": 42, \"input_tokens\": 10, \"output_tokens\": 3, \"cache_creation_input_tokens\": 51, \"cache_read_input_tokens\": 47250},
+  \"vim\": {\"mode\": \"INSERT\"}
+}"
 
 ITERATIONS=${1:-100}
 
