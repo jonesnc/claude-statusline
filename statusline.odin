@@ -5,6 +5,16 @@
 //
 // Build: odin build . -o:speed -out:statusline_odin
 // Usage: Set in ~/.claude/settings.json statusLine.command
+//
+// Shared state files:
+//   /dev/shm/statusline-cache.<gppid>   - Per-session cached state (cost, tokens, pct)
+//                                         to prevent flicker during API calls
+//   /dev/shm/statusline-cleanup         - Sentinel file; mtime tracks last cleanup run
+//                                         (cleanup runs every 5 minutes)
+//   /dev/shm/claude-git-<hash>          - Per-repo git status cache (modified/staged counts)
+//                                         keyed by FNV-1a hash of repo path, mtime-invalidated
+//   /tmp/statusline-<uid>/<pid>.log     - Per-user, per-session debug timing logs
+//                                         (only when STATUSLINE_DEBUG=1)
 
 package main
 
@@ -53,16 +63,18 @@ SEP_ROUND   :: "\uE0B4"  //
 SEP_FLAME   :: "\uE0C0"  //
 
 // Nerd Font icons
-ICON_BRANCH   :: "\uF126"   //  git branch
-ICON_FOLDER   :: "\uF07C"   //  folder open
-ICON_DOLLAR   :: "\uF155"   //  dollar
-ICON_TAG      :: "\uF02B"   //  tag
-ICON_CLOCK    :: "\uF017"   //  clock
-ICON_DIFF     :: "\uF440"   //  diff
-ICON_STASH    :: "\uF01C"   //  inbox/stash
-ICON_TOKENS   :: "\uF2DB"   //  microchip
-ICON_INSERT   :: "\uF040"   //  pencil (insert mode)
-ICON_NORMAL   :: "\uE7C5"   //  vim logo (normal mode)
+ICON_BRANCH    :: "\uF126"   //  git branch
+ICON_FOLDER    :: "\uF07C"   //  folder open
+ICON_DOLLAR    :: "\uF155"   //  dollar
+ICON_TAG       :: "\uF02B"   //  tag
+ICON_CLOCK     :: "\uF017"   //  clock
+ICON_DIFF      :: "\uF440"   //  diff
+ICON_STASH     :: "\uF01C"   //  inbox/stash
+ICON_TOKENS    :: "\uF2DB"   //  microchip
+ICON_INSERT    :: "\uF040"   //  pencil (insert mode)
+ICON_NORMAL    :: "\uE7C5"   //  vim logo (normal mode)
+ICON_STAGED    :: "\uF00C"   //  checkmark (staged)
+ICON_MODIFIED  :: "\uF040"   //  pencil (modified)
 
 /* ---------------------------------------------------------------------------------- */
 /* Output Buffer                                                                      */
@@ -141,15 +153,20 @@ segment_end :: proc(buf: ^OutBuf) {
 
 json_get_string :: proc(json: string, key: string) -> string {
     needle_buf: [256]u8
-    needle := fmt.bprintf(needle_buf[:], "\"%s\":\"", key)
+    needle := fmt.bprintf(needle_buf[:], "\"%s\":", key)
 
     start_idx := strings.index(json, needle)
     if start_idx < 0 do return ""
 
-    start   := start_idx + len(needle)
-    rest    := json[start:]
-    end_idx := strings.index(rest, "\"")
+    // Skip past key and colon, then whitespace
+    rest := strings.trim_left_space(json[start_idx + len(needle):])
 
+    // Expect opening quote
+    if len(rest) == 0 || rest[0] != '"' do return ""
+    rest = rest[1:]
+
+    // Find closing quote
+    end_idx := strings.index(rest, "\"")
     if end_idx < 0 do return ""
 
     return rest[:end_idx]
@@ -318,9 +335,12 @@ format_duration :: proc(ms: i64) -> string {
 /* ---------------------------------------------------------------------------------- */
 
 GitStatus :: struct {
-    valid:   bool,
-    branch:  string,
-    stashes: i64,
+    valid:      bool,
+    branch:     string,
+    stashes:    i64,
+    modified:   u32,
+    staged:     u32,
+    from_cache: bool,
 }
 
 git_read_stash_count :: proc(dir: string) -> i64 {
@@ -452,8 +472,22 @@ write_cached_state :: proc(state: CachedState) {
     posix.write(fd, buf, size_of(CachedState))
 }
 
+CLEANUP_INTERVAL_S :: 300  // 5 minutes
+
 // Clean up orphaned cache files from dead Claude processes
 cleanup_stale_caches :: proc() {
+    // Check if cleanup is due (sentinel file mtime)
+    sentinel_cstr: cstring = "/dev/shm/statusline-cleanup"
+    st: posix.stat_t
+    now_ms := current_time_ms()
+    if posix.stat(sentinel_cstr, &st) == .OK {
+        last_s := i64(st.st_mtim.tv_sec)
+        if now_ms / 1000 - last_s < CLEANUP_INTERVAL_S do return
+    }
+    // Touch sentinel
+    sentinel_fd := posix.open(sentinel_cstr, {.WRONLY, .CREAT, .TRUNC}, {.IRUSR, .IWUSR, .IRGRP, .IWGRP, .IROTH, .IWOTH})
+    if sentinel_fd >= 0 do posix.close(sentinel_fd)
+
     PREFIX :: "statusline-cache."
     SHM_DIR :: "/dev/shm"
 
@@ -482,6 +516,233 @@ cleanup_stale_caches :: proc() {
         path_cstr := strings.clone_to_cstring(path, context.temp_allocator)
         posix.unlink(path_cstr)
     }
+
+    // Clean up stale debug logs in per-user subdir
+    uid := posix.getuid()
+    log_dir_buf: [64]u8
+    log_dir := fmt.bprintf(log_dir_buf[:], "/tmp/statusline-%d", uid)
+    log_dir_cstr := strings.clone_to_cstring(log_dir, context.temp_allocator)
+
+    tmp_dir := posix.opendir(log_dir_cstr)
+    if tmp_dir == nil do return
+    defer posix.closedir(tmp_dir)
+
+    for {
+        entry := posix.readdir(tmp_dir)
+        if entry == nil do break
+
+        name := string(cstring(&entry.d_name[0]))
+        if !strings.has_suffix(name, ".log") do continue
+
+        // Filename is just <pid>.log
+        pid_str := strings.trim_suffix(name, ".log")
+        log_pid, ok := strconv.parse_int(pid_str)
+        if !ok || log_pid <= 0 do continue
+
+        if posix.kill(posix.pid_t(log_pid), .NONE) == .OK do continue
+
+        tmp_path_buf: [96]u8
+        tmp_path := fmt.bprintf(tmp_path_buf[:], "%s/%s", log_dir, name)
+        tmp_path_cstr := strings.clone_to_cstring(tmp_path, context.temp_allocator)
+        posix.unlink(tmp_path_cstr)
+    }
+}
+
+/* ---------------------------------------------------------------------------------- */
+/* Git Status Cache (shared across Claude instances via shm)                          */
+/* ---------------------------------------------------------------------------------- */
+
+GitCache :: struct #packed {
+    index_mtime_sec:  i64,  // .git/index mtime seconds
+    index_mtime_nsec: i64,  // .git/index mtime nanoseconds
+    modified:         u32,  // Unstaged modified files
+    staged:           u32,  // Staged files
+    untracked:        u32,  // Untracked files (unused, kept for future)
+    branch:           [64]u8,   // Branch name
+    repo_path:        [256]u8,  // Repo path (for validation)
+}
+
+// Simple hash of repo path to create shm name
+hash_path :: proc(path: string) -> u32 {
+    // FNV-1a hash
+    h: u32 = 2166136261
+    for c in path {
+        h ~= u32(c)
+        h *= 16777619
+    }
+    return h
+}
+
+get_git_cache_path :: proc(repo_path: string) -> string {
+    @(static) path_buf: [64]u8
+    h := hash_path(repo_path)
+    return fmt.bprintf(path_buf[:], "/dev/shm/claude-git-%08x", h)
+}
+
+current_time_ms :: proc() -> i64 {
+    ts: posix.timespec
+    posix.clock_gettime(.REALTIME, &ts)
+    return i64(ts.tv_sec) * 1000 + i64(ts.tv_nsec) / 1_000_000
+}
+
+CacheState :: enum { NONE, STALE, VALID }
+
+read_git_cache :: proc(repo_path: string) -> (cache: GitCache, state: CacheState) {
+    cache_path := get_git_cache_path(repo_path)
+    cache_cstr := strings.clone_to_cstring(cache_path, context.temp_allocator)
+
+    fd := posix.open(cache_cstr, {})
+    if fd < 0 do return {}, .NONE
+    defer posix.close(fd)
+
+    buf := transmute([^]u8)&cache
+    n := posix.read(fd, buf, size_of(GitCache))
+    if n != size_of(GitCache) do return {}, .NONE
+
+    // Validate repo path matches
+    cached_repo := string(cstring(&cache.repo_path[0]))
+    if cached_repo != repo_path do return {}, .NONE
+
+    // Stat .git/index to check if working tree changed
+    index_path := strings.concatenate({repo_path, "/.git/index"}, context.temp_allocator)
+    index_cstr := strings.clone_to_cstring(index_path, context.temp_allocator)
+    st: posix.stat_t
+    if posix.stat(index_cstr, &st) != .OK do return cache, .STALE
+
+    if i64(st.st_mtim.tv_sec) == cache.index_mtime_sec &&
+       i64(st.st_mtim.tv_nsec) == cache.index_mtime_nsec {
+        return cache, .VALID
+    }
+
+    return cache, .STALE
+}
+
+write_git_cache :: proc(repo_path: string, modified: u32, staged: u32) {
+    // Stat .git/index to capture current mtime
+    index_path := strings.concatenate({repo_path, "/.git/index"}, context.temp_allocator)
+    index_cstr := strings.clone_to_cstring(index_path, context.temp_allocator)
+    st: posix.stat_t
+    if posix.stat(index_cstr, &st) != .OK do return
+
+    cache: GitCache
+    cache.index_mtime_sec = i64(st.st_mtim.tv_sec)
+    cache.index_mtime_nsec = i64(st.st_mtim.tv_nsec)
+    cache.modified = modified
+    cache.staged = staged
+    copy(cache.repo_path[:], repo_path)
+
+    cache_path := get_git_cache_path(repo_path)
+    cache_cstr := strings.clone_to_cstring(cache_path, context.temp_allocator)
+
+    fd := posix.open(cache_cstr, {.WRONLY, .CREAT, .TRUNC}, {.IRUSR, .IWUSR, .IRGRP, .IROTH})
+    if fd < 0 do return
+    defer posix.close(fd)
+
+    buf := transmute([^]u8)&cache
+    posix.write(fd, buf, size_of(GitCache))
+}
+
+// Run git status --porcelain -uno via fork/exec (skips shell)
+run_git_status :: proc(repo_path: string) -> (modified: u32, staged: u32) {
+    pipe_fds: [2]posix.FD
+    if posix.pipe(&pipe_fds) != .OK do return 0, 0
+    pipe_read := pipe_fds[0]
+    pipe_write := pipe_fds[1]
+
+    pid := posix.fork()
+    if pid < 0 {
+        posix.close(pipe_read)
+        posix.close(pipe_write)
+        return 0, 0
+    }
+
+    if pid == 0 {
+        // Child: chdir, redirect stdout, exec git
+        posix.close(pipe_read)
+        repo_cstr := strings.clone_to_cstring(repo_path, context.temp_allocator)
+        posix.chdir(repo_cstr)
+        posix.dup2(pipe_write, 1)  // stdout
+        dev_null := posix.open("/dev/null", {.WRONLY})
+        if dev_null >= 0 do posix.dup2(dev_null, 2)  // stderr -> /dev/null
+        posix.close(pipe_write)
+
+        argv := []cstring{"git", "status", "--porcelain", "-uno", nil}
+        posix.execvp("git", raw_data(argv))
+        posix._exit(127)
+    }
+
+    // Parent: read output, parse, waitpid
+    posix.close(pipe_write)
+
+    buf: [4096]u8
+    total_read := 0
+    for {
+        remaining := len(buf) - total_read
+        if remaining <= 0 do break
+        n := posix.read(pipe_read, raw_data(buf[total_read:]), uint(remaining))
+        if n <= 0 do break
+        total_read += int(n)
+    }
+    posix.close(pipe_read)
+    posix.waitpid(pid, nil, {})
+
+    // Parse porcelain output line by line
+    // X = staged, Y = unstaged (no untracked with -uno)
+    output := string(buf[:total_read])
+    rest := output
+    for len(rest) > 0 {
+        nl := strings.index(rest, "\n")
+        line: string
+        if nl >= 0 {
+            line = rest[:nl]
+            rest = rest[nl + 1:]
+        } else {
+            line = rest
+            rest = ""
+        }
+        if len(line) < 2 do continue
+        if line[0] != ' ' && line[0] != '?' {
+            staged += 1
+        }
+        if line[1] != ' ' && line[1] != '?' {
+            modified += 1
+        }
+    }
+
+    return modified, staged
+}
+
+// Get git status with caching and background refresh
+get_git_status_cached :: proc(repo_path: string) -> (modified: u32, staged: u32, from_cache: bool) {
+    cache, state := read_git_cache(repo_path)
+
+    switch state {
+    case .VALID:
+        return cache.modified, cache.staged, true
+    case .STALE:
+        // Return stale data immediately, double-fork to refresh in background
+        bg_pid := posix.fork()
+        if bg_pid == 0 {
+            // First child: fork again so grandchild is orphaned (no zombie)
+            if posix.fork() == 0 {
+                // Grandchild: refresh cache and exit
+                m, s := run_git_status(repo_path)
+                write_git_cache(repo_path, m, s)
+            }
+            posix._exit(0)
+        }
+        if bg_pid > 0 {
+            posix.waitpid(bg_pid, nil, {})  // Reap first child immediately
+        }
+        return cache.modified, cache.staged, true
+    case .NONE:
+        // First-ever miss: block and run
+        modified, staged = run_git_status(repo_path)
+        write_git_cache(repo_path, modified, staged)
+        return modified, staged, false
+    }
+
+    return 0, 0, false
 }
 
 /* ---------------------------------------------------------------------------------- */
@@ -507,13 +768,29 @@ build_git_segment :: proc(buf: ^OutBuf, gs: ^GitStatus) {
     strings.write_string(&text, " ")
     strings.write_string(&text, truncate_branch(gs.branch, 20))
 
-    // Yellow = unknown status (we don't have staged/unstaged info)
-    segment(buf, ANSI_BG_YELLOW, ANSI_FG_BLACK, strings.to_string(text), false)
+    // Color based on status: green=clean, orange=dirty
+    bg: string
+    if gs.modified > 0 || gs.staged > 0 {
+        bg = ANSI_BG_ORANGE
+    } else {
+        bg = ANSI_BG_GREEN
+    }
+    segment(buf, bg, ANSI_FG_BLACK, strings.to_string(text), false)
 
-    if gs.stashes > 0 {
-        stash_text := strings.builder_make(context.temp_allocator)
-        fmt.sbprintf(&stash_text, "%s %d", ICON_STASH, gs.stashes)
-        segment(buf, ANSI_BG_DARK, ANSI_FG_WHITE, strings.to_string(stash_text), false)
+    // Show counts if any changes
+    if gs.staged > 0 || gs.modified > 0 || gs.stashes > 0 {
+        status_text := strings.builder_make(context.temp_allocator)
+        if gs.staged > 0 {
+            fmt.sbprintf(&status_text, "%s%s%d ", ANSI_FG_GREEN, ICON_STAGED, gs.staged)
+        }
+        if gs.modified > 0 {
+            fmt.sbprintf(&status_text, "%s%s%d ", ANSI_FG_ORANGE, ICON_MODIFIED, gs.modified)
+        }
+        if gs.stashes > 0 {
+            fmt.sbprintf(&status_text, "%s%s%d", ANSI_FG_PURPLE, ICON_STASH, gs.stashes)
+        }
+        status_str := strings.trim_right_space(strings.to_string(status_text))
+        segment(buf, ANSI_BG_DARK, "", status_str, false)
     }
 }
 
@@ -523,9 +800,14 @@ build_git_segment :: proc(buf: ^OutBuf, gs: ^GitStatus) {
 
 main :: proc() {
     t_start := time.tick_now()
+    debug := os.get_env("STATUSLINE_DEBUG", context.temp_allocator) != ""
+
+    // Timing checkpoints for debug
+    t_cleanup, t_read, t_parse, t_git, t_build: time.Tick
 
     // Clean up orphaned cache files from dead Claude processes
     cleanup_stale_caches()
+    if debug do t_cleanup = time.tick_now()
 
     // Read stdin
     input_buf: [8192]u8
@@ -540,6 +822,7 @@ main :: proc() {
     }
 
     input := string(input_buf[:input_len])
+    if debug do t_read = time.tick_now()
 
     // Parse JSON
     cwd               := json_get_string(input, "current_dir")
@@ -575,6 +858,7 @@ main :: proc() {
 
     // Vim mode (nested under "vim": {"mode": "..."}) - undocumented feature
     vim_mode := json_get_string(input, "mode")
+    if debug do t_parse = time.tick_now()
 
     // Git status
     gs: GitStatus
@@ -582,7 +866,9 @@ main :: proc() {
         gs.valid = true
         gs.branch = branch
         gs.stashes = git_read_stash_count(cwd)
+        gs.modified, gs.staged, gs.from_cache = get_git_status_cached(cwd)
     }
+    if debug do t_git = time.tick_now()
 
     // Build output
     buf: OutBuf
@@ -670,14 +956,53 @@ main :: proc() {
     segment(&buf, ANSI_BG_DARK, "", bar, false)
 
     segment_end(&buf)
+    if debug do t_build = time.tick_now()
 
     // Timing suffix (after segments, with spacing)
     t_now := time.tick_now()
     total_us := i64(time.duration_microseconds(time.tick_diff(t_start, t_now)))
     timing_buf: [64]u8
-    timing_str := fmt.bprintf(timing_buf[:], "  %s%dus%s", ANSI_FG_COMMENT, total_us, ANSI_RESET)
+    timing_str: string
+    if total_us >= 1000 {
+        timing_str = fmt.bprintf(timing_buf[:], "  %s%.1fms%s", ANSI_FG_COMMENT, f64(total_us) / 1000.0, ANSI_RESET)
+    } else {
+        timing_str = fmt.bprintf(timing_buf[:], "  %s%dus%s", ANSI_FG_COMMENT, total_us, ANSI_RESET)
+    }
     out_str(&buf, timing_str)
 
     // Output
     posix.write(1, raw_data(&buf.data), uint(buf.len))
+
+    // Debug timing output to per-process log file (append)
+    if debug {
+        t_end := time.tick_now()
+        gppid := get_grandparent_pid()
+        cache_str := gs.from_cache ? "hit" : "miss"
+        debug_buf: [512]u8
+        debug_str := fmt.bprintf(debug_buf[:],
+            "cleanup=%dus read=%dus parse=%dus git=%dus(%s) build=%dus total=%dus\n",
+            i64(time.duration_microseconds(time.tick_diff(t_start, t_cleanup))),
+            i64(time.duration_microseconds(time.tick_diff(t_cleanup, t_read))),
+            i64(time.duration_microseconds(time.tick_diff(t_read, t_parse))),
+            i64(time.duration_microseconds(time.tick_diff(t_parse, t_git))),
+            cache_str,
+            i64(time.duration_microseconds(time.tick_diff(t_git, t_build))),
+            i64(time.duration_microseconds(time.tick_diff(t_start, t_end))))
+
+        uid := posix.getuid()
+        // Ensure per-user log dir exists
+        dir_buf: [64]u8
+        dir_path := fmt.bprintf(dir_buf[:], "/tmp/statusline-%d", uid)
+        dir_cstr := strings.clone_to_cstring(dir_path, context.temp_allocator)
+        posix.mkdir(dir_cstr, {.IRUSR, .IWUSR, .IXUSR})  // ok if exists
+
+        log_path_buf: [96]u8
+        log_path := fmt.bprintf(log_path_buf[:], "%s/%d.log", dir_path, gppid)
+        log_cstr := strings.clone_to_cstring(log_path, context.temp_allocator)
+        log_fd := posix.open(log_cstr, {.WRONLY, .CREAT, .APPEND}, {.IRUSR, .IWUSR})
+        if log_fd >= 0 {
+            posix.write(log_fd, raw_data(debug_buf[:]), uint(len(debug_str)))
+            posix.close(log_fd)
+        }
+    }
 }
