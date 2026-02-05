@@ -3,11 +3,11 @@
 
 CWD="$(pwd)"
 INPUT="{
-  \"model\": {\"id\": \"claude-opus-4-5-20251101\", \"display_name\": \"Opus 4.5\"},
+  \"model\": {\"id\": \"claude-sonnet-4-20250514\", \"display_name\": \"Sonnet 4\"},
   \"workspace\": {\"current_dir\": \"$CWD\"},
-  \"cost\": {\"total_cost_usd\": 0.64, \"total_duration_ms\": 295637, \"total_lines_added\": 156, \"total_lines_removed\": 23},
-  \"context_window\": {\"used_percentage\": 42, \"input_tokens\": 10, \"output_tokens\": 3, \"cache_creation_input_tokens\": 51, \"cache_read_input_tokens\": 47250},
-  \"vim\": {\"mode\": \"INSERT\"}
+  \"cost\": {\"total_cost_usd\": 2.47, \"total_duration_ms\": 847293, \"total_lines_added\": 312, \"total_lines_removed\": 89},
+  \"context_window\": {\"used_percentage\": 67, \"input_tokens\": 89432, \"output_tokens\": 12847, \"cache_creation_input_tokens\": 24680, \"cache_read_input_tokens\": 156320},
+  \"vim\": {\"mode\": \"NORMAL\"}
 }"
 
 ITERATIONS=${1:-100}
@@ -55,3 +55,19 @@ else
     DIFF=$(echo "scale=1; $C_TIME * 100 / $ODIN_TIME - 100" | bc)
     echo "Odin is ${DIFF}% faster"
 fi
+
+echo ""
+echo "======================================================================="
+echo "Odin Profiling (single run with STATUSLINE_DEBUG=1):"
+echo "======================================================================="
+echo ""
+
+# First run - cache miss (clears any existing cache)
+rm -f /dev/shm/claude-git-* 2>/dev/null
+echo "Cache MISS (first run):"
+echo "$INPUT" | STATUSLINE_DEBUG=1 ./statusline_odin 2>&1 | grep -E "^timing:" | sed 's/^/  /'
+echo ""
+
+# Second run - cache hit
+echo "Cache HIT (second run):"
+echo "$INPUT" | STATUSLINE_DEBUG=1 ./statusline_odin 2>&1 | grep -E "^timing:" | sed 's/^/  /'
