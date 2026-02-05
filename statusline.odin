@@ -585,6 +585,8 @@ current_time_ms :: proc() -> i64 {
     return i64(ts.tv_sec) * 1000 + i64(ts.tv_nsec) / 1_000_000
 }
 
+GIT_CACHE_TTL_MS :: 2000  // Working tree changes don't touch .git/index; TTL catches them
+
 CacheState :: enum { NONE, STALE, VALID }
 
 read_git_cache :: proc(repo_path: string) -> (cache: GitCache, state: CacheState) {
@@ -603,7 +605,13 @@ read_git_cache :: proc(repo_path: string) -> (cache: GitCache, state: CacheState
     cached_repo := string(cstring(&cache.repo_path[0]))
     if cached_repo != repo_path do return {}, .NONE
 
-    // Stat .git/index to check if working tree changed
+    // TTL: stat the cache file itself — its mtime is when we last wrote it
+    cache_st: posix.stat_t
+    if posix.fstat(fd, &cache_st) != .OK do return cache, .STALE
+    cache_age_ms := current_time_ms() - (i64(cache_st.st_mtim.tv_sec) * 1000 + i64(cache_st.st_mtim.tv_nsec) / 1_000_000)
+    if cache_age_ms > GIT_CACHE_TTL_MS do return cache, .STALE
+
+    // .git/index mtime: catches git add/commit/stash immediately (within TTL window)
     index_path := strings.concatenate({repo_path, "/.git/index"}, context.temp_allocator)
     index_cstr := strings.clone_to_cstring(index_path, context.temp_allocator)
     st: posix.stat_t
