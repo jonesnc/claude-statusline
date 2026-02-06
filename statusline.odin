@@ -7,8 +7,9 @@
 // Usage: Set in ~/.claude/settings.json statusLine.command
 //
 // Shared state files:
-//   /dev/shm/statusline-cache.<gppid>   - Per-session cached state (cost, tokens, pct)
-//                                         to prevent flicker during API calls
+//   /dev/shm/statusline-cache.<gppid>   - Per-session cached state (cost, tokens, pct, cwd,
+//                                         model, lines, duration) to prevent flicker during
+//                                         API calls and serve as fallback on stdin timeout
 //   /dev/shm/statusline-cleanup         - Sentinel file; mtime tracks last cleanup run
 //                                         (cleanup runs every 5 minutes)
 //   /dev/shm/claude-git-<hash>          - Per-repo git status cache (modified/staged counts)
@@ -335,12 +336,12 @@ format_duration :: proc(ms: i64) -> string {
 /* ---------------------------------------------------------------------------------- */
 
 GitStatus :: struct {
-    valid:      bool,
-    branch:     string,
-    stashes:    i64,
-    modified:   u32,
-    staged:     u32,
-    from_cache: bool,
+    valid:       bool,
+    branch:      string,
+    stashes:     i64,
+    modified:    u32,
+    staged:      u32,
+    cache_state: CacheState,
 }
 
 git_read_stash_count :: proc(dir: string) -> i64 {
@@ -403,10 +404,15 @@ git_read_branch_fast :: proc(dir: string) -> (branch: string, ok: bool) {
 // Cache path includes grandparent PID (Claude's PID) to isolate multiple instances
 CACHE_PATH_PREFIX :: "/dev/shm/statusline-cache."
 
-CachedState :: struct {
+CachedState :: struct #packed {
     used_pct:       i64,
     context_size:   i64,
     cost_usd:       f64,
+    lines_added:    i64,
+    lines_removed:  i64,
+    duration_ms:    i64,
+    cwd:            [256]u8,
+    model:          [64]u8,
 }
 
 // Get grandparent PID (Claude's PID) by reading /proc/<ppid>/status
@@ -585,7 +591,7 @@ current_time_ms :: proc() -> i64 {
     return i64(ts.tv_sec) * 1000 + i64(ts.tv_nsec) / 1_000_000
 }
 
-GIT_CACHE_TTL_MS :: 2000  // Working tree changes don't touch .git/index; TTL catches them
+GIT_CACHE_TTL_MS :: 5000  // Working tree changes don't touch .git/index; TTL catches them
 
 CacheState :: enum { NONE, STALE, VALID }
 
@@ -721,12 +727,12 @@ run_git_status :: proc(repo_path: string) -> (modified: u32, staged: u32) {
 }
 
 // Get git status with caching and background refresh
-get_git_status_cached :: proc(repo_path: string) -> (modified: u32, staged: u32, from_cache: bool) {
-    cache, state := read_git_cache(repo_path)
+get_git_status_cached :: proc(repo_path: string) -> (modified: u32, staged: u32, state: CacheState) {
+    cache, cache_state := read_git_cache(repo_path)
 
-    switch state {
+    switch cache_state {
     case .VALID:
-        return cache.modified, cache.staged, true
+        return cache.modified, cache.staged, .VALID
     case .STALE:
         // Return stale data immediately, double-fork to refresh in background
         bg_pid := posix.fork()
@@ -742,15 +748,15 @@ get_git_status_cached :: proc(repo_path: string) -> (modified: u32, staged: u32,
         if bg_pid > 0 {
             posix.waitpid(bg_pid, nil, {})  // Reap first child immediately
         }
-        return cache.modified, cache.staged, true
+        return cache.modified, cache.staged, .STALE
     case .NONE:
         // First-ever miss: block and run
         modified, staged = run_git_status(repo_path)
         write_git_cache(repo_path, modified, staged)
-        return modified, staged, false
+        return modified, staged, .NONE
     }
 
-    return 0, 0, false
+    return 0, 0, .NONE
 }
 
 /* ---------------------------------------------------------------------------------- */
@@ -802,176 +808,297 @@ build_git_segment :: proc(buf: ^OutBuf, gs: ^GitStatus) {
     }
 }
 
+
 /* ---------------------------------------------------------------------------------- */
-/* Main                                                                               */
+/* Display State                                                                      */
 /* ---------------------------------------------------------------------------------- */
 
-main :: proc() {
-    t_start := time.tick_now()
-    debug := os.get_env("STATUSLINE_DEBUG", context.temp_allocator) != ""
+DisplayState :: struct {
+    cwd:               string,
+    model:             string,
+    cost_usd:          f64,
+    lines_added:       i64,
+    lines_removed:     i64,
+    total_duration_ms: i64,
+    used_pct:          i64,
+    ctx_size:          i64,
+    vim_mode:          string,
+}
 
-    // Timing checkpoints for debug
-    t_cleanup, t_read, t_parse, t_git, t_build: time.Tick
+DebugTimings :: struct {
+    t_start, t_cleanup, t_read, t_parse, t_git, t_build: time.Tick,
+}
 
-    // Clean up orphaned cache files from dead Claude processes
-    cleanup_stale_caches()
-    if debug do t_cleanup = time.tick_now()
+/* ---------------------------------------------------------------------------------- */
+/* Stdin Reader                                                                       */
+/* ---------------------------------------------------------------------------------- */
 
-    // Read stdin
-    input_buf: [8192]u8
+STDIN_TIMEOUT_MS :: 50
+
+read_stdin :: proc() -> (string, bool) {
+    @(static) input_buf: [8192]u8
     input_len := 0
 
-    for {
-        remaining := len(input_buf) - input_len - 1
-        if remaining <= 0 do break
-        n := posix.read(0, raw_data(input_buf[input_len:]), uint(remaining))
-        if n <= 0 do break
-        input_len += int(n)
+    pfds := [1]posix.pollfd{{fd = 0, events = {.IN}}}
+    if posix.poll(raw_data(&pfds), 1, STDIN_TIMEOUT_MS) > 0 {
+        for {
+            remaining := len(input_buf) - input_len - 1
+            if remaining <= 0 do break
+            n := posix.read(0, raw_data(input_buf[input_len:]), uint(remaining))
+            if n <= 0 do break
+            input_len += int(n)
+        }
+        return string(input_buf[:input_len]), false
+    }
+    return "", true
+}
+
+/* ---------------------------------------------------------------------------------- */
+/* State Resolution (JSON + Cache Merge)                                              */
+/* ---------------------------------------------------------------------------------- */
+
+resolve_state :: proc(input: string, stdin_timeout: bool) -> DisplayState {
+    @(static) cached: CachedState
+    cached = read_cached_state()
+    state: DisplayState
+
+    if !stdin_timeout {
+        json_cwd           := json_get_string(input, "current_dir")
+        json_model         := json_get_string(input, "display_name")
+        json_cost          := json_get_float(input, "total_cost_usd")
+        json_lines_added   := json_get_number(input, "total_lines_added")
+        json_lines_removed := json_get_number(input, "total_lines_removed")
+        json_duration      := json_get_number(input, "total_duration_ms")
+        json_pct           := json_get_number(input, "used_percentage")
+        json_ctx_size      := json_get_number(input, "context_window_size")
+        state.vim_mode      = json_get_string(input, "mode")
+
+        // Overlay non-zero JSON with cache (prevents flicker during API calls)
+        state.cwd               = len(json_cwd) > 0 ? json_cwd : string(cstring(&cached.cwd[0]))
+        state.model             = len(json_model) > 0 ? json_model : string(cstring(&cached.model[0]))
+        state.cost_usd          = json_cost > 0 ? json_cost : cached.cost_usd
+        state.lines_added       = json_lines_added > 0 ? json_lines_added : cached.lines_added
+        state.lines_removed     = json_lines_removed > 0 ? json_lines_removed : cached.lines_removed
+        state.total_duration_ms = json_duration > 0 ? json_duration : cached.duration_ms
+        state.used_pct          = json_pct > 0 ? json_pct : cached.used_pct
+        state.ctx_size          = json_ctx_size > 0 ? json_ctx_size : cached.context_size
+
+        // Update full-snapshot cache
+        new_cache: CachedState
+        new_cache.used_pct      = max(json_pct, cached.used_pct)
+        new_cache.context_size  = max(json_ctx_size, cached.context_size)
+        new_cache.cost_usd      = max(json_cost, cached.cost_usd)
+        new_cache.lines_added   = max(json_lines_added, cached.lines_added)
+        new_cache.lines_removed = max(json_lines_removed, cached.lines_removed)
+        new_cache.duration_ms   = max(json_duration, cached.duration_ms)
+        if len(json_cwd) > 0 {
+            copy(new_cache.cwd[:len(new_cache.cwd)-1], json_cwd)
+        } else {
+            new_cache.cwd = cached.cwd
+        }
+        if len(json_model) > 0 {
+            copy(new_cache.model[:len(new_cache.model)-1], json_model)
+        } else {
+            new_cache.model = cached.model
+        }
+        if new_cache != cached {
+            write_cached_state(new_cache)
+        }
+    } else {
+        // Stdin timeout: render entirely from cached snapshot
+        state.cwd               = string(cstring(&cached.cwd[0]))
+        state.model             = string(cstring(&cached.model[0]))
+        state.cost_usd          = cached.cost_usd
+        state.lines_added       = cached.lines_added
+        state.lines_removed     = cached.lines_removed
+        state.total_duration_ms = cached.duration_ms
+        state.used_pct          = cached.used_pct
+        state.ctx_size          = cached.context_size
     }
 
-    input := string(input_buf[:input_len])
-    if debug do t_read = time.tick_now()
+    return state
+}
 
-    // Parse JSON
-    cwd               := json_get_string(input, "current_dir")
-    model             := json_get_string(input, "display_name")
-    json_cost         := json_get_float( input, "total_cost_usd")
-    lines_added       := json_get_number(input, "total_lines_added")
-    lines_removed     := json_get_number(input, "total_lines_removed")
-    total_duration_ms := json_get_number(input, "total_duration_ms")
-    json_pct          := json_get_number(input, "used_percentage")
-    json_ctx_size     := json_get_number(input, "context_window_size")
+/* ---------------------------------------------------------------------------------- */
+/* Statusline Builder                                                                 */
+/* ---------------------------------------------------------------------------------- */
 
-    // Start with cached values, overlay non-zero JSON values
-    // This prevents flicker when Claude sends partial/empty updates during API calls
-    cached := read_cached_state()
-    used_pct     := json_pct > 0 ? json_pct : cached.used_pct
-    ctx_size     := json_ctx_size > 0 ? json_ctx_size : cached.context_size
-    cost_usd     := json_cost > 0 ? json_cost : cached.cost_usd
+build_statusline :: proc(buf: ^OutBuf, state: ^DisplayState, gs: ^GitStatus) {
+    first := true
 
-    // Update cache with any new non-zero values
-    new_cache := CachedState{
-        used_pct     = max(json_pct, cached.used_pct),
-        context_size = max(json_ctx_size, cached.context_size),
-        cost_usd     = max(json_cost, cached.cost_usd),
-    }
-    if new_cache != cached {
-        write_cached_state(new_cache)
-    }
-
-    // Vim mode (nested under "vim": {"mode": "..."}) - undocumented feature
-    vim_mode := json_get_string(input, "mode")
-    if debug do t_parse = time.tick_now()
-
-    // Git status
-    gs: GitStatus
-    if branch, ok := git_read_branch_fast(cwd); ok {
-        gs.valid = true
-        gs.branch = branch
-        gs.stashes = git_read_stash_count(cwd)
-        gs.modified, gs.staged, gs.from_cache = get_git_status_cached(cwd)
-    }
-    if debug do t_git = time.tick_now()
-
-    // Build output
-    buf: OutBuf
-
-    // Vim mode (first, as primary state indicator) - undocumented feature
-    if len(vim_mode) > 0 {
+    // Vim mode (first, as primary state indicator)
+    if len(state.vim_mode) > 0 {
         vim_bg, vim_fg, vim_icon: string
-        is_insert := vim_mode == "INSERT"
+        is_insert := state.vim_mode == "INSERT"
         if is_insert {
             vim_bg = ANSI_BG_GREEN
             vim_fg = ANSI_FG_BLACK
             vim_icon = ICON_INSERT
         } else {
-            // NORMAL mode (default)
             vim_bg = ANSI_BG_DARK
             vim_fg = ANSI_FG_WHITE
             vim_icon = ICON_NORMAL
         }
         vim_text := strings.builder_make(context.temp_allocator)
         if is_insert {
-            fmt.sbprintf(&vim_text, "%s%s %s", ANSI_BOLD, vim_icon, vim_mode)
+            fmt.sbprintf(&vim_text, "%s%s %s", ANSI_BOLD, vim_icon, state.vim_mode)
         } else {
-            fmt.sbprintf(&vim_text, "%s %s", vim_icon, vim_mode)
+            fmt.sbprintf(&vim_text, "%s %s", vim_icon, state.vim_mode)
         }
-        segment(&buf, vim_bg, vim_fg, strings.to_string(vim_text), true)
+        segment(buf, vim_bg, vim_fg, strings.to_string(vim_text), first)
+        first = false
     }
 
     // Model (bold)
     model_text := strings.builder_make(context.temp_allocator)
     strings.write_string(&model_text, ANSI_BOLD)
-    strings.write_string(&model_text, model)
-    segment(&buf, ANSI_BG_PURPLE, ANSI_FG_BLACK, strings.to_string(model_text), len(vim_mode) == 0)
+    strings.write_string(&model_text, state.model)
+    segment(buf, ANSI_BG_PURPLE, ANSI_FG_BLACK, strings.to_string(model_text), first)
+    first = false
 
     // Path
     path_text := strings.builder_make(context.temp_allocator)
-    fmt.sbprintf(&path_text, "%s %s", ICON_FOLDER, abbrev_path(cwd))
-    segment(&buf, ANSI_BG_DARK, ANSI_FG_WHITE, strings.to_string(path_text), false)
+    fmt.sbprintf(&path_text, "%s %s", ICON_FOLDER, abbrev_path(state.cwd))
+    segment(buf, ANSI_BG_DARK, ANSI_FG_WHITE, strings.to_string(path_text), false)
 
     // Git
     if gs.valid {
-        build_git_segment(&buf, &gs)
+        build_git_segment(buf, gs)
     }
 
     // Cost
     cost_bg: string
-    if cost_usd >= 10.0 {
+    if state.cost_usd >= 10.0 {
         cost_bg = ANSI_BG_RED
-    } else if cost_usd >= 5.0 {
+    } else if state.cost_usd >= 5.0 {
         cost_bg = ANSI_BG_ORANGE
-    } else if cost_usd >= 1.0 {
+    } else if state.cost_usd >= 1.0 {
         cost_bg = ANSI_BG_CYAN
     } else {
         cost_bg = ANSI_BG_MINT
     }
-
     cost_text := strings.builder_make(context.temp_allocator)
-    fmt.sbprintf(&cost_text, "%s %.2f", ICON_DOLLAR, cost_usd)
-    segment(&buf, cost_bg, ANSI_FG_BLACK, strings.to_string(cost_text), false)
+    fmt.sbprintf(&cost_text, "%s %.2f", ICON_DOLLAR, state.cost_usd)
+    segment(buf, cost_bg, ANSI_FG_BLACK, strings.to_string(cost_text), false)
 
     // Lines changed
-    if lines_added > 0 || lines_removed > 0 {
+    if state.lines_added > 0 || state.lines_removed > 0 {
         lines_text := strings.builder_make(context.temp_allocator)
         fmt.sbprintf(&lines_text, "%s%s %s+%d %s-%d",
-            ANSI_FG_WHITE, ICON_DIFF, ANSI_FG_GREEN, lines_added, ANSI_FG_RED, lines_removed)
-        segment(&buf, ANSI_BG_DARK, "", strings.to_string(lines_text), false)
+            ANSI_FG_WHITE, ICON_DIFF,
+            ANSI_FG_GREEN, state.lines_added,
+            ANSI_FG_RED, state.lines_removed)
+        segment(buf, ANSI_BG_DARK, "", strings.to_string(lines_text), false)
     }
 
     // Session duration
-    if total_duration_ms > 0 {
+    if state.total_duration_ms > 0 {
         dur_text := strings.builder_make(context.temp_allocator)
-        fmt.sbprintf(&dur_text, "%s %s", ICON_CLOCK, format_duration(total_duration_ms))
-        segment(&buf, ANSI_BG_DARK, ANSI_FG_WHITE, strings.to_string(dur_text), false)
+        fmt.sbprintf(&dur_text, "%s %s", ICON_CLOCK, format_duration(state.total_duration_ms))
+        segment(buf, ANSI_BG_DARK, ANSI_FG_WHITE, strings.to_string(dur_text), false)
     }
 
     // Token count (used/total context window)
-    if ctx_size > 0 && used_pct > 0 {
+    if state.ctx_size > 0 && state.used_pct > 0 {
         tok_text := strings.builder_make(context.temp_allocator)
-        used_tokens := used_pct * ctx_size / 100
+        used_tokens := state.used_pct * state.ctx_size / 100
         used_k := f64(used_tokens) / 1000.0
         strings.write_string(&tok_text, ICON_TOKENS)
         strings.write_string(&tok_text, " ")
         fmt.sbprintf(&tok_text, "%.0fk/", used_k)
-        if ctx_size >= 1_000_000 {
-            fmt.sbprintf(&tok_text, "%dM", ctx_size / 1_000_000)
+        if state.ctx_size >= 1_000_000 {
+            fmt.sbprintf(&tok_text, "%dM", state.ctx_size / 1_000_000)
         } else {
-            fmt.sbprintf(&tok_text, "%dk", ctx_size / 1000)
+            fmt.sbprintf(&tok_text, "%dk", state.ctx_size / 1000)
         }
-        segment(&buf, ANSI_BG_COMMENT, ANSI_FG_WHITE, strings.to_string(tok_text), false)
+        segment(buf, ANSI_BG_COMMENT, ANSI_FG_WHITE, strings.to_string(tok_text), false)
     }
 
     // Progress bar (cached value prevents flicker during API calls)
-    bar := make_progress_bar(used_pct)
-    segment(&buf, ANSI_BG_DARK, "", bar, false)
+    bar := make_progress_bar(state.used_pct)
+    segment(buf, ANSI_BG_DARK, "", bar, false)
 
-    segment_end(&buf)
-    if debug do t_build = time.tick_now()
+    segment_end(buf)
+}
 
-    // Timing suffix (after segments, with spacing)
+/* ---------------------------------------------------------------------------------- */
+/* Debug Logging                                                                      */
+/* ---------------------------------------------------------------------------------- */
+
+write_debug_log :: proc(timings: ^DebugTimings, gs: ^GitStatus, stdin_timeout: bool) {
+    t_end := time.tick_now()
+    gppid := get_grandparent_pid()
+    cache_str: string
+    switch gs.cache_state {
+    case .VALID: cache_str = "valid"
+    case .STALE: cache_str = "stale"
+    case .NONE:  cache_str = "miss"
+    }
+    stdin_str := stdin_timeout ? "timeout" : "ok"
+    debug_buf: [512]u8
+    debug_str := fmt.bprintf(debug_buf[:],
+        "cleanup=%dus read=%dus(%s) parse=%dus git=%dus(%s) build=%dus total=%dus\n",
+        i64(time.duration_microseconds(time.tick_diff(timings.t_start, timings.t_cleanup))),
+        i64(time.duration_microseconds(time.tick_diff(timings.t_cleanup, timings.t_read))),
+        stdin_str,
+        i64(time.duration_microseconds(time.tick_diff(timings.t_read, timings.t_parse))),
+        i64(time.duration_microseconds(time.tick_diff(timings.t_parse, timings.t_git))),
+        cache_str,
+        i64(time.duration_microseconds(time.tick_diff(timings.t_git, timings.t_build))),
+        i64(time.duration_microseconds(time.tick_diff(timings.t_start, t_end))))
+
+    uid := posix.getuid()
+    dir_buf: [64]u8
+    dir_path := fmt.bprintf(dir_buf[:], "/tmp/statusline-%d", uid)
+    dir_cstr := strings.clone_to_cstring(dir_path, context.temp_allocator)
+    posix.mkdir(dir_cstr, {.IRUSR, .IWUSR, .IXUSR})
+
+    log_path_buf: [96]u8
+    log_path := fmt.bprintf(log_path_buf[:], "%s/%d.log", dir_path, gppid)
+    log_cstr := strings.clone_to_cstring(log_path, context.temp_allocator)
+    log_fd := posix.open(log_cstr, {.WRONLY, .CREAT, .APPEND}, {.IRUSR, .IWUSR})
+    if log_fd >= 0 {
+        posix.write(log_fd, raw_data(debug_buf[:]), uint(len(debug_str)))
+        posix.close(log_fd)
+    }
+}
+
+/* ---------------------------------------------------------------------------------- */
+/* Main                                                                               */
+/* ---------------------------------------------------------------------------------- */
+
+main :: proc() {
+    timings: DebugTimings
+    timings.t_start = time.tick_now()
+    debug := os.get_env("STATUSLINE_DEBUG", context.temp_allocator) != ""
+
+    cleanup_stale_caches()
+    if debug do timings.t_cleanup = time.tick_now()
+
+    input, stdin_timeout := read_stdin()
+    if debug do timings.t_read = time.tick_now()
+
+    state := resolve_state(input, stdin_timeout)
+    if debug do timings.t_parse = time.tick_now()
+
+    // Git status
+    gs: GitStatus
+    if branch, ok := git_read_branch_fast(state.cwd); ok {
+        gs.valid = true
+        gs.branch = branch
+        gs.stashes = git_read_stash_count(state.cwd)
+        gs.modified, gs.staged, gs.cache_state = get_git_status_cached(state.cwd)
+    }
+    if debug do timings.t_git = time.tick_now()
+
+    // Build and output
+    buf: OutBuf
+    build_statusline(&buf, &state, &gs)
+    if debug do timings.t_build = time.tick_now()
+
+    // Timing suffix
     t_now := time.tick_now()
-    total_us := i64(time.duration_microseconds(time.tick_diff(t_start, t_now)))
+    total_us := i64(time.duration_microseconds(time.tick_diff(timings.t_start, t_now)))
     timing_buf: [64]u8
     timing_str: string
     if total_us >= 1000 {
@@ -981,39 +1108,9 @@ main :: proc() {
     }
     out_str(&buf, timing_str)
 
-    // Output
     posix.write(1, raw_data(&buf.data), uint(buf.len))
 
-    // Debug timing output to per-process log file (append)
     if debug {
-        t_end := time.tick_now()
-        gppid := get_grandparent_pid()
-        cache_str := gs.from_cache ? "hit" : "miss"
-        debug_buf: [512]u8
-        debug_str := fmt.bprintf(debug_buf[:],
-            "cleanup=%dus read=%dus parse=%dus git=%dus(%s) build=%dus total=%dus\n",
-            i64(time.duration_microseconds(time.tick_diff(t_start, t_cleanup))),
-            i64(time.duration_microseconds(time.tick_diff(t_cleanup, t_read))),
-            i64(time.duration_microseconds(time.tick_diff(t_read, t_parse))),
-            i64(time.duration_microseconds(time.tick_diff(t_parse, t_git))),
-            cache_str,
-            i64(time.duration_microseconds(time.tick_diff(t_git, t_build))),
-            i64(time.duration_microseconds(time.tick_diff(t_start, t_end))))
-
-        uid := posix.getuid()
-        // Ensure per-user log dir exists
-        dir_buf: [64]u8
-        dir_path := fmt.bprintf(dir_buf[:], "/tmp/statusline-%d", uid)
-        dir_cstr := strings.clone_to_cstring(dir_path, context.temp_allocator)
-        posix.mkdir(dir_cstr, {.IRUSR, .IWUSR, .IXUSR})  // ok if exists
-
-        log_path_buf: [96]u8
-        log_path := fmt.bprintf(log_path_buf[:], "%s/%d.log", dir_path, gppid)
-        log_cstr := strings.clone_to_cstring(log_path, context.temp_allocator)
-        log_fd := posix.open(log_cstr, {.WRONLY, .CREAT, .APPEND}, {.IRUSR, .IWUSR})
-        if log_fd >= 0 {
-            posix.write(log_fd, raw_data(debug_buf[:]), uint(len(debug_str)))
-            posix.close(log_fd)
-        }
+        write_debug_log(&timings, &gs, stdin_timeout)
     }
 }
