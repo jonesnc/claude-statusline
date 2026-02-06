@@ -274,11 +274,11 @@ abbrev_path :: proc(path: string) -> string {
 /* Progress Bar (Compact)                                                             */
 /* ---------------------------------------------------------------------------------- */
 
-make_progress_bar :: proc(pct: i64) -> string {
-    @(static) bar_buf: [256]u8
+make_context_bar :: proc(pct: i64, ctx_size: i64) -> string {
+    @(static) bar_buf: [512]u8
 
     clamped := min(pct, 100)
-    width :: 20
+    width :: 15
     filled := (clamped * width) / 100
     empty := width - filled
 
@@ -296,16 +296,32 @@ make_progress_bar :: proc(pct: i64) -> string {
 
     bar := strings.builder_make(context.temp_allocator)
 
-    // Filled portion with color
-    strings.write_string(&bar, fill_color)
-    for _ in 0 ..< filled do strings.write_string(&bar, "\u2501")  // ━ thick horizontal
+    // Used tokens label
+    used_tokens := pct * ctx_size / 100
+    used_k := f64(used_tokens) / 1000.0
+    fmt.sbprintf(&bar, "%s%.0fk ", fill_color, used_k)
 
-    // Empty portion with dots (dimmed)
+    // Left cap + filled portion
+    strings.write_string(&bar, "\u257A")  // ╺ left half-line cap
+    for _ in 0 ..< filled do strings.write_string(&bar, "\u2501")  // ━
+
+    // Percentage at the boundary
+    fmt.sbprintf(&bar, " %d%% ", clamped)
+
+    // Empty portion + right cap
     strings.write_string(&bar, ANSI_FG_COMMENT)
-    for _ in 0 ..< empty do strings.write_string(&bar, "\u2504")   // ┄ dotted line
+    for _ in 0 ..< empty do strings.write_string(&bar, "\u2504")   // ┄
+    strings.write_string(&bar, "\u2578")  // ╸ right half-line cap
 
-    // Percentage with matching color (no reset - segment handles it)
-    result := fmt.bprintf(bar_buf[:], "%s %s%d%%", strings.to_string(bar), fill_color, clamped)
+    // Total context label
+    strings.write_string(&bar, fill_color)
+    if ctx_size >= 1_000_000 {
+        fmt.sbprintf(&bar, " %dM", ctx_size / 1_000_000)
+    } else {
+        fmt.sbprintf(&bar, " %dk", ctx_size / 1000)
+    }
+
+    result := fmt.bprintf(bar_buf[:], "%s", strings.to_string(bar))
     return result
 }
 
@@ -998,24 +1014,8 @@ build_statusline :: proc(buf: ^OutBuf, state: ^DisplayState, gs: ^GitStatus) {
         segment(buf, ANSI_BG_DARK, ANSI_FG_WHITE, strings.to_string(dur_text), false)
     }
 
-    // Token count (used/total context window)
-    if state.ctx_size > 0 && state.used_pct > 0 {
-        tok_text := strings.builder_make(context.temp_allocator)
-        used_tokens := state.used_pct * state.ctx_size / 100
-        used_k := f64(used_tokens) / 1000.0
-        strings.write_string(&tok_text, ICON_TOKENS)
-        strings.write_string(&tok_text, " ")
-        fmt.sbprintf(&tok_text, "%.0fk/", used_k)
-        if state.ctx_size >= 1_000_000 {
-            fmt.sbprintf(&tok_text, "%dM", state.ctx_size / 1_000_000)
-        } else {
-            fmt.sbprintf(&tok_text, "%dk", state.ctx_size / 1000)
-        }
-        segment(buf, ANSI_BG_COMMENT, ANSI_FG_WHITE, strings.to_string(tok_text), false)
-    }
-
-    // Progress bar (cached value prevents flicker during API calls)
-    bar := make_progress_bar(state.used_pct)
+    // Context window: used ━━━ pct% ┄┄┄ total
+    bar := make_context_bar(state.used_pct, state.ctx_size)
     segment(buf, ANSI_BG_DARK, "", bar, false)
 
     segment_end(buf)
