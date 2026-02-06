@@ -32,7 +32,6 @@ import "core:time"
 
 ANSI_RESET      :: "\x1b[0m"
 ANSI_BOLD       :: "\x1b[1m"
-ANSI_DIM        :: "\x1b[2m"
 
 ANSI_BG_PURPLE  :: "\x1b[48;2;189;147;249m"
 ANSI_BG_ORANGE  :: "\x1b[48;2;255;184;108m"
@@ -41,10 +40,8 @@ ANSI_BG_GREEN   :: "\x1b[48;2;72;209;104m"
 ANSI_BG_MINT    :: "\x1b[48;2;40;167;69m"
 ANSI_BG_COMMENT :: "\x1b[48;2;98;114;164m"
 ANSI_BG_RED     :: "\x1b[48;2;255;85;85m"
-ANSI_BG_CYAN    :: "\x1b[48;2;139;233;253m"
-ANSI_BG_PINK    :: "\x1b[48;2;255;121;198m"
 ANSI_BG_YELLOW  :: "\x1b[48;2;241;250;140m"
-ANSI_BG_DARKER  :: "\x1b[48;2;40;42;54m"
+ANSI_BG_CYAN    :: "\x1b[48;2;139;233;253m"
 
 ANSI_FG_BLACK   :: "\x1b[38;2;40;42;54m"
 ANSI_FG_WHITE   :: "\x1b[38;2;248;248;242m"
@@ -76,6 +73,8 @@ ICON_INSERT    :: "\uF040"   //  pencil (insert mode)
 ICON_NORMAL    :: "\uE7C5"   //  vim logo (normal mode)
 ICON_STAGED    :: "\uF00C"   //  checkmark (staged)
 ICON_MODIFIED  :: "\uF040"   //  pencil (modified)
+ICON_AGENT     :: "\uF544"   //  robot (agent)
+ICON_WARN      :: "\uF071"   //  warning triangle
 
 /* ---------------------------------------------------------------------------------- */
 /* Output Buffer                                                                      */
@@ -839,6 +838,7 @@ DisplayState :: struct {
     used_pct:          i64,
     ctx_size:          i64,
     vim_mode:          string,
+    agent_name:        string,
 }
 
 DebugTimings :: struct {
@@ -888,6 +888,7 @@ resolve_state :: proc(input: string, stdin_timeout: bool) -> DisplayState {
         json_pct           := json_get_number(input, "used_percentage")
         json_ctx_size      := json_get_number(input, "context_window_size")
         state.vim_mode      = json_get_string(input, "mode")
+        state.agent_name    = json_get_string(input, "name")
 
         // Overlay non-zero JSON with cache (prevents flicker during API calls)
         state.cwd               = len(json_cwd) > 0 ? json_cwd : string(cstring(&cached.cwd[0]))
@@ -972,6 +973,13 @@ build_statusline :: proc(buf: ^OutBuf, state: ^DisplayState, gs: ^GitStatus) {
     segment(buf, ANSI_BG_PURPLE, ANSI_FG_BLACK, strings.to_string(model_text), first)
     first = false
 
+    // Agent name (only when using --agent)
+    if len(state.agent_name) > 0 {
+        agent_text := strings.builder_make(context.temp_allocator)
+        fmt.sbprintf(&agent_text, "%s %s", ICON_AGENT, state.agent_name)
+        segment(buf, ANSI_BG_CYAN, ANSI_FG_BLACK, strings.to_string(agent_text), false)
+    }
+
     // Path
     path_text := strings.builder_make(context.temp_allocator)
     fmt.sbprintf(&path_text, "%s %s", ICON_FOLDER, abbrev_path(state.cwd))
@@ -1017,6 +1025,23 @@ build_statusline :: proc(buf: ^OutBuf, state: ^DisplayState, gs: ^GitStatus) {
     // Context window: used ━━━ pct% ┄┄┄ total
     bar := make_context_bar(state.used_pct, state.ctx_size)
     segment(buf, ANSI_BG_DARK, "", bar, false)
+
+    // Context limit warnings
+    if state.used_pct >= 80 {
+        warn_text := strings.builder_make(context.temp_allocator)
+        warn_bg: string
+        if state.used_pct >= 95 {
+            fmt.sbprintf(&warn_text, "%s%s CRITICAL COMPACT", ANSI_BOLD, ICON_WARN)
+            warn_bg = ANSI_BG_RED
+        } else if state.used_pct >= 90 {
+            fmt.sbprintf(&warn_text, "%s%s LOW CTX COMPACT", ANSI_BOLD, ICON_WARN)
+            warn_bg = ANSI_BG_RED
+        } else {
+            fmt.sbprintf(&warn_text, "%s CTX 80%%+", ICON_WARN)
+            warn_bg = ANSI_BG_YELLOW
+        }
+        segment(buf, warn_bg, ANSI_FG_BLACK, strings.to_string(warn_text), false)
+    }
 
     segment_end(buf)
 }
