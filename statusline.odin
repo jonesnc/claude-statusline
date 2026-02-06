@@ -356,6 +356,8 @@ GitStatus :: struct {
     stashes:     i64,
     modified:    u32,
     staged:      u32,
+    ahead:       u32,
+    behind:      u32,
     cache_state: CacheState,
 }
 
@@ -578,7 +580,8 @@ GitCache :: struct #packed {
     index_mtime_nsec: i64,  // .git/index mtime nanoseconds
     modified:         u32,  // Unstaged modified files
     staged:           u32,  // Staged files
-    untracked:        u32,  // Untracked files (unused, kept for future)
+    ahead:            u32,  // Commits ahead of remote
+    behind:           u32,  // Commits behind remote
     branch:           [64]u8,   // Branch name
     repo_path:        [256]u8,  // Repo path (for validation)
 }
@@ -646,7 +649,7 @@ read_git_cache :: proc(repo_path: string) -> (cache: GitCache, state: CacheState
     return cache, .STALE
 }
 
-write_git_cache :: proc(repo_path: string, modified: u32, staged: u32) {
+write_git_cache :: proc(repo_path: string, modified: u32, staged: u32, ahead: u32, behind: u32) {
     // Stat .git/index to capture current mtime
     index_path := strings.concatenate({repo_path, "/.git/index"}, context.temp_allocator)
     index_cstr := strings.clone_to_cstring(index_path, context.temp_allocator)
@@ -658,6 +661,8 @@ write_git_cache :: proc(repo_path: string, modified: u32, staged: u32) {
     cache.index_mtime_nsec = i64(st.st_mtim.tv_nsec)
     cache.modified = modified
     cache.staged = staged
+    cache.ahead = ahead
+    cache.behind = behind
     copy(cache.repo_path[:], repo_path)
 
     cache_path := get_git_cache_path(repo_path)
@@ -671,18 +676,18 @@ write_git_cache :: proc(repo_path: string, modified: u32, staged: u32) {
     posix.write(fd, buf, size_of(GitCache))
 }
 
-// Run git status --porcelain -uno via fork/exec (skips shell)
-run_git_status :: proc(repo_path: string) -> (modified: u32, staged: u32) {
+// Run git status --porcelain -b -uno via fork/exec (skips shell)
+run_git_status :: proc(repo_path: string) -> (modified: u32, staged: u32, ahead: u32, behind: u32) {
     pipe_fds: [2]posix.FD
-    if posix.pipe(&pipe_fds) != .OK do return 0, 0
-    pipe_read := pipe_fds[0]
+    if posix.pipe(&pipe_fds) != .OK do return 0, 0, 0, 0
+    pipe_read  := pipe_fds[0]
     pipe_write := pipe_fds[1]
 
     pid := posix.fork()
     if pid < 0 {
         posix.close(pipe_read)
         posix.close(pipe_write)
-        return 0, 0
+        return 0, 0, 0, 0
     }
 
     if pid == 0 {
@@ -695,7 +700,7 @@ run_git_status :: proc(repo_path: string) -> (modified: u32, staged: u32) {
         if dev_null >= 0 do posix.dup2(dev_null, 2)  // stderr -> /dev/null
         posix.close(pipe_write)
 
-        argv := []cstring{"git", "status", "--porcelain", "-uno", nil}
+        argv := []cstring{"git", "status", "--porcelain", "-b", "-uno", nil}
         posix.execvp("git", raw_data(argv))
         posix._exit(127)
     }
@@ -716,7 +721,6 @@ run_git_status :: proc(repo_path: string) -> (modified: u32, staged: u32) {
     posix.waitpid(pid, nil, {})
 
     // Parse porcelain output line by line
-    // X = staged, Y = unstaged (no untracked with -uno)
     output := string(buf[:total_read])
     rest := output
     for len(rest) > 0 {
@@ -730,6 +734,36 @@ run_git_status :: proc(repo_path: string) -> (modified: u32, staged: u32) {
             rest = ""
         }
         if len(line) < 2 do continue
+
+        // ## branch...remote [ahead N, behind M]
+        if line[0] == '#' && line[1] == '#' {
+            if idx := strings.index(line, "["); idx >= 0 {
+                bracket := line[idx:]
+                if a := strings.index(bracket, "ahead "); a >= 0 {
+                    num_start := a + 6
+                    num_end := num_start
+                    for num_end < len(bracket) && bracket[num_end] >= '0' && bracket[num_end] <= '9' {
+                        num_end += 1
+                    }
+                    if v, ok := strconv.parse_int(bracket[num_start:num_end]); ok {
+                        ahead = u32(v)
+                    }
+                }
+                if b := strings.index(bracket, "behind "); b >= 0 {
+                    num_start := b + 7
+                    num_end := num_start
+                    for num_end < len(bracket) && bracket[num_end] >= '0' && bracket[num_end] <= '9' {
+                        num_end += 1
+                    }
+                    if v, ok := strconv.parse_int(bracket[num_start:num_end]); ok {
+                        behind = u32(v)
+                    }
+                }
+            }
+            continue
+        }
+
+        // X = staged, Y = unstaged (no untracked with -uno)
         if line[0] != ' ' && line[0] != '?' {
             staged += 1
         }
@@ -738,16 +772,16 @@ run_git_status :: proc(repo_path: string) -> (modified: u32, staged: u32) {
         }
     }
 
-    return modified, staged
+    return modified, staged, ahead, behind
 }
 
 // Get git status with caching and background refresh
-get_git_status_cached :: proc(repo_path: string) -> (modified: u32, staged: u32, state: CacheState) {
+get_git_status_cached :: proc(repo_path: string) -> (modified: u32, staged: u32, ahead: u32, behind: u32, state: CacheState) {
     cache, cache_state := read_git_cache(repo_path)
 
     switch cache_state {
     case .VALID:
-        return cache.modified, cache.staged, .VALID
+        return cache.modified, cache.staged, cache.ahead, cache.behind, .VALID
     case .STALE:
         // Return stale data immediately, double-fork to refresh in background
         bg_pid := posix.fork()
@@ -755,23 +789,23 @@ get_git_status_cached :: proc(repo_path: string) -> (modified: u32, staged: u32,
             // First child: fork again so grandchild is orphaned (no zombie)
             if posix.fork() == 0 {
                 // Grandchild: refresh cache and exit
-                m, s := run_git_status(repo_path)
-                write_git_cache(repo_path, m, s)
+                m, s, a, b := run_git_status(repo_path)
+                write_git_cache(repo_path, m, s, a, b)
             }
             posix._exit(0)
         }
         if bg_pid > 0 {
             posix.waitpid(bg_pid, nil, {})  // Reap first child immediately
         }
-        return cache.modified, cache.staged, .STALE
+        return cache.modified, cache.staged, cache.ahead, cache.behind, .STALE
     case .NONE:
         // First-ever miss: block and run
-        modified, staged = run_git_status(repo_path)
-        write_git_cache(repo_path, modified, staged)
-        return modified, staged, .NONE
+        modified, staged, ahead, behind = run_git_status(repo_path)
+        write_git_cache(repo_path, modified, staged, ahead, behind)
+        return modified, staged, ahead, behind, .NONE
     }
 
-    return 0, 0, .NONE
+    return 0, 0, 0, 0, .NONE
 }
 
 /* ---------------------------------------------------------------------------------- */
@@ -806,9 +840,15 @@ build_git_segment :: proc(buf: ^OutBuf, gs: ^GitStatus) {
     }
     segment(buf, bg, ANSI_FG_BLACK, strings.to_string(text), false)
 
-    // Show counts if any changes
-    if gs.staged > 0 || gs.modified > 0 || gs.stashes > 0 {
+    // Show counts if any changes or ahead/behind
+    if gs.staged > 0 || gs.modified > 0 || gs.stashes > 0 || gs.ahead > 0 || gs.behind > 0 {
         status_text := strings.builder_make(context.temp_allocator)
+        if gs.ahead > 0 {
+            fmt.sbprintf(&status_text, "%s\u2191%d ", ANSI_FG_GREEN, gs.ahead)  // ↑
+        }
+        if gs.behind > 0 {
+            fmt.sbprintf(&status_text, "%s\u2193%d ", ANSI_FG_RED, gs.behind)  // ↓
+        }
         if gs.staged > 0 {
             fmt.sbprintf(&status_text, "%s%s%d ", ANSI_FG_GREEN, ICON_STAGED, gs.staged)
         }
@@ -881,7 +921,7 @@ resolve_state :: proc(input: string, stdin_timeout: bool) -> DisplayState {
     if !stdin_timeout {
         json_cwd           := json_get_string(input, "current_dir")
         json_model         := json_get_string(input, "display_name")
-        json_cost          := json_get_float(input, "total_cost_usd")
+        json_cost          := json_get_float (input, "total_cost_usd")
         json_lines_added   := json_get_number(input, "total_lines_added")
         json_lines_removed := json_get_number(input, "total_lines_removed")
         json_duration      := json_get_number(input, "total_duration_ms")
@@ -1112,7 +1152,7 @@ main :: proc() {
         gs.valid = true
         gs.branch = branch
         gs.stashes = git_read_stash_count(state.cwd)
-        gs.modified, gs.staged, gs.cache_state = get_git_status_cached(state.cwd)
+        gs.modified, gs.staged, gs.ahead, gs.behind, gs.cache_state = get_git_status_cached(state.cwd)
     }
     if debug do timings.t_git = time.tick_now()
 
