@@ -6,7 +6,7 @@ INPUT="{
   \"model\": {\"id\": \"claude-sonnet-4-20250514\", \"display_name\": \"Sonnet 4\"},
   \"workspace\": {\"current_dir\": \"$CWD\"},
   \"cost\": {\"total_cost_usd\": 2.47, \"total_duration_ms\": 847293, \"total_lines_added\": 312, \"total_lines_removed\": 89},
-  \"context_window\": {\"used_percentage\": 67, \"input_tokens\": 89432, \"output_tokens\": 12847, \"cache_creation_input_tokens\": 24680, \"cache_read_input_tokens\": 156320},
+  \"context_window\": {\"total_input_tokens\": 283432, \"total_output_tokens\": 42847, \"context_window_size\": 200000, \"used_percentage\": 67, \"current_usage\": {\"input_tokens\": 89432, \"output_tokens\": 12847, \"cache_creation_input_tokens\": 24680, \"cache_read_input_tokens\": 156320}},
   \"vim\": {\"mode\": \"NORMAL\"}
 }"
 

@@ -404,9 +404,9 @@ git_read_branch_fast :: proc(dir: string) -> (branch: string, ok: bool) {
 CACHE_PATH_PREFIX :: "/dev/shm/statusline-cache."
 
 CachedState :: struct {
-    used_pct:     i64,
-    total_tokens: i64,
-    cost_usd:     f64,
+    used_pct:       i64,
+    context_size:   i64,
+    cost_usd:       f64,
 }
 
 // Get grandparent PID (Claude's PID) by reading /proc/<ppid>/status
@@ -839,25 +839,20 @@ main :: proc() {
     lines_added       := json_get_number(input, "total_lines_added")
     lines_removed     := json_get_number(input, "total_lines_removed")
     total_duration_ms := json_get_number(input, "total_duration_ms")
-    // Token counts
-    input_tokens      := json_get_number(input, "input_tokens")
-    output_tokens     := json_get_number(input, "output_tokens")
-    cache_creation    := json_get_number(input, "cache_creation_input_tokens")
-    cache_read        := json_get_number(input, "cache_read_input_tokens")
-    json_tokens       := input_tokens + output_tokens + cache_creation + cache_read
     json_pct          := json_get_number(input, "used_percentage")
+    json_ctx_size     := json_get_number(input, "context_window_size")
 
     // Start with cached values, overlay non-zero JSON values
     // This prevents flicker when Claude sends partial/empty updates during API calls
     cached := read_cached_state()
     used_pct     := json_pct > 0 ? json_pct : cached.used_pct
-    total_tokens := json_tokens > 0 ? json_tokens : cached.total_tokens
+    ctx_size     := json_ctx_size > 0 ? json_ctx_size : cached.context_size
     cost_usd     := json_cost > 0 ? json_cost : cached.cost_usd
 
     // Update cache with any new non-zero values
     new_cache := CachedState{
         used_pct     = max(json_pct, cached.used_pct),
-        total_tokens = max(json_tokens, cached.total_tokens),
+        context_size = max(json_ctx_size, cached.context_size),
         cost_usd     = max(json_cost, cached.cost_usd),
     }
     if new_cache != cached {
@@ -951,11 +946,19 @@ main :: proc() {
         segment(&buf, ANSI_BG_DARK, ANSI_FG_WHITE, strings.to_string(dur_text), false)
     }
 
-    // Token count
-    if total_tokens > 0 {
+    // Token count (used/total context window)
+    if ctx_size > 0 && used_pct > 0 {
         tok_text := strings.builder_make(context.temp_allocator)
-        total_k := f64(total_tokens) / 1000.0
-        fmt.sbprintf(&tok_text, "%s %.0fk", ICON_TOKENS, total_k)
+        used_tokens := used_pct * ctx_size / 100
+        used_k := f64(used_tokens) / 1000.0
+        strings.write_string(&tok_text, ICON_TOKENS)
+        strings.write_string(&tok_text, " ")
+        fmt.sbprintf(&tok_text, "%.0fk/", used_k)
+        if ctx_size >= 1_000_000 {
+            fmt.sbprintf(&tok_text, "%dM", ctx_size / 1_000_000)
+        } else {
+            fmt.sbprintf(&tok_text, "%dk", ctx_size / 1000)
+        }
         segment(&buf, ANSI_BG_COMMENT, ANSI_FG_WHITE, strings.to_string(tok_text), false)
     }
 
