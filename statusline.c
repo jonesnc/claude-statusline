@@ -1202,12 +1202,10 @@ read_stdin(char *buf, U64 buf_cap, U64 *out_len)
     struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
     if(poll(&pfd, 1, STDIN_TIMEOUT_MS) <= 0) return false;
 
-    while(*out_len < buf_cap - 1)
-    {
-        ssize_t n = read(STDIN_FILENO, buf + *out_len, buf_cap - 1 - *out_len);
-        if(n <= 0) break;
-        *out_len += (U64)n;
-    }
+    // Single read — JSON is <4KB, always arrives atomically via pipe (PIPE_BUF=4096)
+    ssize_t n = read(STDIN_FILENO, buf, buf_cap - 1);
+    if(n <= 0) return false;
+    *out_len = (U64)n;
     buf[*out_len] = '\0';
     return true;
 }
