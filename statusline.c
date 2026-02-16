@@ -214,8 +214,6 @@ out_u64(OutBuf *buf, U64 val)
     out_strn(buf, tmp, len);
 }
 
-
-
 internal void
 out_f64(OutBuf *buf, double val, int decimals)
 {
@@ -603,10 +601,9 @@ make_context_bar(S64 pct, S64 ctx_size, char *out, U64 out_cap)
 //~ Duration Formatting (snprintf-free)
 
 internal U64
-format_duration(S64 ms, char *out, U64 out_cap)
+format_duration(S64 ms, char *out)
 {
     char *p = out;
-    (void)out_cap;
 
     if(ms < 1000)
     {
@@ -1404,7 +1401,7 @@ build_statusline(OutBuf *buf, DisplayState *state, GitStatus *gs)
         char dur_text[64];
         char *p = dur_text;
         memcpy(p, ICON_CLOCK " ", sizeof(ICON_CLOCK " ")-1); p += sizeof(ICON_CLOCK " ")-1;
-        p += format_duration(state->total_duration_ms, p, sizeof(dur_text) - (p - dur_text));
+        p += format_duration(state->total_duration_ms, p);
 
         seg(buf, ANSI_BG_DARK, ANSI_FG_WHITE, dur_text, (U64)(p - dur_text), false);
     }
