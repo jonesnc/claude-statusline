@@ -48,19 +48,19 @@ typedef int       B32;
 //~ Timing
 
 internal U64
-time_us(void)
+time_microseconds(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (U64)ts.tv_sec * 1000000 + (U64)ts.tv_nsec / 1000;
+    struct timespec timestamp;
+    clock_gettime(CLOCK_MONOTONIC, &timestamp);
+    return (U64)timestamp.tv_sec * 1000000 + (U64)timestamp.tv_nsec / 1000;
 }
 
 internal S64
-time_ms_realtime(void)
+time_milliseconds_realtime(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (S64)ts.tv_sec * 1000 + (S64)ts.tv_nsec / 1000000;
+    struct timespec timestamp;
+    clock_gettime(CLOCK_REALTIME, &timestamp);
+    return (S64)timestamp.tv_sec * 1000 + (S64)timestamp.tv_nsec / 1000000;
 }
 
 //~ ANSI Colors (Dracula Theme)
@@ -116,110 +116,110 @@ time_ms_realtime(void)
 
 //~ Output Buffer
 
-typedef struct OutBuf OutBuf;
-struct OutBuf
+typedef struct Output_Buffer Output_Buffer;
+struct Output_Buffer
 {
-    char data[4096];
-    U64  len;
-    const char *prev_bg;
-    U64  prev_bg_len;
+    char       data[4096];
+    U64        length;
+    const char *previous_background;
+    U64        previous_background_length;
 };
 
 internal void
-out_strn(OutBuf *buf, const char *s, U64 slen)
+output_string(Output_Buffer *buffer, const char *string, U64 string_length)
 {
-    if(buf->len + slen < sizeof(buf->data))
+    if(buffer->length + string_length < sizeof(buffer->data))
     {
-        memcpy(buf->data + buf->len, s, slen);
-        buf->len += slen;
+        memcpy(buffer->data + buffer->length, string, string_length);
+        buffer->length += string_length;
     }
 }
 
 // For compile-time-known string literals: avoids strlen
-#define out_lit(buf, s) out_strn(buf, s, sizeof(s) - 1)
+#define output_literal(buffer, string) output_string(buffer, string, sizeof(string) - 1)
 
 internal void
-out_char(OutBuf *buf, char c)
+output_char(Output_Buffer *buffer, char character)
 {
-    if(buf->len + 1 < sizeof(buf->data))
+    if(buffer->length + 1 < sizeof(buffer->data))
     {
-        buf->data[buf->len] = c;
-        buf->len += 1;
+        buffer->data[buffer->length] = character;
+        buffer->length += 1;
     }
 }
 
 //~ Hand-Rolled Formatters (replaces snprintf on hot path)
 
 internal int
-fmt_u64(char *buf, U64 val)
+format_u64(char *output, U64 value)
 {
-    if(val == 0) { buf[0] = '0'; return 1; }
-    char tmp[20];
-    int len = 0;
-    while(val > 0) { tmp[len++] = '0' + (char)(val % 10); val /= 10; }
-    for(int i = 0; i < len; i++) buf[i] = tmp[len - 1 - i];
-    return len;
+    if(value == 0) { output[0] = '0'; return 1; }
+    char digits[20];
+    int length = 0;
+    while(value > 0) { digits[length++] = '0' + (char)(value % 10); value /= 10; }
+    for(int index = 0; index < length; index++) output[index] = digits[length - 1 - index];
+    return length;
 }
 
 internal int
-fmt_s64(char *buf, S64 val)
+format_s64(char *output, S64 value)
 {
-    if(val < 0) { buf[0] = '-'; return 1 + fmt_u64(buf + 1, (U64)(-val)); }
-    return fmt_u64(buf, (U64)val);
+    if(value < 0) { output[0] = '-'; return 1 + format_u64(output + 1, (U64)(-value)); }
+    return format_u64(output, (U64)value);
 }
 
 internal int
-fmt_u32(char *buf, U32 val)
+format_u32(char *output, U32 value)
 {
-    return fmt_u64(buf, (U64)val);
+    return format_u64(output, (U64)value);
 }
 
 // Format double with N decimal places (0, 1, or 2)
 internal int
-fmt_f64(char *buf, double val, int decimals)
+format_f64(char *output, double value, int decimals)
 {
-    int pos = 0;
-    if(val < 0) { buf[pos++] = '-'; val = -val; }
+    int position = 0;
+    if(value < 0) { output[position++] = '-'; value = -value; }
 
     // Multiply to get fixed-point
-    U64 mul = 1;
-    for(int i = 0; i < decimals; i++) mul *= 10;
-    U64 fixed = (U64)(val * mul + 0.5);
-    U64 whole = fixed / mul;
-    U64 frac  = fixed % mul;
+    U64 multiplier = 1;
+    for(int index = 0; index < decimals; index++) multiplier *= 10;
+    U64 fixed = (U64)(value * multiplier + 0.5);
+    U64 whole = fixed / multiplier;
+    U64 fraction = fixed % multiplier;
 
-    pos += fmt_u64(buf + pos, whole);
+    position += format_u64(output + position, whole);
 
     if(decimals > 0)
     {
-        buf[pos++] = '.';
+        output[position++] = '.';
         // Pad with leading zeros
-        for(int i = decimals - 1; i > 0; i--)
+        for(int digit_index = decimals - 1; digit_index > 0; digit_index--)
         {
-            U64 d = 1;
-            for(int j = 0; j < i; j++) d *= 10;
-            if(frac < d) buf[pos++] = '0';
+            U64 divisor = 1;
+            for(int inner = 0; inner < digit_index; inner++) divisor *= 10;
+            if(fraction < divisor) output[position++] = '0';
         }
-        if(frac > 0) pos += fmt_u64(buf + pos, frac);
+        if(fraction > 0) position += format_u64(output + position, fraction);
     }
-    return pos;
+    return position;
 }
 
-// Append a formatted string directly into OutBuf
+// Append a formatted number directly into Output_Buffer
 internal void
-out_u64(OutBuf *buf, U64 val)
+output_u64(Output_Buffer *buffer, U64 value)
 {
-    char tmp[20];
-    int len = fmt_u64(tmp, val);
-    out_strn(buf, tmp, len);
+    char temp[20];
+    int length = format_u64(temp, value);
+    output_string(buffer, temp, length);
 }
 
 internal void
-out_f64(OutBuf *buf, double val, int decimals)
+output_f64(Output_Buffer *buffer, double value, int decimals)
 {
-    char tmp[32];
-    int len = fmt_f64(tmp, val, decimals);
-    out_strn(buf, tmp, len);
+    char temp[32];
+    int length = format_f64(temp, value, decimals);
+    output_string(buffer, temp, length);
 }
 
 //~ Segment Builder
@@ -227,76 +227,81 @@ out_f64(OutBuf *buf, double val, int decimals)
 // All ANSI BG strings have format \x1b[48;2;R;G;Bm
 // FG equivalent is \x1b[38;2;R;G;Bm (just change byte 2: '4' -> '3')
 internal void
-bg_to_fg_buf(const char *bg, U64 bg_len, char *fg_out, U64 *fg_len_out)
+background_to_foreground(const char *background, U64 background_length,
+                         char *foreground_output, U64 *foreground_length_output)
 {
-    if(bg == NULL || bg_len == 0 || bg_len >= 64)
+    if(background == NULL || background_length == 0 || background_length >= 64)
     {
-        *fg_len_out = 0;
+        *foreground_length_output = 0;
         return;
     }
-    memcpy(fg_out, bg, bg_len);
-    fg_out[2] = '3';  // 48;2 -> 38;2
-    *fg_len_out = bg_len;
+    memcpy(foreground_output, background, background_length);
+    foreground_output[2] = '3';  // 48;2 -> 38;2
+    *foreground_length_output = background_length;
 }
 
 internal void
-segment(OutBuf *buf, const char *bg, U64 bg_len,
-        const char *fg, U64 fg_len,
-        const char *text, U64 text_len, B32 first)
+segment(Output_Buffer *buffer, const char *background, U64 background_length,
+        const char *foreground, U64 foreground_length,
+        const char *text, U64 text_length, B32 first)
 {
-    if(!first && buf->prev_bg != NULL)
+    if(!first && buffer->previous_background != NULL)
     {
-        char fg_tmp[64];
-        U64 fg_tmp_len;
-        bg_to_fg_buf(buf->prev_bg, buf->prev_bg_len, fg_tmp, &fg_tmp_len);
+        char foreground_temp[64];
+        U64 foreground_temp_length;
+        background_to_foreground(buffer->previous_background,
+                                 buffer->previous_background_length,
+                                 foreground_temp, &foreground_temp_length);
 
-        out_strn(buf, bg, bg_len);
-        out_strn(buf, fg_tmp, fg_tmp_len);
-        out_lit(buf, SEP_ROUND);
-        out_lit(buf, ANSI_RESET);
+        output_string(buffer, background, background_length);
+        output_string(buffer, foreground_temp, foreground_temp_length);
+        output_literal(buffer, SEP_ROUND);
+        output_literal(buffer, ANSI_RESET);
     }
 
-    out_strn(buf, bg, bg_len);
-    out_strn(buf, fg, fg_len);
-    out_char(buf, ' ');
-    out_strn(buf, text, text_len);
-    out_char(buf, ' ');
-    out_lit(buf, ANSI_RESET);
+    output_string(buffer, background, background_length);
+    output_string(buffer, foreground, foreground_length);
+    output_char(buffer, ' ');
+    output_string(buffer, text, text_length);
+    output_char(buffer, ' ');
+    output_literal(buffer, ANSI_RESET);
 
-    buf->prev_bg = bg;
-    buf->prev_bg_len = bg_len;
+    buffer->previous_background = background;
+    buffer->previous_background_length = background_length;
 }
 
-// Convenience: segment with string literal bg/fg, runtime text
-#define seg(buf, bg, fg, text, text_len, first) \
-    segment(buf, bg, sizeof(bg)-1, fg, sizeof(fg)-1, text, text_len, first)
+// Convenience: segment with string literal background/foreground, runtime text
+#define segment_literal(buffer, background, foreground, text, text_length, first) \
+    segment(buffer, background, sizeof(background)-1, foreground, sizeof(foreground)-1, text, text_length, first)
 
-// Convenience: segment with string literal bg, empty fg, runtime text
-#define seg_nofg(buf, bg, text, text_len, first) \
-    segment(buf, bg, sizeof(bg)-1, "", 0, text, text_len, first)
+// Convenience: segment with string literal background, empty foreground, runtime text
+#define segment_no_foreground(buffer, background, text, text_length, first) \
+    segment(buffer, background, sizeof(background)-1, "", 0, text, text_length, first)
 
 internal void
-segment_end(OutBuf *buf)
+segment_end(Output_Buffer *buffer)
 {
-    if(buf->prev_bg != NULL)
+    if(buffer->previous_background != NULL)
     {
-        char fg_tmp[64];
-        U64 fg_tmp_len;
-        bg_to_fg_buf(buf->prev_bg, buf->prev_bg_len, fg_tmp, &fg_tmp_len);
-        out_strn(buf, fg_tmp, fg_tmp_len);
-        out_lit(buf, SEP_ROUND);
-        out_lit(buf, ANSI_RESET);
+        char foreground_temp[64];
+        U64 foreground_temp_length;
+        background_to_foreground(buffer->previous_background,
+                                 buffer->previous_background_length,
+                                 foreground_temp, &foreground_temp_length);
+        output_string(buffer, foreground_temp, foreground_temp_length);
+        output_literal(buffer, SEP_ROUND);
+        output_literal(buffer, ANSI_RESET);
     }
 }
 
 //~ Single-Pass JSON Parser
 
-typedef struct JsonFields JsonFields;
-struct JsonFields
+typedef struct Json_Parsed_Fields Json_Parsed_Fields;
+struct Json_Parsed_Fields
 {
-    const char *current_dir;      U64 current_dir_len;
-    const char *display_name;     U64 display_name_len;
-    const char *mode;             U64 mode_len;
+    const char *current_dir;      U64 current_dir_length;
+    const char *display_name;     U64 display_name_length;
+    const char *mode;             U64 mode_length;
     double total_cost_usd;
     S64    total_lines_added;
     S64    total_lines_removed;
@@ -316,329 +321,329 @@ struct JsonFields
 #define KEY_USED_PCT          "\"used_percentage\":"
 #define KEY_CTX_SIZE          "\"context_window_size\":"
 
-// Parse a JSON string value at current position (p points past ':')
-// Returns pointer into json, sets *len. Advances *p past closing quote.
+// Parse a JSON string value at current position (cursor points past ':')
+// Returns pointer into json, sets *length. Advances *cursor past closing quote.
 internal const char *
-parse_json_string(const char **p, U64 *len)
+parse_json_string(const char **cursor, U64 *length)
 {
-    const char *c = *p;
-    while(*c == ' ' || *c == '\t') c++;
-    if(*c != '"') { *len = 0; return NULL; }
-    c++;
-    const char *start = c;
-    while(*c && *c != '"') c++;
-    *len = (U64)(c - start);
-    if(*c == '"') c++;
-    *p = c;
+    const char *scanner = *cursor;
+    while(*scanner == ' ' || *scanner == '\t') scanner++;
+    if(*scanner != '"') { *length = 0; return NULL; }
+    scanner++;
+    const char *start = scanner;
+    while(*scanner && *scanner != '"') scanner++;
+    *length = (U64)(scanner - start);
+    if(*scanner == '"') scanner++;
+    *cursor = scanner;
     return start;
 }
 
-// Parse a JSON number at current position (p points past ':')
+// Parse a JSON number at current position (cursor points past ':')
 internal S64
-parse_json_s64(const char **p)
+parse_json_s64(const char **cursor)
 {
-    const char *c = *p;
-    while(*c == ' ' || *c == '\t') c++;
-    S64 val = strtoll(c, (char **)&c, 10);
-    *p = c;
-    return val;
+    const char *scanner = *cursor;
+    while(*scanner == ' ' || *scanner == '\t') scanner++;
+    S64 value = strtoll(scanner, (char **)&scanner, 10);
+    *cursor = scanner;
+    return value;
 }
 
 internal double
-parse_json_f64(const char **p)
+parse_json_f64(const char **cursor)
 {
-    const char *c = *p;
-    while(*c == ' ' || *c == '\t') c++;
-    double val = strtod(c, (char **)&c);
-    *p = c;
-    return val;
+    const char *scanner = *cursor;
+    while(*scanner == ' ' || *scanner == '\t') scanner++;
+    double value = strtod(scanner, (char **)&scanner);
+    *cursor = scanner;
+    return value;
 }
 
 // Match a key at position. Returns length of key if matched, 0 otherwise.
-#define TRY_KEY(pos, key) \
-    (memcmp(pos, key, sizeof(key)-1) == 0 ? sizeof(key)-1 : 0)
+#define TRY_KEY(position, key) \
+    (memcmp(position, key, sizeof(key)-1) == 0 ? sizeof(key)-1 : 0)
 
 internal void
-json_parse_all(const char *json, JsonFields *f)
+json_parse_all(const char *json, Json_Parsed_Fields *fields)
 {
-    memset(f, 0, sizeof(*f));
-    const char *p = json;
+    memset(fields, 0, sizeof(*fields));
+    const char *cursor = json;
 
-    while(*p)
+    while(*cursor)
     {
         // Scan for next '"'
-        while(*p && *p != '"') p++;
-        if(*p == 0) break;
+        while(*cursor && *cursor != '"') cursor++;
+        if(*cursor == 0) break;
 
-        U64 klen;
+        U64 key_length;
 
         // Dispatch on first char after '"' for fast rejection
-        switch(p[1])
+        switch(cursor[1])
         {
         case 'c':
-            if((klen = TRY_KEY(p, KEY_CURRENT_DIR)))
+            if((key_length = TRY_KEY(cursor, KEY_CURRENT_DIR)))
             {
-                p += klen;
-                f->current_dir = parse_json_string(&p, &f->current_dir_len);
+                cursor += key_length;
+                fields->current_dir = parse_json_string(&cursor, &fields->current_dir_length);
                 continue;
             }
-            if((klen = TRY_KEY(p, KEY_CTX_SIZE)))
+            if((key_length = TRY_KEY(cursor, KEY_CTX_SIZE)))
             {
-                p += klen;
-                f->context_window_size = parse_json_s64(&p);
+                cursor += key_length;
+                fields->context_window_size = parse_json_s64(&cursor);
                 continue;
             }
             break;
 
         case 'd':
-            if((klen = TRY_KEY(p, KEY_DISPLAY_NAME)))
+            if((key_length = TRY_KEY(cursor, KEY_DISPLAY_NAME)))
             {
-                p += klen;
-                f->display_name = parse_json_string(&p, &f->display_name_len);
+                cursor += key_length;
+                fields->display_name = parse_json_string(&cursor, &fields->display_name_length);
                 continue;
             }
             break;
 
         case 'm':
-            if((klen = TRY_KEY(p, KEY_MODE)))
+            if((key_length = TRY_KEY(cursor, KEY_MODE)))
             {
-                p += klen;
-                f->mode = parse_json_string(&p, &f->mode_len);
+                cursor += key_length;
+                fields->mode = parse_json_string(&cursor, &fields->mode_length);
                 continue;
             }
             break;
 
         case 't':
-            if((klen = TRY_KEY(p, KEY_TOTAL_COST_USD)))
+            if((key_length = TRY_KEY(cursor, KEY_TOTAL_COST_USD)))
             {
-                p += klen;
-                f->total_cost_usd = parse_json_f64(&p);
+                cursor += key_length;
+                fields->total_cost_usd = parse_json_f64(&cursor);
                 continue;
             }
-            if((klen = TRY_KEY(p, KEY_LINES_ADDED)))
+            if((key_length = TRY_KEY(cursor, KEY_LINES_ADDED)))
             {
-                p += klen;
-                f->total_lines_added = parse_json_s64(&p);
+                cursor += key_length;
+                fields->total_lines_added = parse_json_s64(&cursor);
                 continue;
             }
-            if((klen = TRY_KEY(p, KEY_LINES_REMOVED)))
+            if((key_length = TRY_KEY(cursor, KEY_LINES_REMOVED)))
             {
-                p += klen;
-                f->total_lines_removed = parse_json_s64(&p);
+                cursor += key_length;
+                fields->total_lines_removed = parse_json_s64(&cursor);
                 continue;
             }
-            if((klen = TRY_KEY(p, KEY_DURATION_MS)))
+            if((key_length = TRY_KEY(cursor, KEY_DURATION_MS)))
             {
-                p += klen;
-                f->total_duration_ms = parse_json_s64(&p);
+                cursor += key_length;
+                fields->total_duration_ms = parse_json_s64(&cursor);
                 continue;
             }
             break;
 
         case 'u':
-            if((klen = TRY_KEY(p, KEY_USED_PCT)))
+            if((key_length = TRY_KEY(cursor, KEY_USED_PCT)))
             {
-                p += klen;
-                f->used_percentage = parse_json_s64(&p);
+                cursor += key_length;
+                fields->used_percentage = parse_json_s64(&cursor);
                 continue;
             }
             break;
         }
 
         // Not a key we care about — skip past this '"'
-        p++;
+        cursor++;
     }
 }
 
 //~ Path Abbreviation
 
 internal U64
-abbrev_path(const char *path, char *out, U64 out_cap)
+abbreviate_path(const char *path, char *output, U64 output_capacity)
 {
     const char *home = getenv("HOME");
-    U64 home_len = home ? strlen(home) : 0;
+    U64 home_length = home ? strlen(home) : 0;
 
     // Working buffer: substitute ~ for HOME prefix
-    char buf[512];
-    U64 buf_len;
-    if(home && home_len > 0 && strncmp(path, home, home_len) == 0)
+    char working[512];
+    U64 working_length;
+    if(home && home_length > 0 && strncmp(path, home, home_length) == 0)
     {
-        buf[0] = '~';
-        U64 rest_len = strlen(path + home_len);
-        U64 copy_len = Min(rest_len, sizeof(buf) - 2);
-        memcpy(buf + 1, path + home_len, copy_len);
-        buf_len = 1 + copy_len;
-        buf[buf_len] = '\0';
+        working[0] = '~';
+        U64 rest_length = strlen(path + home_length);
+        U64 copy_length = Min(rest_length, sizeof(working) - 2);
+        memcpy(working + 1, path + home_length, copy_length);
+        working_length = 1 + copy_length;
+        working[working_length] = '\0';
     }
     else
     {
-        buf_len = strlen(path);
-        U64 copy_len = Min(buf_len, sizeof(buf) - 1);
-        memcpy(buf, path, copy_len);
-        buf_len = copy_len;
-        buf[buf_len] = '\0';
+        working_length = strlen(path);
+        U64 copy_length = Min(working_length, sizeof(working) - 1);
+        memcpy(working, path, copy_length);
+        working_length = copy_length;
+        working[working_length] = '\0';
     }
 
-    if(buf_len <= 1 || memchr(buf, '/', buf_len) == NULL)
+    if(working_length <= 1 || memchr(working, '/', working_length) == NULL)
     {
-        U64 copy_len = Min(buf_len, out_cap - 1);
-        memcpy(out, buf, copy_len);
-        out[copy_len] = '\0';
-        return copy_len;
+        U64 copy_length = Min(working_length, output_capacity - 1);
+        memcpy(output, working, copy_length);
+        output[copy_length] = '\0';
+        return copy_length;
     }
 
     // Walk the string: abbreviate all components except the last to first char
-    U64 pos = 0;
-    U64 i = 0;
+    U64 output_position = 0;
+    U64 scan_position = 0;
 
     // Find the last '/' to know where the final component starts
     U64 last_slash = 0;
-    for(U64 j = 0; j < buf_len; j++)
-        if(buf[j] == '/') last_slash = j;
+    for(U64 search_index = 0; search_index < working_length; search_index++)
+        if(working[search_index] == '/') last_slash = search_index;
 
-    while(i < buf_len && pos < out_cap - 1)
+    while(scan_position < working_length && output_position < output_capacity - 1)
     {
-        if(i > 0 && buf[i] == '/')
+        if(scan_position > 0 && working[scan_position] == '/')
         {
-            out[pos++] = '/';
-            i++;
+            output[output_position++] = '/';
+            scan_position++;
             continue;
         }
 
         // Find end of this component
-        U64 comp_start = i;
-        while(i < buf_len && buf[i] != '/') i++;
-        U64 comp_len = i - comp_start;
+        U64 component_start = scan_position;
+        while(scan_position < working_length && working[scan_position] != '/') scan_position++;
+        U64 component_length = scan_position - component_start;
 
-        if(comp_start < last_slash && buf[comp_start] != '~')
+        if(component_start < last_slash && working[component_start] != '~')
         {
             // Abbreviate: just first char
-            if(pos < out_cap - 1)
-                out[pos++] = buf[comp_start];
+            if(output_position < output_capacity - 1)
+                output[output_position++] = working[component_start];
         }
         else
         {
             // Last component or ~: copy fully
-            U64 copy_len = Min(comp_len, out_cap - 1 - pos);
-            memcpy(out + pos, buf + comp_start, copy_len);
-            pos += copy_len;
+            U64 copy_length = Min(component_length, output_capacity - 1 - output_position);
+            memcpy(output + output_position, working + component_start, copy_length);
+            output_position += copy_length;
         }
     }
-    out[pos] = '\0';
-    return pos;
+    output[output_position] = '\0';
+    return output_position;
 }
 
 //~ Context Bar Builder (snprintf-free)
 
 internal U64
-make_context_bar(S64 pct, S64 ctx_size, char *out, U64 out_cap)
+make_context_bar(S64 percent, S64 context_size, char *output, U64 output_capacity)
 {
-    S64 clamped = Min(pct, 100);
+    S64 clamped = Min(percent, 100);
     int width = 15;
     int filled = (int)(clamped * width / 100);
     int empty = width - filled;
 
     const char *fill_color;
-    U64 fill_color_len;
-    if(clamped >= 90)      { fill_color = ANSI_FG_RED;    fill_color_len = sizeof(ANSI_FG_RED)-1; }
-    else if(clamped >= 80) { fill_color = ANSI_FG_ORANGE; fill_color_len = sizeof(ANSI_FG_ORANGE)-1; }
-    else if(clamped >= 50) { fill_color = ANSI_FG_YELLOW; fill_color_len = sizeof(ANSI_FG_YELLOW)-1; }
-    else                   { fill_color = ANSI_FG_GREEN;  fill_color_len = sizeof(ANSI_FG_GREEN)-1; }
+    U64 fill_color_length;
+    if(clamped >= 90)      { fill_color = ANSI_FG_RED;    fill_color_length = sizeof(ANSI_FG_RED)-1; }
+    else if(clamped >= 80) { fill_color = ANSI_FG_ORANGE; fill_color_length = sizeof(ANSI_FG_ORANGE)-1; }
+    else if(clamped >= 50) { fill_color = ANSI_FG_YELLOW; fill_color_length = sizeof(ANSI_FG_YELLOW)-1; }
+    else                   { fill_color = ANSI_FG_GREEN;  fill_color_length = sizeof(ANSI_FG_GREEN)-1; }
 
-    char *p = out;
-    char *end = out + out_cap - 1;
+    char *cursor = output;
+    char *buffer_end = output + output_capacity - 1;
 
     // Fill color
-    memcpy(p, fill_color, fill_color_len); p += fill_color_len;
+    memcpy(cursor, fill_color, fill_color_length); cursor += fill_color_length;
 
     // Used tokens label: Nk
-    S64 used_tokens = pct * ctx_size / 100;
-    S64 used_k = (used_tokens + 500) / 1000;  // round to nearest k
-    p += fmt_s64(p, used_k);
-    *p++ = 'k'; *p++ = ' ';
+    S64 used_tokens = percent * context_size / 100;
+    S64 used_thousands = (used_tokens + 500) / 1000;
+    cursor += format_s64(cursor, used_thousands);
+    *cursor++ = 'k'; *cursor++ = ' ';
 
     // Left cap
-    memcpy(p, UTF8_LCAP, 3); p += 3;
+    memcpy(cursor, UTF8_LCAP, 3); cursor += 3;
 
     // Filled bars
-    for(int i = 0; i < filled && p + 3 <= end; i++)
-    { memcpy(p, UTF8_FILL, 3); p += 3; }
+    for(int bar_index = 0; bar_index < filled && cursor + 3 <= buffer_end; bar_index++)
+    { memcpy(cursor, UTF8_FILL, 3); cursor += 3; }
 
     // Percentage
-    *p++ = ' ';
-    p += fmt_s64(p, clamped);
-    *p++ = '%'; *p++ = ' ';
+    *cursor++ = ' ';
+    cursor += format_s64(cursor, clamped);
+    *cursor++ = '%'; *cursor++ = ' ';
 
     // Comment color for empty portion
-    memcpy(p, ANSI_FG_COMMENT, sizeof(ANSI_FG_COMMENT)-1);
-    p += sizeof(ANSI_FG_COMMENT)-1;
+    memcpy(cursor, ANSI_FG_COMMENT, sizeof(ANSI_FG_COMMENT)-1);
+    cursor += sizeof(ANSI_FG_COMMENT)-1;
 
     // Empty bars
-    for(int i = 0; i < empty && p + 3 <= end; i++)
-    { memcpy(p, UTF8_EMPTY, 3); p += 3; }
+    for(int bar_index = 0; bar_index < empty && cursor + 3 <= buffer_end; bar_index++)
+    { memcpy(cursor, UTF8_EMPTY, 3); cursor += 3; }
 
     // Right cap
-    memcpy(p, UTF8_RCAP, 3); p += 3;
+    memcpy(cursor, UTF8_RCAP, 3); cursor += 3;
 
     // Total context label in fill color
-    memcpy(p, fill_color, fill_color_len); p += fill_color_len;
-    *p++ = ' ';
-    if(ctx_size >= 1000000)
+    memcpy(cursor, fill_color, fill_color_length); cursor += fill_color_length;
+    *cursor++ = ' ';
+    if(context_size >= 1000000)
     {
-        p += fmt_s64(p, ctx_size / 1000000);
-        *p++ = 'M';
+        cursor += format_s64(cursor, context_size / 1000000);
+        *cursor++ = 'M';
     }
     else
     {
-        p += fmt_s64(p, ctx_size / 1000);
-        *p++ = 'k';
+        cursor += format_s64(cursor, context_size / 1000);
+        *cursor++ = 'k';
     }
 
-    *p = '\0';
-    return (U64)(p - out);
+    *cursor = '\0';
+    return (U64)(cursor - output);
 }
 
 //~ Duration Formatting (snprintf-free)
 
 internal U64
-format_duration(S64 ms, char *out)
+format_duration(S64 milliseconds, char *output)
 {
-    char *p = out;
+    char *cursor = output;
 
-    if(ms < 1000)
+    if(milliseconds < 1000)
     {
-        p += fmt_s64(p, ms);
-        *p++ = 'm'; *p++ = 's';
+        cursor += format_s64(cursor, milliseconds);
+        *cursor++ = 'm'; *cursor++ = 's';
     }
-    else if(ms < 60000)
+    else if(milliseconds < 60000)
     {
-        p += fmt_f64(p, ms / 1000.0, 1);
-        *p++ = 's';
+        cursor += format_f64(cursor, milliseconds / 1000.0, 1);
+        *cursor++ = 's';
     }
-    else if(ms < 3600000)
+    else if(milliseconds < 3600000)
     {
-        p += fmt_s64(p, ms / 60000);
-        *p++ = 'm';
-        p += fmt_s64(p, (ms % 60000) / 1000);
-        *p++ = 's';
+        cursor += format_s64(cursor, milliseconds / 60000);
+        *cursor++ = 'm';
+        cursor += format_s64(cursor, (milliseconds % 60000) / 1000);
+        *cursor++ = 's';
     }
     else
     {
-        p += fmt_s64(p, ms / 3600000);
-        *p++ = 'h';
-        p += fmt_s64(p, (ms % 3600000) / 60000);
-        *p++ = 'm';
+        cursor += format_s64(cursor, milliseconds / 3600000);
+        *cursor++ = 'h';
+        cursor += format_s64(cursor, (milliseconds % 3600000) / 60000);
+        *cursor++ = 'm';
     }
-    *p = '\0';
-    return (U64)(p - out);
+    *cursor = '\0';
+    return (U64)(cursor - output);
 }
 
 //~ Git Status
 
-enum CacheState { CACHE_NONE, CACHE_STALE, CACHE_VALID };
+enum Cache_State { CACHE_NONE, CACHE_STALE, CACHE_VALID };
 
-typedef struct GitStatus GitStatus;
-struct GitStatus
+typedef struct Git_Status Git_Status;
+struct Git_Status
 {
     B32  valid;
     char branch[128];
@@ -647,66 +652,66 @@ struct GitStatus
     U32  staged;
     U32  ahead;
     U32  behind;
-    enum CacheState cache_state;
+    enum Cache_State cache_state;
 };
 
 internal S64
-git_read_stash_count(const char *dir)
+git_read_stash_count(const char *repo_directory)
 {
     char path[512];
-    snprintf(path, sizeof(path), "%s/.git/logs/refs/stash", dir);
+    snprintf(path, sizeof(path), "%s/.git/logs/refs/stash", repo_directory);
 
-    int fd = open(path, O_RDONLY);
-    if(fd < 0) return 0;
+    int file_desc = open(path, O_RDONLY);
+    if(file_desc < 0) return 0;
 
-    char buf[4096];
+    char buffer[4096];
     S64 count = 0;
     for(;;)
     {
-        ssize_t n = read(fd, buf, sizeof(buf));
-        if(n <= 0) break;
-        for(ssize_t i = 0; i < n; i++)
-            if(buf[i] == '\n') count++;
+        ssize_t bytes_read = read(file_desc, buffer, sizeof(buffer));
+        if(bytes_read <= 0) break;
+        for(ssize_t index = 0; index < bytes_read; index++)
+            if(buffer[index] == '\n') count++;
     }
-    close(fd);
+    close(file_desc);
     return count;
 }
 
 internal B32
-git_read_branch_fast(const char *dir, char *branch_out, U64 branch_cap)
+git_read_branch_fast(const char *repo_directory, char *branch_output, U64 branch_capacity)
 {
     char head_path[512];
-    snprintf(head_path, sizeof(head_path), "%s/.git/HEAD", dir);
+    snprintf(head_path, sizeof(head_path), "%s/.git/HEAD", repo_directory);
 
-    int fd = open(head_path, O_RDONLY);
-    if(fd < 0) return false;
+    int file_desc = open(head_path, O_RDONLY);
+    if(file_desc < 0) return false;
 
-    char buf[256];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if(n <= 0) return false;
-    buf[n] = '\0';
+    char buffer[256];
+    ssize_t bytes_read = read(file_desc, buffer, sizeof(buffer) - 1);
+    close(file_desc);
+    if(bytes_read <= 0) return false;
+    buffer[bytes_read] = '\0';
 
-    while(n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r' || buf[n-1] == ' '))
-        buf[--n] = '\0';
+    while(bytes_read > 0 && (buffer[bytes_read-1] == '\n' || buffer[bytes_read-1] == '\r' || buffer[bytes_read-1] == ' '))
+        buffer[--bytes_read] = '\0';
 
     #define REF_PREFIX "ref: refs/heads/"
-    if(n > (ssize_t)(sizeof(REF_PREFIX)-1) && memcmp(buf, REF_PREFIX, sizeof(REF_PREFIX)-1) == 0)
+    if(bytes_read > (ssize_t)(sizeof(REF_PREFIX)-1) && memcmp(buffer, REF_PREFIX, sizeof(REF_PREFIX)-1) == 0)
     {
-        const char *branch = buf + sizeof(REF_PREFIX) - 1;
-        U64 len = (U64)(n - (sizeof(REF_PREFIX) - 1));
-        U64 copy_len = Min(len, branch_cap - 1);
-        memcpy(branch_out, branch, copy_len);
-        branch_out[copy_len] = '\0';
+        const char *branch_name = buffer + sizeof(REF_PREFIX) - 1;
+        U64 length = (U64)(bytes_read - (sizeof(REF_PREFIX) - 1));
+        U64 copy_length = Min(length, branch_capacity - 1);
+        memcpy(branch_output, branch_name, copy_length);
+        branch_output[copy_length] = '\0';
         return true;
     }
     #undef REF_PREFIX
 
-    if(n >= 7)
+    if(bytes_read >= 7)
     {
-        U64 copy_len = Min(7, branch_cap - 1);
-        memcpy(branch_out, buf, copy_len);
-        branch_out[copy_len] = '\0';
+        U64 copy_length = Min(7, branch_capacity - 1);
+        memcpy(branch_output, buffer, copy_length);
+        branch_output[copy_length] = '\0';
         return true;
     }
 
@@ -718,97 +723,97 @@ git_read_branch_fast(const char *dir, char *branch_out, U64 branch_cap)
 #define CACHE_PATH_PREFIX "/dev/shm/statusline-cache."
 #define CLEANUP_INTERVAL_S 300
 
-typedef struct __attribute__((packed)) CachedState CachedState;
-struct __attribute__((packed)) CachedState
+typedef struct __attribute__((packed)) Cached_State Cached_State;
+struct __attribute__((packed)) Cached_State
 {
-    S64    used_pct;
+    S64    used_percent;
     S64    context_size;
     double cost_usd;
     S64    lines_added;
     S64    lines_removed;
     S64    duration_ms;
-    char   cwd[256];
+    char   working_directory[256];
     char   model[64];
 };
 
 internal int
 get_grandparent_pid(void)
 {
-    pid_t ppid = getppid();
+    pid_t parent_pid = getppid();
 
     char path[32];
-    snprintf(path, sizeof(path), "/proc/%d/status", ppid);
+    snprintf(path, sizeof(path), "/proc/%d/status", parent_pid);
 
-    int fd = open(path, O_RDONLY);
-    if(fd < 0) return ppid;
+    int file_desc = open(path, O_RDONLY);
+    if(file_desc < 0) return parent_pid;
 
-    char buf[1024];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if(n <= 0) return ppid;
-    buf[n] = '\0';
+    char buffer[1024];
+    ssize_t bytes_read = read(file_desc, buffer, sizeof(buffer) - 1);
+    close(file_desc);
+    if(bytes_read <= 0) return parent_pid;
+    buffer[bytes_read] = '\0';
 
     const char *needle = "PPid:\t";
-    char *p = strstr(buf, needle);
-    if(p == NULL) return ppid;
+    char *cursor = strstr(buffer, needle);
+    if(cursor == NULL) return parent_pid;
 
-    p += 6;  // strlen("PPid:\t")
-    return (int)strtol(p, NULL, 10);
+    cursor += 6;  // strlen("PPid:\t")
+    return (int)strtol(cursor, NULL, 10);
 }
 
 internal void
-get_cache_path(char *out, U64 out_cap)
+get_cache_path(char *output, U64 output_capacity)
 {
-    int gppid = get_grandparent_pid();
-    snprintf(out, out_cap, "%s%d", CACHE_PATH_PREFIX, gppid);
+    int grandparent_pid = get_grandparent_pid();
+    snprintf(output, output_capacity, "%s%d", CACHE_PATH_PREFIX, grandparent_pid);
 }
 
 internal B32
-read_cached_state(CachedState *state)
+read_cached_state(Cached_State *state)
 {
     char path[64];
     get_cache_path(path, sizeof(path));
 
-    int fd = open(path, O_RDONLY);
-    if(fd < 0) return false;
+    int file_desc = open(path, O_RDONLY);
+    if(file_desc < 0) return false;
 
-    ssize_t n = read(fd, state, sizeof(CachedState));
-    close(fd);
-    return n == sizeof(CachedState);
+    ssize_t bytes_read = read(file_desc, state, sizeof(Cached_State));
+    close(file_desc);
+    return bytes_read == sizeof(Cached_State);
 }
 
 internal void
-write_cached_state(const CachedState *state)
+write_cached_state(const Cached_State *state)
 {
     char path[64];
     get_cache_path(path, sizeof(path));
 
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if(fd < 0) return;
+    int file_desc = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if(file_desc < 0) return;
 
-    write(fd, state, sizeof(CachedState));
-    close(fd);
+    write(file_desc, state, sizeof(Cached_State));
+    close(file_desc);
 }
 
 internal void
 cleanup_stale_caches(void)
 {
-    struct stat st;
-    S64 now_ms = time_ms_realtime();
-    if(stat("/dev/shm/statusline-cleanup", &st) == 0)
+    struct stat stat_info;
+    S64 now_milliseconds = time_milliseconds_realtime();
+    if(stat("/dev/shm/statusline-cleanup", &stat_info) == 0)
     {
-        S64 last_s = (S64)st.st_mtim.tv_sec;
-        if(now_ms / 1000 - last_s < CLEANUP_INTERVAL_S) return;
+        S64 last_seconds = (S64)stat_info.st_mtim.tv_sec;
+        if(now_milliseconds / 1000 - last_seconds < CLEANUP_INTERVAL_S) return;
     }
 
-    int sentinel_fd = open("/dev/shm/statusline-cleanup", O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if(sentinel_fd >= 0) close(sentinel_fd);
+    int sentinel_file_desc = open("/dev/shm/statusline-cleanup", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if(sentinel_file_desc >= 0) close(sentinel_file_desc);
 
-    DIR *dir = opendir("/dev/shm");
-    if(dir == NULL) return;
+    DIR *shared_memory_dir = opendir("/dev/shm");
+    if(shared_memory_dir == NULL) return;
 
     struct dirent *entry;
-    while((entry = readdir(dir)) != NULL)
+    while((entry = readdir(shared_memory_dir)) != NULL)
     {
         if(strncmp(entry->d_name, "statusline-cache.", 17) != 0) continue;
 
@@ -816,45 +821,45 @@ cleanup_stale_caches(void)
         if(pid <= 0) continue;
         if(kill(pid, 0) == 0) continue;
 
-        char rm_path[300];
-        snprintf(rm_path, sizeof(rm_path), "/dev/shm/%s", entry->d_name);
-        unlink(rm_path);
+        char remove_path[300];
+        snprintf(remove_path, sizeof(remove_path), "/dev/shm/%s", entry->d_name);
+        unlink(remove_path);
     }
-    closedir(dir);
+    closedir(shared_memory_dir);
 
     uid_t uid = getuid();
-    char log_dir[64];
-    snprintf(log_dir, sizeof(log_dir), "/tmp/statusline-%d", uid);
+    char log_directory[64];
+    snprintf(log_directory, sizeof(log_directory), "/tmp/statusline-%d", uid);
 
-    DIR *tmp_dir = opendir(log_dir);
-    if(tmp_dir == NULL) return;
+    DIR *log_dir_handle = opendir(log_directory);
+    if(log_dir_handle == NULL) return;
 
-    while((entry = readdir(tmp_dir)) != NULL)
+    while((entry = readdir(log_dir_handle)) != NULL)
     {
-        U64 name_len = strlen(entry->d_name);
-        if(name_len < 5 || strcmp(entry->d_name + name_len - 4, ".log") != 0)
+        U64 name_length = strlen(entry->d_name);
+        if(name_length < 5 || strcmp(entry->d_name + name_length - 4, ".log") != 0)
             continue;
 
-        char pid_str[32];
-        U64 copy_len = Min(name_len - 4, sizeof(pid_str) - 1);
-        memcpy(pid_str, entry->d_name, copy_len);
-        pid_str[copy_len] = '\0';
+        char pid_string[32];
+        U64 copy_length = Min(name_length - 4, sizeof(pid_string) - 1);
+        memcpy(pid_string, entry->d_name, copy_length);
+        pid_string[copy_length] = '\0';
 
-        int log_pid = (int)strtol(pid_str, NULL, 10);
+        int log_pid = (int)strtol(pid_string, NULL, 10);
         if(log_pid <= 0) continue;
         if(kill(log_pid, 0) == 0) continue;
 
-        char rm_path[96];
-        snprintf(rm_path, sizeof(rm_path), "%s/%s", log_dir, entry->d_name);
-        unlink(rm_path);
+        char remove_path[96];
+        snprintf(remove_path, sizeof(remove_path), "%s/%s", log_directory, entry->d_name);
+        unlink(remove_path);
     }
-    closedir(tmp_dir);
+    closedir(log_dir_handle);
 }
 
 //~ Git Status Cache
 
-typedef struct __attribute__((packed)) GitCache GitCache;
-struct __attribute__((packed)) GitCache
+typedef struct __attribute__((packed)) Git_Cache Git_Cache;
+struct __attribute__((packed)) Git_Cache
 {
     S64  index_mtime_sec;
     S64  index_mtime_nsec;
@@ -871,55 +876,55 @@ struct __attribute__((packed)) GitCache
 internal U32
 hash_path(const char *path)
 {
-    U32 h = 2166136261u;
-    for(const char *p = path; *p; p++)
+    U32 hash = 2166136261u;
+    for(const char *cursor = path; *cursor; cursor++)
     {
-        h ^= (U32)(unsigned char)*p;
-        h *= 16777619u;
+        hash ^= (U32)(unsigned char)*cursor;
+        hash *= 16777619u;
     }
-    return h;
+    return hash;
 }
 
 internal void
-get_git_cache_path(const char *repo_path, char *out, U64 out_cap)
+get_git_cache_path(const char *repo_path, char *output, U64 output_capacity)
 {
-    U32 h = hash_path(repo_path);
-    snprintf(out, out_cap, "/dev/shm/claude-git-%08x", h);
+    U32 path_hash = hash_path(repo_path);
+    snprintf(output, output_capacity, "/dev/shm/claude-git-%08x", path_hash);
 }
 
-internal enum CacheState
-read_git_cache(const char *repo_path, GitCache *cache)
+internal enum Cache_State
+read_git_cache(const char *repo_path, Git_Cache *cache)
 {
     char cache_path[64];
     get_git_cache_path(repo_path, cache_path, sizeof(cache_path));
 
-    int fd = open(cache_path, O_RDONLY);
-    if(fd < 0) return CACHE_NONE;
+    int file_desc = open(cache_path, O_RDONLY);
+    if(file_desc < 0) return CACHE_NONE;
 
-    ssize_t n = read(fd, cache, sizeof(GitCache));
-    if(n != sizeof(GitCache)) { close(fd); return CACHE_NONE; }
+    ssize_t bytes_read = read(file_desc, cache, sizeof(Git_Cache));
+    if(bytes_read != sizeof(Git_Cache)) { close(file_desc); return CACHE_NONE; }
 
     if(strncmp(cache->repo_path, repo_path, sizeof(cache->repo_path)) != 0)
     {
-        close(fd);
+        close(file_desc);
         return CACHE_NONE;
     }
 
-    struct stat cache_st;
-    if(fstat(fd, &cache_st) != 0) { close(fd); return CACHE_STALE; }
-    close(fd);
+    struct stat cache_stat;
+    if(fstat(file_desc, &cache_stat) != 0) { close(file_desc); return CACHE_STALE; }
+    close(file_desc);
 
-    S64 cache_age_ms = time_ms_realtime() -
-        ((S64)cache_st.st_mtim.tv_sec * 1000 + (S64)cache_st.st_mtim.tv_nsec / 1000000);
-    if(cache_age_ms > GIT_CACHE_TTL_MS) return CACHE_STALE;
+    S64 cache_age_milliseconds = time_milliseconds_realtime() -
+        ((S64)cache_stat.st_mtim.tv_sec * 1000 + (S64)cache_stat.st_mtim.tv_nsec / 1000000);
+    if(cache_age_milliseconds > GIT_CACHE_TTL_MS) return CACHE_STALE;
 
     char index_path[512];
     snprintf(index_path, sizeof(index_path), "%s/.git/index", repo_path);
-    struct stat idx_st;
-    if(stat(index_path, &idx_st) != 0) return CACHE_STALE;
+    struct stat index_stat;
+    if(stat(index_path, &index_stat) != 0) return CACHE_STALE;
 
-    if((S64)idx_st.st_mtim.tv_sec == cache->index_mtime_sec &&
-       (S64)idx_st.st_mtim.tv_nsec == cache->index_mtime_nsec)
+    if((S64)index_stat.st_mtim.tv_sec == cache->index_mtime_sec &&
+       (S64)index_stat.st_mtim.tv_nsec == cache->index_mtime_nsec)
     {
         return CACHE_VALID;
     }
@@ -932,13 +937,13 @@ write_git_cache(const char *repo_path, U32 modified, U32 staged, U32 ahead, U32 
 {
     char index_path[512];
     snprintf(index_path, sizeof(index_path), "%s/.git/index", repo_path);
-    struct stat idx_st;
-    if(stat(index_path, &idx_st) != 0) return;
+    struct stat index_stat;
+    if(stat(index_path, &index_stat) != 0) return;
 
-    GitCache cache;
+    Git_Cache cache;
     memset(&cache, 0, sizeof(cache));
-    cache.index_mtime_sec = (S64)idx_st.st_mtim.tv_sec;
-    cache.index_mtime_nsec = (S64)idx_st.st_mtim.tv_nsec;
+    cache.index_mtime_sec = (S64)index_stat.st_mtim.tv_sec;
+    cache.index_mtime_nsec = (S64)index_stat.st_mtim.tv_nsec;
     cache.modified = modified;
     cache.staged = staged;
     cache.ahead = ahead;
@@ -948,10 +953,10 @@ write_git_cache(const char *repo_path, U32 modified, U32 staged, U32 ahead, U32 
     char cache_path[64];
     get_git_cache_path(repo_path, cache_path, sizeof(cache_path));
 
-    int fd = open(cache_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if(fd < 0) return;
-    write(fd, &cache, sizeof(cache));
-    close(fd);
+    int file_desc = open(cache_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if(file_desc < 0) return;
+    write(file_desc, &cache, sizeof(cache));
+    close(file_desc);
 }
 
 internal void
@@ -959,22 +964,22 @@ run_git_status(const char *repo_path, U32 *out_modified, U32 *out_staged,
                U32 *out_ahead, U32 *out_behind)
 {
     *out_modified = 0;
-    *out_staged = 0;
-    *out_ahead = 0;
-    *out_behind = 0;
+    *out_staged   = 0;
+    *out_ahead    = 0;
+    *out_behind   = 0;
 
     int pipe_fds[2];
     if(pipe(pipe_fds) != 0) return;
 
-    pid_t pid = fork();
-    if(pid < 0)
+    pid_t child_pid = fork();
+    if(child_pid < 0)
     {
         close(pipe_fds[0]);
         close(pipe_fds[1]);
         return;
     }
 
-    if(pid == 0)
+    if(child_pid == 0)
     {
         close(pipe_fds[0]);
         chdir(repo_path);
@@ -990,36 +995,36 @@ run_git_status(const char *repo_path, U32 *out_modified, U32 *out_staged,
 
     close(pipe_fds[1]);
 
-    char buf[4096];
-    int total_read = 0;
+    char buffer[4096];
+    int total_bytes_read = 0;
     for(;;)
     {
-        int remaining = (int)sizeof(buf) - total_read;
+        int remaining = (int)sizeof(buffer) - total_bytes_read;
         if(remaining <= 0) break;
-        ssize_t n = read(pipe_fds[0], buf + total_read, remaining);
-        if(n <= 0) break;
-        total_read += (int)n;
+        ssize_t bytes_read = read(pipe_fds[0], buffer + total_bytes_read, remaining);
+        if(bytes_read <= 0) break;
+        total_bytes_read += (int)bytes_read;
     }
     close(pipe_fds[0]);
-    waitpid(pid, NULL, 0);
+    waitpid(child_pid, NULL, 0);
 
-    char *line = buf;
-    char *buf_end = buf + total_read;
-    while(line < buf_end)
+    char *line = buffer;
+    char *buffer_end = buffer + total_bytes_read;
+    while(line < buffer_end)
     {
-        char *nl = memchr(line, '\n', buf_end - line);
-        int line_len = nl ? (int)(nl - line) : (int)(buf_end - line);
-        if(line_len < 2) { line = nl ? nl + 1 : buf_end; continue; }
+        char *newline = memchr(line, '\n', buffer_end - line);
+        int line_length = newline ? (int)(newline - line) : (int)(buffer_end - line);
+        if(line_length < 2) { line = newline ? newline + 1 : buffer_end; continue; }
 
         if(line[0] == '#' && line[1] == '#')
         {
-            char *bracket = memchr(line, '[', line_len);
+            char *bracket = memchr(line, '[', line_length);
             if(bracket)
             {
-                char *a = strstr(bracket, "ahead ");
-                if(a) *out_ahead = (U32)strtol(a + 6, NULL, 10);
-                char *b = strstr(bracket, "behind ");
-                if(b) *out_behind = (U32)strtol(b + 7, NULL, 10);
+                char *ahead_match = strstr(bracket, "ahead ");
+                if(ahead_match) *out_ahead = (U32)strtol(ahead_match + 6, NULL, 10);
+                char *behind_match = strstr(bracket, "behind ");
+                if(behind_match) *out_behind = (U32)strtol(behind_match + 7, NULL, 10);
             }
         }
         else
@@ -1028,44 +1033,44 @@ run_git_status(const char *repo_path, U32 *out_modified, U32 *out_staged,
             if(line[1] != ' ' && line[1] != '?') *out_modified += 1;
         }
 
-        line = nl ? nl + 1 : buf_end;
+        line = newline ? newline + 1 : buffer_end;
     }
 }
 
 internal void
 get_git_status_cached(const char *repo_path, U32 *modified, U32 *staged,
-                      U32 *ahead, U32 *behind, enum CacheState *state)
+                      U32 *ahead, U32 *behind, enum Cache_State *state)
 {
-    GitCache cache;
+    Git_Cache cache;
     *state = read_git_cache(repo_path, &cache);
 
     switch(*state)
     {
     case CACHE_VALID:
         *modified = cache.modified;
-        *staged = cache.staged;
-        *ahead = cache.ahead;
-        *behind = cache.behind;
+        *staged   = cache.staged;
+        *ahead    = cache.ahead;
+        *behind   = cache.behind;
         return;
 
     case CACHE_STALE:
         *modified = cache.modified;
-        *staged = cache.staged;
-        *ahead = cache.ahead;
-        *behind = cache.behind;
+        *staged   = cache.staged;
+        *ahead    = cache.ahead;
+        *behind   = cache.behind;
         {
-            pid_t bg_pid = fork();
-            if(bg_pid == 0)
+            pid_t background_pid = fork();
+            if(background_pid == 0)
             {
                 if(fork() == 0)
                 {
-                    U32 m, s, a, b;
-                    run_git_status(repo_path, &m, &s, &a, &b);
-                    write_git_cache(repo_path, m, s, a, b);
+                    U32 new_modified, new_staged, new_ahead, new_behind;
+                    run_git_status(repo_path, &new_modified, &new_staged, &new_ahead, &new_behind);
+                    write_git_cache(repo_path, new_modified, new_staged, new_ahead, new_behind);
                 }
                 _exit(0);
             }
-            if(bg_pid > 0) waitpid(bg_pid, NULL, 0);
+            if(background_pid > 0) waitpid(background_pid, NULL, 0);
         }
         return;
 
@@ -1079,112 +1084,112 @@ get_git_status_cached(const char *repo_path, U32 *modified, U32 *staged,
 //~ Branch Truncation
 
 internal const char *
-truncate_branch(const char *branch, int max_len, U64 *out_len)
+truncate_branch(const char *branch, int max_length, U64 *output_length)
 {
-    static char trunc_buf[64];
-    int len = (int)strlen(branch);
-    if(len <= max_len) { *out_len = len; return branch; }
+    static char truncation_buffer[64];
+    int length = (int)strlen(branch);
+    if(length <= max_length) { *output_length = length; return branch; }
 
-    int copy_len = max_len - 3;
-    memcpy(trunc_buf, branch, copy_len);
-    trunc_buf[copy_len] = '.';
-    trunc_buf[copy_len + 1] = '.';
-    trunc_buf[copy_len + 2] = '.';
-    trunc_buf[copy_len + 3] = '\0';
-    *out_len = max_len;
-    return trunc_buf;
+    int copy_length = max_length - 3;
+    memcpy(truncation_buffer, branch, copy_length);
+    truncation_buffer[copy_length] = '.';
+    truncation_buffer[copy_length + 1] = '.';
+    truncation_buffer[copy_length + 2] = '.';
+    truncation_buffer[copy_length + 3] = '\0';
+    *output_length = max_length;
+    return truncation_buffer;
 }
 
 //~ Git Segment Builder (snprintf-free)
 
 internal void
-build_git_segment(OutBuf *buf, GitStatus *gs)
+build_git_segment(Output_Buffer *buffer, Git_Status *git_status)
 {
-    if(!gs->valid) return;
+    if(!git_status->valid) return;
 
     // Branch text: ICON_BRANCH " " + branch name
     char text[256];
-    char *p = text;
-    memcpy(p, ICON_BRANCH " ", sizeof(ICON_BRANCH " ") - 1);
-    p += sizeof(ICON_BRANCH " ") - 1;
+    char *cursor = text;
+    memcpy(cursor, ICON_BRANCH " ", sizeof(ICON_BRANCH " ") - 1);
+    cursor += sizeof(ICON_BRANCH " ") - 1;
 
-    U64 blen;
-    const char *br = truncate_branch(gs->branch, 20, &blen);
-    memcpy(p, br, blen);
-    p += blen;
-    U64 text_len = (U64)(p - text);
+    U64 branch_length;
+    const char *branch_name = truncate_branch(git_status->branch, 20, &branch_length);
+    memcpy(cursor, branch_name, branch_length);
+    cursor += branch_length;
+    U64 text_length = (U64)(cursor - text);
 
-    const char *bg; U64 bg_len;
-    if(gs->modified > 0 || gs->staged > 0)
-    { bg = ANSI_BG_ORANGE; bg_len = sizeof(ANSI_BG_ORANGE)-1; }
+    const char *background; U64 background_length;
+    if(git_status->modified > 0 || git_status->staged > 0)
+    { background = ANSI_BG_ORANGE; background_length = sizeof(ANSI_BG_ORANGE)-1; }
     else
-    { bg = ANSI_BG_GREEN; bg_len = sizeof(ANSI_BG_GREEN)-1; }
+    { background = ANSI_BG_GREEN; background_length = sizeof(ANSI_BG_GREEN)-1; }
 
-    segment(buf, bg, bg_len, ANSI_FG_BLACK, sizeof(ANSI_FG_BLACK)-1, text, text_len, false);
+    segment(buffer, background, background_length, ANSI_FG_BLACK, sizeof(ANSI_FG_BLACK)-1, text, text_length, false);
 
     // Status counts
-    if(gs->staged > 0 || gs->modified > 0 || gs->stashes > 0 ||
-       gs->ahead > 0 || gs->behind > 0)
+    if(git_status->staged > 0 || git_status->modified > 0 || git_status->stashes > 0 ||
+       git_status->ahead > 0 || git_status->behind > 0)
     {
-        char status[256];
-        p = status;
+        char status_text[256];
+        cursor = status_text;
 
-        if(gs->ahead > 0)
+        if(git_status->ahead > 0)
         {
-            memcpy(p, ANSI_FG_GREEN, sizeof(ANSI_FG_GREEN)-1); p += sizeof(ANSI_FG_GREEN)-1;
-            memcpy(p, UTF8_UP, 3); p += 3;
-            p += fmt_u32(p, gs->ahead);
-            *p++ = ' ';
+            memcpy(cursor, ANSI_FG_GREEN, sizeof(ANSI_FG_GREEN)-1); cursor += sizeof(ANSI_FG_GREEN)-1;
+            memcpy(cursor, UTF8_UP, 3); cursor += 3;
+            cursor += format_u32(cursor, git_status->ahead);
+            *cursor++ = ' ';
         }
-        if(gs->behind > 0)
+        if(git_status->behind > 0)
         {
-            memcpy(p, ANSI_FG_RED, sizeof(ANSI_FG_RED)-1); p += sizeof(ANSI_FG_RED)-1;
-            memcpy(p, UTF8_DOWN, 3); p += 3;
-            p += fmt_u32(p, gs->behind);
-            *p++ = ' ';
+            memcpy(cursor, ANSI_FG_RED, sizeof(ANSI_FG_RED)-1); cursor += sizeof(ANSI_FG_RED)-1;
+            memcpy(cursor, UTF8_DOWN, 3); cursor += 3;
+            cursor += format_u32(cursor, git_status->behind);
+            *cursor++ = ' ';
         }
-        if(gs->staged > 0)
+        if(git_status->staged > 0)
         {
-            memcpy(p, ANSI_FG_GREEN, sizeof(ANSI_FG_GREEN)-1); p += sizeof(ANSI_FG_GREEN)-1;
-            memcpy(p, ICON_STAGED, sizeof(ICON_STAGED)-1); p += sizeof(ICON_STAGED)-1;
-            p += fmt_u32(p, gs->staged);
-            *p++ = ' ';
+            memcpy(cursor, ANSI_FG_GREEN, sizeof(ANSI_FG_GREEN)-1); cursor += sizeof(ANSI_FG_GREEN)-1;
+            memcpy(cursor, ICON_STAGED, sizeof(ICON_STAGED)-1); cursor += sizeof(ICON_STAGED)-1;
+            cursor += format_u32(cursor, git_status->staged);
+            *cursor++ = ' ';
         }
-        if(gs->modified > 0)
+        if(git_status->modified > 0)
         {
-            memcpy(p, ANSI_FG_ORANGE, sizeof(ANSI_FG_ORANGE)-1); p += sizeof(ANSI_FG_ORANGE)-1;
-            memcpy(p, ICON_MODIFIED, sizeof(ICON_MODIFIED)-1); p += sizeof(ICON_MODIFIED)-1;
-            p += fmt_u32(p, gs->modified);
-            *p++ = ' ';
+            memcpy(cursor, ANSI_FG_ORANGE, sizeof(ANSI_FG_ORANGE)-1); cursor += sizeof(ANSI_FG_ORANGE)-1;
+            memcpy(cursor, ICON_MODIFIED, sizeof(ICON_MODIFIED)-1); cursor += sizeof(ICON_MODIFIED)-1;
+            cursor += format_u32(cursor, git_status->modified);
+            *cursor++ = ' ';
         }
-        if(gs->stashes > 0)
+        if(git_status->stashes > 0)
         {
-            memcpy(p, ANSI_FG_PURPLE, sizeof(ANSI_FG_PURPLE)-1); p += sizeof(ANSI_FG_PURPLE)-1;
-            memcpy(p, ICON_STASH, sizeof(ICON_STASH)-1); p += sizeof(ICON_STASH)-1;
-            p += fmt_s64(p, gs->stashes);
+            memcpy(cursor, ANSI_FG_PURPLE, sizeof(ANSI_FG_PURPLE)-1); cursor += sizeof(ANSI_FG_PURPLE)-1;
+            memcpy(cursor, ICON_STASH, sizeof(ICON_STASH)-1); cursor += sizeof(ICON_STASH)-1;
+            cursor += format_s64(cursor, git_status->stashes);
         }
 
         // Trim trailing space
-        U64 slen = (U64)(p - status);
-        if(slen > 0 && status[slen - 1] == ' ') slen--;
+        U64 status_length = (U64)(cursor - status_text);
+        if(status_length > 0 && status_text[status_length - 1] == ' ') status_length--;
 
-        segment(buf, ANSI_BG_DARK, sizeof(ANSI_BG_DARK)-1, "", 0, status, slen, false);
+        segment(buffer, ANSI_BG_DARK, sizeof(ANSI_BG_DARK)-1, "", 0, status_text, status_length, false);
     }
 }
 
 //~ Display State
 
-typedef struct DisplayState DisplayState;
-struct DisplayState
+typedef struct Display_State Display_State;
+struct Display_State
 {
-    char   cwd[512];
+    char   working_directory[512];
     char   model[64];
     double cost_usd;
     S64    lines_added;
     S64    lines_removed;
     S64    total_duration_ms;
-    S64    used_pct;
-    S64    ctx_size;
+    S64    used_percent;
+    S64    context_size;
     char   vim_mode[32];
 };
 
@@ -1193,26 +1198,26 @@ struct DisplayState
 #define STDIN_TIMEOUT_MS 50
 
 internal B32
-read_stdin(char *buf, U64 buf_cap, U64 *out_len)
+read_stdin(char *buffer, U64 buffer_capacity, U64 *output_length)
 {
-    *out_len = 0;
-    struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
-    if(poll(&pfd, 1, STDIN_TIMEOUT_MS) <= 0) return false;
+    *output_length = 0;
+    struct pollfd poll_fd = {.fd = STDIN_FILENO, .events = POLLIN};
+    if(poll(&poll_fd, 1, STDIN_TIMEOUT_MS) <= 0) return false;
 
     // Single read — JSON is <4KB, always arrives atomically via pipe (PIPE_BUF=4096)
-    ssize_t n = read(STDIN_FILENO, buf, buf_cap - 1);
-    if(n <= 0) return false;
-    *out_len = (U64)n;
-    buf[*out_len] = '\0';
+    ssize_t bytes_read = read(STDIN_FILENO, buffer, buffer_capacity - 1);
+    if(bytes_read <= 0) return false;
+    *output_length = (U64)bytes_read;
+    buffer[*output_length] = '\0';
     return true;
 }
 
 //~ State Resolution (uses single-pass JSON parser)
 
 internal void
-resolve_state(const char *input, B32 has_stdin, DisplayState *state)
+resolve_state(const char *input, B32 has_stdin, Display_State *state)
 {
-    CachedState cached;
+    Cached_State cached;
     memset(&cached, 0, sizeof(cached));
     read_cached_state(&cached);
 
@@ -1220,117 +1225,117 @@ resolve_state(const char *input, B32 has_stdin, DisplayState *state)
 
     if(has_stdin)
     {
-        JsonFields f;
-        json_parse_all(input, &f);
+        Json_Parsed_Fields fields;
+        json_parse_all(input, &fields);
 
         // Copy string fields
-        if(f.current_dir_len > 0)
+        if(fields.current_dir_length > 0)
         {
-            U64 clen = Min(f.current_dir_len, sizeof(state->cwd) - 1);
-            memcpy(state->cwd, f.current_dir, clen);
-            state->cwd[clen] = '\0';
+            U64 cwd_length = Min(fields.current_dir_length, sizeof(state->working_directory) - 1);
+            memcpy(state->working_directory, fields.current_dir, cwd_length);
+            state->working_directory[cwd_length] = '\0';
         }
-        else if(cached.cwd[0])
-            strcpy(state->cwd, cached.cwd);
+        else if(cached.working_directory[0])
+            strcpy(state->working_directory, cached.working_directory);
 
-        if(f.display_name_len > 0)
+        if(fields.display_name_length > 0)
         {
-            U64 mlen = Min(f.display_name_len, sizeof(state->model) - 1);
-            memcpy(state->model, f.display_name, mlen);
-            state->model[mlen] = '\0';
+            U64 model_length = Min(fields.display_name_length, sizeof(state->model) - 1);
+            memcpy(state->model, fields.display_name, model_length);
+            state->model[model_length] = '\0';
         }
         else if(cached.model[0])
             strcpy(state->model, cached.model);
 
-        if(f.mode_len > 0)
+        if(fields.mode_length > 0)
         {
-            U64 vlen = Min(f.mode_len, sizeof(state->vim_mode) - 1);
-            memcpy(state->vim_mode, f.mode, vlen);
-            state->vim_mode[vlen] = '\0';
+            U64 vim_mode_length = Min(fields.mode_length, sizeof(state->vim_mode) - 1);
+            memcpy(state->vim_mode, fields.mode, vim_mode_length);
+            state->vim_mode[vim_mode_length] = '\0';
         }
 
-        state->cost_usd          = f.total_cost_usd > 0 ? f.total_cost_usd : cached.cost_usd;
-        state->lines_added       = f.total_lines_added > 0 ? f.total_lines_added : cached.lines_added;
-        state->lines_removed     = f.total_lines_removed > 0 ? f.total_lines_removed : cached.lines_removed;
-        state->total_duration_ms = f.total_duration_ms > 0 ? f.total_duration_ms : cached.duration_ms;
-        state->used_pct          = f.used_percentage > 0 ? f.used_percentage : cached.used_pct;
-        state->ctx_size          = f.context_window_size > 0 ? f.context_window_size : cached.context_size;
+        state->cost_usd          = fields.total_cost_usd > 0 ? fields.total_cost_usd : cached.cost_usd;
+        state->lines_added       = fields.total_lines_added > 0 ? fields.total_lines_added : cached.lines_added;
+        state->lines_removed     = fields.total_lines_removed > 0 ? fields.total_lines_removed : cached.lines_removed;
+        state->total_duration_ms = fields.total_duration_ms > 0 ? fields.total_duration_ms : cached.duration_ms;
+        state->used_percent      = fields.used_percentage > 0 ? fields.used_percentage : cached.used_percent;
+        state->context_size      = fields.context_window_size > 0 ? fields.context_window_size : cached.context_size;
 
         // Update cache
-        CachedState new_cache;
-        new_cache.used_pct      = Max(f.used_percentage, cached.used_pct);
-        new_cache.context_size  = Max(f.context_window_size, cached.context_size);
-        new_cache.cost_usd      = f.total_cost_usd > cached.cost_usd ? f.total_cost_usd : cached.cost_usd;
-        new_cache.lines_added   = Max(f.total_lines_added, cached.lines_added);
-        new_cache.lines_removed = Max(f.total_lines_removed, cached.lines_removed);
-        new_cache.duration_ms   = Max(f.total_duration_ms, cached.duration_ms);
+        Cached_State new_cache;
+        new_cache.used_percent  = Max(fields.used_percentage, cached.used_percent);
+        new_cache.context_size  = Max(fields.context_window_size, cached.context_size);
+        new_cache.cost_usd      = fields.total_cost_usd > cached.cost_usd ? fields.total_cost_usd : cached.cost_usd;
+        new_cache.lines_added   = Max(fields.total_lines_added, cached.lines_added);
+        new_cache.lines_removed = Max(fields.total_lines_removed, cached.lines_removed);
+        new_cache.duration_ms   = Max(fields.total_duration_ms, cached.duration_ms);
 
-        memset(new_cache.cwd, 0, sizeof(new_cache.cwd));
+        memset(new_cache.working_directory, 0, sizeof(new_cache.working_directory));
         memset(new_cache.model, 0, sizeof(new_cache.model));
-        if(f.current_dir_len > 0)
-            memcpy(new_cache.cwd, f.current_dir, Min(f.current_dir_len, sizeof(new_cache.cwd) - 1));
+        if(fields.current_dir_length > 0)
+            memcpy(new_cache.working_directory, fields.current_dir, Min(fields.current_dir_length, sizeof(new_cache.working_directory) - 1));
         else
-            memcpy(new_cache.cwd, cached.cwd, sizeof(new_cache.cwd));
+            memcpy(new_cache.working_directory, cached.working_directory, sizeof(new_cache.working_directory));
 
-        if(f.display_name_len > 0)
-            memcpy(new_cache.model, f.display_name, Min(f.display_name_len, sizeof(new_cache.model) - 1));
+        if(fields.display_name_length > 0)
+            memcpy(new_cache.model, fields.display_name, Min(fields.display_name_length, sizeof(new_cache.model) - 1));
         else
             memcpy(new_cache.model, cached.model, sizeof(new_cache.model));
 
-        if(memcmp(&new_cache, &cached, sizeof(CachedState)) != 0)
+        if(memcmp(&new_cache, &cached, sizeof(Cached_State)) != 0)
             write_cached_state(&new_cache);
     }
     else
     {
-        if(cached.cwd[0]) strcpy(state->cwd, cached.cwd);
+        if(cached.working_directory[0]) strcpy(state->working_directory, cached.working_directory);
         if(cached.model[0]) strcpy(state->model, cached.model);
         state->cost_usd          = cached.cost_usd;
         state->lines_added       = cached.lines_added;
         state->lines_removed     = cached.lines_removed;
         state->total_duration_ms = cached.duration_ms;
-        state->used_pct          = cached.used_pct;
-        state->ctx_size          = cached.context_size;
+        state->used_percent      = cached.used_percent;
+        state->context_size      = cached.context_size;
     }
 }
 
 //~ Statusline Builder (snprintf-free)
 
 internal void
-build_statusline(OutBuf *buf, DisplayState *state, GitStatus *gs)
+build_statusline(Output_Buffer *buffer, Display_State *state, Git_Status *git_status)
 {
     B32 first = true;
 
     // Vim mode
     if(state->vim_mode[0])
     {
-        const char *vim_bg, *vim_fg, *vim_icon;
-        U64 vim_bg_len, vim_fg_len, vim_icon_len;
+        const char *vim_background, *vim_foreground, *vim_icon;
+        U64 vim_background_length, vim_foreground_length, vim_icon_length;
         B32 is_insert = (strcmp(state->vim_mode, "INSERT") == 0);
         if(is_insert)
         {
-            vim_bg = ANSI_BG_GREEN; vim_bg_len = sizeof(ANSI_BG_GREEN)-1;
-            vim_fg = ANSI_FG_BLACK; vim_fg_len = sizeof(ANSI_FG_BLACK)-1;
-            vim_icon = ICON_INSERT; vim_icon_len = sizeof(ICON_INSERT)-1;
+            vim_background = ANSI_BG_GREEN; vim_background_length = sizeof(ANSI_BG_GREEN)-1;
+            vim_foreground = ANSI_FG_BLACK; vim_foreground_length = sizeof(ANSI_FG_BLACK)-1;
+            vim_icon = ICON_INSERT; vim_icon_length = sizeof(ICON_INSERT)-1;
         }
         else
         {
-            vim_bg = ANSI_BG_DARK;  vim_bg_len = sizeof(ANSI_BG_DARK)-1;
-            vim_fg = ANSI_FG_WHITE; vim_fg_len = sizeof(ANSI_FG_WHITE)-1;
-            vim_icon = ICON_NORMAL; vim_icon_len = sizeof(ICON_NORMAL)-1;
+            vim_background = ANSI_BG_DARK;  vim_background_length = sizeof(ANSI_BG_DARK)-1;
+            vim_foreground = ANSI_FG_WHITE; vim_foreground_length = sizeof(ANSI_FG_WHITE)-1;
+            vim_icon = ICON_NORMAL; vim_icon_length = sizeof(ICON_NORMAL)-1;
         }
 
         char vim_text[64];
-        char *p = vim_text;
+        char *cursor = vim_text;
         if(is_insert)
         {
-            memcpy(p, ANSI_BOLD, sizeof(ANSI_BOLD)-1); p += sizeof(ANSI_BOLD)-1;
+            memcpy(cursor, ANSI_BOLD, sizeof(ANSI_BOLD)-1); cursor += sizeof(ANSI_BOLD)-1;
         }
-        memcpy(p, vim_icon, vim_icon_len); p += vim_icon_len;
-        *p++ = ' ';
-        U64 mode_len = strlen(state->vim_mode);
-        memcpy(p, state->vim_mode, mode_len); p += mode_len;
+        memcpy(cursor, vim_icon, vim_icon_length); cursor += vim_icon_length;
+        *cursor++ = ' ';
+        U64 mode_length = strlen(state->vim_mode);
+        memcpy(cursor, state->vim_mode, mode_length); cursor += mode_length;
 
-        segment(buf, vim_bg, vim_bg_len, vim_fg, vim_fg_len, vim_text, (U64)(p - vim_text), first);
+        segment(buffer, vim_background, vim_background_length, vim_foreground, vim_foreground_length, vim_text, (U64)(cursor - vim_text), first);
         first = false;
     }
 
@@ -1338,11 +1343,11 @@ build_statusline(OutBuf *buf, DisplayState *state, GitStatus *gs)
     {
         char model_text[128];
         memcpy(model_text, ANSI_BOLD, sizeof(ANSI_BOLD)-1);
-        U64 model_len = strlen(state->model);
-        memcpy(model_text + sizeof(ANSI_BOLD)-1, state->model, model_len);
-        U64 text_len = sizeof(ANSI_BOLD)-1 + model_len;
+        U64 model_length = strlen(state->model);
+        memcpy(model_text + sizeof(ANSI_BOLD)-1, state->model, model_length);
+        U64 text_length = sizeof(ANSI_BOLD)-1 + model_length;
 
-        seg(buf, ANSI_BG_PURPLE, ANSI_FG_BLACK, model_text, text_len, first);
+        segment_literal(buffer, ANSI_BG_PURPLE, ANSI_FG_BLACK, model_text, text_length, first);
         first = false;
     }
 
@@ -1350,147 +1355,147 @@ build_statusline(OutBuf *buf, DisplayState *state, GitStatus *gs)
     {
         char path_text[300];
         memcpy(path_text, ICON_FOLDER " ", sizeof(ICON_FOLDER " ")-1);
-        U64 prefix_len = sizeof(ICON_FOLDER " ")-1;
-        U64 abbrev_len = abbrev_path(state->cwd, path_text + prefix_len, sizeof(path_text) - prefix_len);
+        U64 prefix_length = sizeof(ICON_FOLDER " ")-1;
+        U64 abbreviated_length = abbreviate_path(state->working_directory, path_text + prefix_length, sizeof(path_text) - prefix_length);
 
-        seg(buf, ANSI_BG_DARK, ANSI_FG_WHITE, path_text, prefix_len + abbrev_len, false);
+        segment_literal(buffer, ANSI_BG_DARK, ANSI_FG_WHITE, path_text, prefix_length + abbreviated_length, false);
     }
 
     // Git
-    if(gs->valid)
-        build_git_segment(buf, gs);
+    if(git_status->valid)
+        build_git_segment(buffer, git_status);
 
     // Cost
     {
-        const char *cost_bg; U64 cost_bg_len;
-        if(state->cost_usd >= 10.0)      { cost_bg = ANSI_BG_RED;    cost_bg_len = sizeof(ANSI_BG_RED)-1; }
-        else if(state->cost_usd >= 5.0)  { cost_bg = ANSI_BG_ORANGE; cost_bg_len = sizeof(ANSI_BG_ORANGE)-1; }
-        else if(state->cost_usd >= 1.0)  { cost_bg = ANSI_BG_CYAN;   cost_bg_len = sizeof(ANSI_BG_CYAN)-1; }
-        else                              { cost_bg = ANSI_BG_MINT;   cost_bg_len = sizeof(ANSI_BG_MINT)-1; }
+        const char *cost_background; U64 cost_background_length;
+        if(state->cost_usd >= 10.0)      { cost_background = ANSI_BG_RED;    cost_background_length = sizeof(ANSI_BG_RED)-1;    }
+        else if(state->cost_usd >= 5.0)  { cost_background = ANSI_BG_ORANGE; cost_background_length = sizeof(ANSI_BG_ORANGE)-1; }
+        else if(state->cost_usd >= 1.0)  { cost_background = ANSI_BG_CYAN;   cost_background_length = sizeof(ANSI_BG_CYAN)-1;   }
+        else                             { cost_background = ANSI_BG_MINT;   cost_background_length = sizeof(ANSI_BG_MINT)-1;   }
 
         char cost_text[64];
-        char *p = cost_text;
-        memcpy(p, ICON_DOLLAR " ", sizeof(ICON_DOLLAR " ")-1); p += sizeof(ICON_DOLLAR " ")-1;
-        p += fmt_f64(p, state->cost_usd, 2);
+        char *cursor = cost_text;
+        memcpy(cursor, ICON_DOLLAR " ", sizeof(ICON_DOLLAR " ")-1); cursor += sizeof(ICON_DOLLAR " ")-1;
+        cursor += format_f64(cursor, state->cost_usd, 2);
 
-        segment(buf, cost_bg, cost_bg_len, ANSI_FG_BLACK, sizeof(ANSI_FG_BLACK)-1,
-                cost_text, (U64)(p - cost_text), false);
+        segment(buffer, cost_background, cost_background_length, ANSI_FG_BLACK, sizeof(ANSI_FG_BLACK)-1,
+                cost_text, (U64)(cursor - cost_text), false);
     }
 
     // Lines changed
     if(state->lines_added > 0 || state->lines_removed > 0)
     {
         char lines_text[128];
-        char *p = lines_text;
-        memcpy(p, ANSI_FG_WHITE, sizeof(ANSI_FG_WHITE)-1); p += sizeof(ANSI_FG_WHITE)-1;
-        memcpy(p, ICON_DIFF " ", sizeof(ICON_DIFF " ")-1); p += sizeof(ICON_DIFF " ")-1;
-        memcpy(p, ANSI_FG_GREEN, sizeof(ANSI_FG_GREEN)-1); p += sizeof(ANSI_FG_GREEN)-1;
-        *p++ = '+';
-        p += fmt_s64(p, state->lines_added);
-        *p++ = ' ';
-        memcpy(p, ANSI_FG_RED, sizeof(ANSI_FG_RED)-1); p += sizeof(ANSI_FG_RED)-1;
-        *p++ = '-';
-        p += fmt_s64(p, state->lines_removed);
+        char *cursor = lines_text;
+        memcpy(cursor, ANSI_FG_WHITE, sizeof(ANSI_FG_WHITE)-1); cursor += sizeof(ANSI_FG_WHITE)-1;
+        memcpy(cursor, ICON_DIFF " ", sizeof(ICON_DIFF " ")-1); cursor += sizeof(ICON_DIFF " ")-1;
+        memcpy(cursor, ANSI_FG_GREEN, sizeof(ANSI_FG_GREEN)-1); cursor += sizeof(ANSI_FG_GREEN)-1;
+        *cursor++ = '+';
+        cursor += format_s64(cursor, state->lines_added);
+        *cursor++ = ' ';
+        memcpy(cursor, ANSI_FG_RED, sizeof(ANSI_FG_RED)-1); cursor += sizeof(ANSI_FG_RED)-1;
+        *cursor++ = '-';
+        cursor += format_s64(cursor, state->lines_removed);
 
-        seg_nofg(buf, ANSI_BG_DARK, lines_text, (U64)(p - lines_text), false);
+        segment_no_foreground(buffer, ANSI_BG_DARK, lines_text, (U64)(cursor - lines_text), false);
     }
 
     // Session duration
     if(state->total_duration_ms > 0)
     {
-        char dur_text[64];
-        char *p = dur_text;
-        memcpy(p, ICON_CLOCK " ", sizeof(ICON_CLOCK " ")-1); p += sizeof(ICON_CLOCK " ")-1;
-        p += format_duration(state->total_duration_ms, p);
+        char duration_text[64];
+        char *cursor = duration_text;
+        memcpy(cursor, ICON_CLOCK " ", sizeof(ICON_CLOCK " ")-1); cursor += sizeof(ICON_CLOCK " ")-1;
+        cursor += format_duration(state->total_duration_ms, cursor);
 
-        seg(buf, ANSI_BG_DARK, ANSI_FG_WHITE, dur_text, (U64)(p - dur_text), false);
+        segment_literal(buffer, ANSI_BG_DARK, ANSI_FG_WHITE, duration_text, (U64)(cursor - duration_text), false);
     }
 
     // Context bar
     {
-        char bar[512];
-        U64 bar_len = make_context_bar(state->used_pct, state->ctx_size, bar, sizeof(bar));
-        seg_nofg(buf, ANSI_BG_DARK, bar, bar_len, false);
+        char context_bar[512];
+        U64 context_bar_length = make_context_bar(state->used_percent, state->context_size, context_bar, sizeof(context_bar));
+        segment_no_foreground(buffer, ANSI_BG_DARK, context_bar, context_bar_length, false);
     }
 
     // Context warnings
-    if(state->used_pct >= 80)
+    if(state->used_percent >= 80)
     {
-        char warn_text[128];
-        char *p = warn_text;
-        const char *warn_bg; U64 warn_bg_len;
+        char warning_text[128];
+        char *cursor = warning_text;
+        const char *warning_background; U64 warning_background_length;
 
-        if(state->used_pct >= 95)
+        if(state->used_percent >= 95)
         {
-            memcpy(p, ANSI_BOLD, sizeof(ANSI_BOLD)-1); p += sizeof(ANSI_BOLD)-1;
-            memcpy(p, ICON_WARN " CRITICAL COMPACT", sizeof(ICON_WARN " CRITICAL COMPACT")-1);
-            p += sizeof(ICON_WARN " CRITICAL COMPACT")-1;
-            warn_bg = ANSI_BG_RED; warn_bg_len = sizeof(ANSI_BG_RED)-1;
+            memcpy(cursor, ANSI_BOLD, sizeof(ANSI_BOLD)-1); cursor += sizeof(ANSI_BOLD)-1;
+            memcpy(cursor, ICON_WARN " CRITICAL COMPACT", sizeof(ICON_WARN " CRITICAL COMPACT")-1);
+            cursor += sizeof(ICON_WARN " CRITICAL COMPACT")-1;
+            warning_background = ANSI_BG_RED; warning_background_length = sizeof(ANSI_BG_RED)-1;
         }
-        else if(state->used_pct >= 90)
+        else if(state->used_percent >= 90)
         {
-            memcpy(p, ANSI_BOLD, sizeof(ANSI_BOLD)-1); p += sizeof(ANSI_BOLD)-1;
-            memcpy(p, ICON_WARN " LOW CTX COMPACT", sizeof(ICON_WARN " LOW CTX COMPACT")-1);
-            p += sizeof(ICON_WARN " LOW CTX COMPACT")-1;
-            warn_bg = ANSI_BG_RED; warn_bg_len = sizeof(ANSI_BG_RED)-1;
+            memcpy(cursor, ANSI_BOLD, sizeof(ANSI_BOLD)-1); cursor += sizeof(ANSI_BOLD)-1;
+            memcpy(cursor, ICON_WARN " LOW CTX COMPACT", sizeof(ICON_WARN " LOW CTX COMPACT")-1);
+            cursor += sizeof(ICON_WARN " LOW CTX COMPACT")-1;
+            warning_background = ANSI_BG_RED; warning_background_length = sizeof(ANSI_BG_RED)-1;
         }
         else
         {
-            memcpy(p, ICON_WARN " CTX 80%+", sizeof(ICON_WARN " CTX 80%+")-1);
-            p += sizeof(ICON_WARN " CTX 80%+")-1;
-            warn_bg = ANSI_BG_YELLOW; warn_bg_len = sizeof(ANSI_BG_YELLOW)-1;
+            memcpy(cursor, ICON_WARN " CTX 80%+", sizeof(ICON_WARN " CTX 80%+")-1);
+            cursor += sizeof(ICON_WARN " CTX 80%+")-1;
+            warning_background = ANSI_BG_YELLOW; warning_background_length = sizeof(ANSI_BG_YELLOW)-1;
         }
 
-        segment(buf, warn_bg, warn_bg_len, ANSI_FG_BLACK, sizeof(ANSI_FG_BLACK)-1,
-                warn_text, (U64)(p - warn_text), false);
+        segment(buffer, warning_background, warning_background_length, ANSI_FG_BLACK, sizeof(ANSI_FG_BLACK)-1,
+                warning_text, (U64)(cursor - warning_text), false);
     }
 
-    segment_end(buf);
+    segment_end(buffer);
 }
 
 //~ Debug Logging
 
 internal void
-write_debug_log(U64 t_start, U64 t_cleanup, U64 t_read, U64 t_parse,
-                U64 t_git, U64 t_build, enum CacheState cache_state, B32 has_stdin)
+write_debug_log(U64 time_start, U64 time_cleanup, U64 time_read, U64 time_parse,
+                U64 time_git, U64 time_build, enum Cache_State cache_state, B32 has_stdin)
 {
-    U64 t_end = time_us();
-    int gppid = get_grandparent_pid();
+    U64 time_end = time_microseconds();
+    int grandparent_pid = get_grandparent_pid();
 
-    const char *cache_str;
+    const char *cache_string;
     switch(cache_state)
     {
-    case CACHE_VALID: cache_str = "valid"; break;
-    case CACHE_STALE: cache_str = "stale"; break;
-    case CACHE_NONE:  cache_str = "miss";  break;
-    default:          cache_str = "?";     break;
+    case CACHE_VALID: cache_string = "valid"; break;
+    case CACHE_STALE: cache_string = "stale"; break;
+    case CACHE_NONE:  cache_string = "miss";  break;
+    default:          cache_string = "?";     break;
     }
 
     char line[512];
-    int n = snprintf(line, sizeof(line),
+    int line_length = snprintf(line, sizeof(line),
         "cleanup=%lluus read=%lluus(%s) parse=%lluus git=%lluus(%s) build=%lluus total=%lluus\n",
-        (unsigned long long)(t_cleanup - t_start),
-        (unsigned long long)(t_read - t_cleanup),
+        (unsigned long long)(time_cleanup - time_start),
+        (unsigned long long)(time_read - time_cleanup),
         has_stdin ? "ok" : "timeout",
-        (unsigned long long)(t_parse - t_read),
-        (unsigned long long)(t_git - t_parse),
-        cache_str,
-        (unsigned long long)(t_build - t_git),
-        (unsigned long long)(t_end - t_start));
+        (unsigned long long)(time_parse - time_read),
+        (unsigned long long)(time_git - time_parse),
+        cache_string,
+        (unsigned long long)(time_build - time_git),
+        (unsigned long long)(time_end - time_start));
 
     uid_t uid = getuid();
-    char dir_path[64];
-    snprintf(dir_path, sizeof(dir_path), "/tmp/statusline-%d", uid);
-    mkdir(dir_path, 0700);
+    char directory_path[64];
+    snprintf(directory_path, sizeof(directory_path), "/tmp/statusline-%d", uid);
+    mkdir(directory_path, 0700);
 
     char log_path[96];
-    snprintf(log_path, sizeof(log_path), "%s/%d.log", dir_path, gppid);
+    snprintf(log_path, sizeof(log_path), "%s/%d.log", directory_path, grandparent_pid);
 
-    int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
-    if(fd >= 0)
+    int file_desc = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if(file_desc >= 0)
     {
-        write(fd, line, n);
-        close(fd);
+        write(file_desc, line, line_length);
+        close(file_desc);
     }
 }
 
@@ -1499,59 +1504,59 @@ write_debug_log(U64 t_start, U64 t_cleanup, U64 t_read, U64 t_parse,
 int
 main(void)
 {
-    U64 t_start = time_us();
+    U64 time_start = time_microseconds();
     B32 debug = (getenv("STATUSLINE_DEBUG") != NULL);
 
     cleanup_stale_caches();
-    U64 t_cleanup = time_us();
+    U64 time_cleanup = time_microseconds();
 
     char input[8192];
-    U64 input_len;
-    B32 has_stdin = read_stdin(input, sizeof(input), &input_len);
-    U64 t_read = time_us();
+    U64 input_length;
+    B32 has_stdin = read_stdin(input, sizeof(input), &input_length);
+    U64 time_read = time_microseconds();
 
-    DisplayState state;
+    Display_State state;
     resolve_state(input, has_stdin, &state);
-    U64 t_parse = time_us();
+    U64 time_parse = time_microseconds();
 
     // Git status
-    GitStatus gs;
-    memset(&gs, 0, sizeof(gs));
-    if(state.cwd[0] && git_read_branch_fast(state.cwd, gs.branch, sizeof(gs.branch)))
+    Git_Status git_status;
+    memset(&git_status, 0, sizeof(git_status));
+    if(state.working_directory[0] && git_read_branch_fast(state.working_directory, git_status.branch, sizeof(git_status.branch)))
     {
-        gs.valid = true;
-        gs.stashes = git_read_stash_count(state.cwd);
-        get_git_status_cached(state.cwd, &gs.modified, &gs.staged,
-                              &gs.ahead, &gs.behind, &gs.cache_state);
+        git_status.valid = true;
+        git_status.stashes = git_read_stash_count(state.working_directory);
+        get_git_status_cached(state.working_directory, &git_status.modified, &git_status.staged,
+                              &git_status.ahead, &git_status.behind, &git_status.cache_state);
     }
-    U64 t_git = time_us();
+    U64 time_git = time_microseconds();
 
     // Build output
-    OutBuf buf;
-    memset(&buf, 0, sizeof(buf));
-    build_statusline(&buf, &state, &gs);
-    U64 t_build = time_us();
+    Output_Buffer output_buffer;
+    memset(&output_buffer, 0, sizeof(output_buffer));
+    build_statusline(&output_buffer, &state, &git_status);
+    U64 time_build = time_microseconds();
 
     // Timing suffix (hand-rolled)
-    U64 t_now = time_us();
-    U64 total_us = t_now - t_start;
-    out_lit(&buf, "  " ANSI_FG_COMMENT);
-    if(total_us >= 1000)
+    U64 time_now = time_microseconds();
+    U64 total_microseconds = time_now - time_start;
+    output_literal(&output_buffer, "  " ANSI_FG_COMMENT);
+    if(total_microseconds >= 1000)
     {
-        out_f64(&buf, total_us / 1000.0, 1);
-        out_lit(&buf, "ms");
+        output_f64(&output_buffer, total_microseconds / 1000.0, 1);
+        output_literal(&output_buffer, "ms");
     }
     else
     {
-        out_u64(&buf, total_us);
-        out_lit(&buf, "us");
+        output_u64(&output_buffer, total_microseconds);
+        output_literal(&output_buffer, "us");
     }
-    out_lit(&buf, ANSI_RESET);
+    output_literal(&output_buffer, ANSI_RESET);
 
-    write(STDOUT_FILENO, buf.data, buf.len);
+    write(STDOUT_FILENO, output_buffer.data, output_buffer.length);
 
     if(debug)
-        write_debug_log(t_start, t_cleanup, t_read, t_parse, t_git, t_build, gs.cache_state, has_stdin);
+        write_debug_log(time_start, time_cleanup, time_read, time_parse, time_git, time_build, git_status.cache_state, has_stdin);
 
     return 0;
 }
