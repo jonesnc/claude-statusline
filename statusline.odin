@@ -73,7 +73,6 @@ ICON_INSERT    :: "\uF040"   //  pencil (insert mode)
 ICON_NORMAL    :: "\uE7C5"   //  vim logo (normal mode)
 ICON_STAGED    :: "\uF00C"   //  checkmark (staged)
 ICON_MODIFIED  :: "\uF040"   //  pencil (modified)
-ICON_AGENT     :: "\uF544"   //  robot (agent)
 ICON_WARN      :: "\uF071"   //  warning triangle
 
 /* ---------------------------------------------------------------------------------- */
@@ -878,7 +877,6 @@ DisplayState :: struct {
     used_pct:          i64,
     ctx_size:          i64,
     vim_mode:          string,
-    agent_name:        string,
 }
 
 DebugTimings :: struct {
@@ -928,7 +926,6 @@ resolve_state :: proc(input: string, stdin_timeout: bool) -> DisplayState {
         json_pct           := json_get_number(input, "used_percentage")
         json_ctx_size      := json_get_number(input, "context_window_size")
         state.vim_mode      = json_get_string(input, "mode")
-        state.agent_name    = json_get_string(input, "name")
 
         // Overlay non-zero JSON with cache (prevents flicker during API calls)
         state.cwd               = len(json_cwd) > 0 ? json_cwd : string(cstring(&cached.cwd[0]))
@@ -1012,13 +1009,6 @@ build_statusline :: proc(buf: ^OutBuf, state: ^DisplayState, gs: ^GitStatus) {
     strings.write_string(&model_text, state.model)
     segment(buf, ANSI_BG_PURPLE, ANSI_FG_BLACK, strings.to_string(model_text), first)
     first = false
-
-    // Agent name (only when using --agent)
-    if len(state.agent_name) > 0 {
-        agent_text := strings.builder_make(context.temp_allocator)
-        fmt.sbprintf(&agent_text, "%s %s", ICON_AGENT, state.agent_name)
-        segment(buf, ANSI_BG_CYAN, ANSI_FG_BLACK, strings.to_string(agent_text), false)
-    }
 
     // Path
     path_text := strings.builder_make(context.temp_allocator)
