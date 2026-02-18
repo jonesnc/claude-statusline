@@ -539,7 +539,7 @@ internal U64
 make_context_bar(S64 percent, S64 context_size, char *output, U64 output_capacity)
 {
     S64 clamped = Min(percent, 100);
-    int width = 15;
+    int width = 10;
     int filled = (int)(clamped * width / 100);
     int empty = width - filled;
 
@@ -732,6 +732,7 @@ struct __attribute__((packed)) Cached_State
     S64    lines_added;
     S64    lines_removed;
     S64    duration_ms;
+    S64    last_update_sec;
     char   working_directory[256];
     char   model[64];
 };
@@ -1190,6 +1191,7 @@ struct Display_State
     S64    total_duration_ms;
     S64    used_percent;
     S64    context_size;
+    S64    last_update_sec;
     char   vim_mode[32];
 };
 
@@ -1260,6 +1262,7 @@ resolve_state(const char *input, B32 has_stdin, Display_State *state)
         state->total_duration_ms = fields.total_duration_ms > 0 ? fields.total_duration_ms : cached.duration_ms;
         state->used_percent      = fields.used_percentage > 0 ? fields.used_percentage : cached.used_percent;
         state->context_size      = fields.context_window_size > 0 ? fields.context_window_size : cached.context_size;
+        state->last_update_sec   = (S64)time(NULL);
 
         // Update cache
         Cached_State new_cache;
@@ -1269,6 +1272,7 @@ resolve_state(const char *input, B32 has_stdin, Display_State *state)
         new_cache.lines_added   = Max(fields.total_lines_added, cached.lines_added);
         new_cache.lines_removed = Max(fields.total_lines_removed, cached.lines_removed);
         new_cache.duration_ms   = Max(fields.total_duration_ms, cached.duration_ms);
+        new_cache.last_update_sec = state->last_update_sec;
 
         memset(new_cache.working_directory, 0, sizeof(new_cache.working_directory));
         memset(new_cache.model, 0, sizeof(new_cache.model));
@@ -1295,6 +1299,7 @@ resolve_state(const char *input, B32 has_stdin, Display_State *state)
         state->total_duration_ms = cached.duration_ms;
         state->used_percent      = cached.used_percent;
         state->context_size      = cached.context_size;
+        state->last_update_sec   = cached.last_update_sec;
     }
 }
 
@@ -1400,13 +1405,37 @@ build_statusline(Output_Buffer *buffer, Display_State *state, Git_Status *git_st
         segment_no_foreground(buffer, ANSI_BG_DARK, lines_text, (U64)(cursor - lines_text), false);
     }
 
-    // Session duration
+    // Session duration + last update time
     if(state->total_duration_ms > 0)
     {
-        char duration_text[64];
+        char duration_text[128];
         char *cursor = duration_text;
         memcpy(cursor, ICON_CLOCK " ", sizeof(ICON_CLOCK " ")-1); cursor += sizeof(ICON_CLOCK " ")-1;
         cursor += format_duration(state->total_duration_ms, cursor);
+
+        if(state->last_update_sec > 0)
+        {
+            // Faint separator
+            memcpy(cursor, " " ANSI_FG_COMMENT "| " ANSI_FG_WHITE, sizeof(" " ANSI_FG_COMMENT "| " ANSI_FG_WHITE)-1);
+            cursor += sizeof(" " ANSI_FG_COMMENT "| " ANSI_FG_WHITE)-1;
+
+            time_t update_time = (time_t)state->last_update_sec;
+            struct tm local_time;
+            localtime_r(&update_time, &local_time);
+
+            int hour12 = local_time.tm_hour % 12;
+            if(hour12 == 0) hour12 = 12;
+            const char *ampm = local_time.tm_hour < 12 ? " AM" : " PM";
+
+            cursor += format_u64(cursor, (U64)hour12);
+            *cursor++ = ':';
+            if(local_time.tm_min < 10) *cursor++ = '0';
+            cursor += format_u64(cursor, (U64)local_time.tm_min);
+            *cursor++ = ':';
+            if(local_time.tm_sec < 10) *cursor++ = '0';
+            cursor += format_u64(cursor, (U64)local_time.tm_sec);
+            memcpy(cursor, ampm, 3); cursor += 3;
+        }
 
         segment_literal(buffer, ANSI_BG_DARK, ANSI_FG_WHITE, duration_text, (U64)(cursor - duration_text), false);
     }
@@ -1537,7 +1566,7 @@ main(void)
     build_statusline(&output_buffer, &state, &git_status);
     U64 time_build = time_microseconds();
 
-    // Timing suffix (hand-rolled)
+    // Timing suffix (render time only)
     U64 time_now = time_microseconds();
     U64 total_microseconds = time_now - time_start;
     output_literal(&output_buffer, "  " ANSI_FG_COMMENT);
