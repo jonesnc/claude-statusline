@@ -12,6 +12,7 @@
 //
 // Shared state files:
 //   /dev/shm/statusline-cache.<gppid>   - Per-session cached state
+//   /dev/shm/statusline-usage.<gppid>   - Per-session usage quota cache
 //   /dev/shm/statusline-cleanup         - Sentinel for cleanup interval
 //   /dev/shm/claude-git-<hash>          - Per-repo git status cache
 //   /tmp/statusline-<uid>/<pid>.log     - Debug timing logs
@@ -517,9 +518,41 @@ abbreviate_path(const char *path, char *output, U64 output_capacity)
 
         if(component_start < last_slash && working[component_start] != '~')
         {
-            // Abbreviate: just first char
-            if(output_position < output_capacity - 1)
-                output[output_position++] = working[component_start];
+            // Abbreviate: preserve issue number if present, else first char
+            // Scan component for a digit run (issue number)
+            U64 digit_start = 0, digit_end = 0;
+            B32 found_digits = false;
+            for(U64 i = component_start; i < component_start + component_length; i++)
+            {
+                if(working[i] >= '0' && working[i] <= '9')
+                {
+                    if(!found_digits) { digit_start = i; found_digits = true; }
+                    digit_end = i + 1;
+                }
+                else if(found_digits) break;
+            }
+
+            if(found_digits && digit_end - digit_start >= 2)
+            {
+                // Copy digit run + ellipsis if there's more after
+                U64 dlen = digit_end - digit_start;
+                U64 copy_len = Min(dlen, output_capacity - 1 - output_position);
+                memcpy(output + output_position, working + digit_start, copy_len);
+                output_position += copy_len;
+                if(digit_end < component_start + component_length && output_position + 3 <= output_capacity - 1)
+                {
+                    // U+2026 ellipsis (UTF-8: E2 80 A6)
+                    output[output_position++] = '\xe2';
+                    output[output_position++] = '\x80';
+                    output[output_position++] = '\xa6';
+                }
+            }
+            else
+            {
+                // No issue number: just first char
+                if(output_position < output_capacity - 1)
+                    output[output_position++] = working[component_start];
+            }
         }
         else
         {
@@ -539,7 +572,7 @@ internal U64
 make_context_bar(S64 percent, S64 context_size, char *output, U64 output_capacity)
 {
     S64 clamped = Min(percent, 100);
-    int width = 10;
+    int width = 5;
     int filled = (int)(clamped * width / 100);
     int empty = width - filled;
 
@@ -551,53 +584,23 @@ make_context_bar(S64 percent, S64 context_size, char *output, U64 output_capacit
     else                   { fill_color = ANSI_FG_GREEN;  fill_color_length = sizeof(ANSI_FG_GREEN)-1; }
 
     char *cursor = output;
-    char *buffer_end = output + output_capacity - 1;
 
-    // Fill color
+    // Filled blocks in fill color
     memcpy(cursor, fill_color, fill_color_length); cursor += fill_color_length;
+    for(int i = 0; i < filled; i++)
+    { memcpy(cursor, "\xe2\x96\xb0", 3); cursor += 3; }  // ▰
 
-    // Used tokens label: Nk
-    S64 used_tokens = percent * context_size / 100;
-    S64 used_thousands = (used_tokens + 500) / 1000;
-    cursor += format_s64(cursor, used_thousands);
-    *cursor++ = 'k'; *cursor++ = ' ';
-
-    // Left cap
-    memcpy(cursor, UTF8_LCAP, 3); cursor += 3;
-
-    // Filled bars
-    for(int bar_index = 0; bar_index < filled && cursor + 3 <= buffer_end; bar_index++)
-    { memcpy(cursor, UTF8_FILL, 3); cursor += 3; }
+    // Empty blocks - use dimmer but still solid ▱ with white color for visibility
+    memcpy(cursor, ANSI_FG_WHITE, sizeof(ANSI_FG_WHITE)-1);
+    cursor += sizeof(ANSI_FG_WHITE)-1;
+    for(int i = 0; i < empty; i++)
+    { memcpy(cursor, "\xe2\x96\xb1", 3); cursor += 3; }  // ▱
 
     // Percentage
     *cursor++ = ' ';
-    cursor += format_s64(cursor, clamped);
-    *cursor++ = '%'; *cursor++ = ' ';
-
-    // Comment color for empty portion
-    memcpy(cursor, ANSI_FG_COMMENT, sizeof(ANSI_FG_COMMENT)-1);
-    cursor += sizeof(ANSI_FG_COMMENT)-1;
-
-    // Empty bars
-    for(int bar_index = 0; bar_index < empty && cursor + 3 <= buffer_end; bar_index++)
-    { memcpy(cursor, UTF8_EMPTY, 3); cursor += 3; }
-
-    // Right cap
-    memcpy(cursor, UTF8_RCAP, 3); cursor += 3;
-
-    // Total context label in fill color
     memcpy(cursor, fill_color, fill_color_length); cursor += fill_color_length;
-    *cursor++ = ' ';
-    if(context_size >= 1000000)
-    {
-        cursor += format_s64(cursor, context_size / 1000000);
-        *cursor++ = 'M';
-    }
-    else
-    {
-        cursor += format_s64(cursor, context_size / 1000);
-        *cursor++ = 'k';
-    }
+    cursor += format_s64(cursor, clamped);
+    *cursor++ = '%';
 
     *cursor = '\0';
     return (U64)(cursor - output);
@@ -796,6 +799,232 @@ write_cached_state(const Cached_State *state)
     close(file_desc);
 }
 
+//~ Usage Quota Cache
+
+#define USAGE_CACHE_TTL_S 60
+#define USAGE_CACHE_PREFIX "/dev/shm/statusline-usage."
+
+typedef struct __attribute__((packed)) Usage_Cache Usage_Cache;
+struct __attribute__((packed)) Usage_Cache
+{
+    S64    fetch_time_sec;
+    double five_hour_pct;
+    double seven_day_pct;
+};
+
+internal void
+get_usage_cache_path(int gppid, char *output, U64 output_capacity)
+{
+    snprintf(output, output_capacity, "%s%d", USAGE_CACHE_PREFIX, gppid);
+}
+
+// Extract a JSON string value for a given key from raw JSON text.
+// Returns pointer into json, sets *length. Key must include quotes and colon.
+internal const char *
+json_extract_string(const char *json, const char *key, U64 *length)
+{
+    *length = 0;
+    const char *found = strstr(json, key);
+    if(!found) return NULL;
+    const char *cursor = found + strlen(key);
+    while(*cursor == ' ' || *cursor == '\t') cursor++;
+    if(*cursor != '"') return NULL;
+    cursor++;
+    const char *start = cursor;
+    while(*cursor && *cursor != '"') cursor++;
+    *length = (U64)(cursor - start);
+    return start;
+}
+
+// Extract a double value for key like "utilization": 0.39
+internal double
+json_extract_f64(const char *json, const char *key)
+{
+    const char *found = strstr(json, key);
+    if(!found) return 0.0;
+    const char *cursor = found + strlen(key);
+    while(*cursor == ' ' || *cursor == '\t' || *cursor == ':') cursor++;
+    return strtod(cursor, NULL);
+}
+
+// Find the start of a JSON object for a given key, e.g. "five_hour": {
+internal const char *
+json_find_object(const char *json, const char *key)
+{
+    const char *found = strstr(json, key);
+    if(!found) return NULL;
+    const char *cursor = found + strlen(key);
+    while(*cursor && *cursor != '{') cursor++;
+    return *cursor == '{' ? cursor : NULL;
+}
+
+internal void
+refresh_usage_cache(int gppid)
+{
+    pid_t first_fork = fork();
+    if(first_fork < 0) return;
+    if(first_fork > 0) { waitpid(first_fork, NULL, 0); return; }
+
+    // Middle child — fork grandchild and exit
+    if(fork() != 0) _exit(0);
+
+    // Grandchild: read credentials, curl, parse, write cache
+
+    // Read ~/.claude/.credentials.json
+    const char *home = getenv("HOME");
+    if(!home) _exit(1);
+
+    char cred_path[512];
+    snprintf(cred_path, sizeof(cred_path),
+             "%s/.claude/.credentials.json", home);
+
+    int cred_fd = open(cred_path, O_RDONLY);
+    if(cred_fd < 0) _exit(1);
+
+    char cred_buf[4096];
+    ssize_t cred_len = read(cred_fd, cred_buf, sizeof(cred_buf) - 1);
+    close(cred_fd);
+    if(cred_len <= 0) _exit(1);
+    cred_buf[cred_len] = '\0';
+
+    // Find claudeAiOauth object, then extract accessToken
+    const char *oauth_obj = json_find_object(cred_buf,
+                                             "\"claudeAiOauth\"");
+    if(!oauth_obj) _exit(1);
+
+    U64 token_len;
+    const char *token = json_extract_string(oauth_obj,
+                                            "\"accessToken\":",
+                                            &token_len);
+    if(!token || token_len == 0) _exit(1);
+
+    // Build Authorization header
+    char auth_header[2048];
+    int auth_len = snprintf(auth_header, sizeof(auth_header),
+                            "Authorization: Bearer %.*s",
+                            (int)token_len, token);
+    if(auth_len <= 0 || auth_len >= (int)sizeof(auth_header))
+        _exit(1);
+
+    // Fork/exec curl
+    int pipe_fds[2];
+    if(pipe(pipe_fds) != 0) _exit(1);
+
+    pid_t curl_pid = fork();
+    if(curl_pid < 0) _exit(1);
+
+    if(curl_pid == 0)
+    {
+        close(pipe_fds[0]);
+        dup2(pipe_fds[1], STDOUT_FILENO);
+        int dev_null = open("/dev/null", O_WRONLY);
+        if(dev_null >= 0)
+        {
+            dup2(dev_null, STDERR_FILENO);
+            close(dev_null);
+        }
+        close(pipe_fds[1]);
+
+        char *argv[] = {
+            "curl", "-s", "--max-time", "10",
+            "-H", auth_header,
+            "-H", "anthropic-beta: oauth-2025-04-20",
+            "https://api.anthropic.com/api/oauth/usage",
+            NULL
+        };
+        execvp("curl", argv);
+        _exit(127);
+    }
+
+    close(pipe_fds[1]);
+
+    char response[8192];
+    int total_read = 0;
+    for(;;)
+    {
+        int remaining = (int)sizeof(response) - total_read - 1;
+        if(remaining <= 0) break;
+        ssize_t n = read(pipe_fds[0], response + total_read, remaining);
+        if(n <= 0) break;
+        total_read += (int)n;
+    }
+    close(pipe_fds[0]);
+    waitpid(curl_pid, NULL, 0);
+    response[total_read] = '\0';
+
+    // Parse: find five_hour and seven_day objects, extract utilization
+    double five_hour_pct = 0.0;
+    double seven_day_pct = 0.0;
+
+    const char *five_hour_obj = json_find_object(response,
+                                                  "\"five_hour\"");
+    if(five_hour_obj)
+        five_hour_pct = json_extract_f64(five_hour_obj,
+                                          "\"utilization\"");
+
+    const char *seven_day_obj = json_find_object(response,
+                                                  "\"seven_day\"");
+    if(seven_day_obj)
+        seven_day_pct = json_extract_f64(seven_day_obj,
+                                          "\"utilization\"");
+
+    // Write cache
+    Usage_Cache cache;
+    cache.fetch_time_sec = (S64)time(NULL);
+    cache.five_hour_pct  = five_hour_pct;
+    cache.seven_day_pct  = seven_day_pct;
+
+    char cache_path[64];
+    get_usage_cache_path(gppid, cache_path, sizeof(cache_path));
+
+    int cache_fd = open(cache_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if(cache_fd >= 0)
+    {
+        write(cache_fd, &cache, sizeof(cache));
+        close(cache_fd);
+    }
+    _exit(0);
+}
+
+internal Usage_Cache
+read_usage_cache(int gppid)
+{
+    Usage_Cache cache;
+    memset(&cache, 0, sizeof(cache));
+
+    char cache_path[64];
+    get_usage_cache_path(gppid, cache_path, sizeof(cache_path));
+
+    int fd = open(cache_path, O_RDONLY);
+    if(fd < 0)
+    {
+        // No cache — trigger background fetch, return zeros
+        refresh_usage_cache(gppid);
+        return cache;
+    }
+
+    ssize_t n = read(fd, &cache, sizeof(cache));
+    close(fd);
+    if(n != sizeof(cache))
+    {
+        memset(&cache, 0, sizeof(cache));
+        refresh_usage_cache(gppid);
+        return cache;
+    }
+
+    // Check TTL
+    S64 now = (S64)time(NULL);
+    if(now - cache.fetch_time_sec > USAGE_CACHE_TTL_S)
+    {
+        // Stale — return stale data, refresh in background
+        refresh_usage_cache(gppid);
+    }
+
+    return cache;
+}
+
+//~ Cache Cleanup
+
 internal void
 cleanup_stale_caches(void)
 {
@@ -816,9 +1045,14 @@ cleanup_stale_caches(void)
     struct dirent *entry;
     while((entry = readdir(shared_memory_dir)) != NULL)
     {
-        if(strncmp(entry->d_name, "statusline-cache.", 17) != 0) continue;
+        int pid = 0;
+        if(strncmp(entry->d_name, "statusline-cache.", 17) == 0)
+            pid = (int)strtol(entry->d_name + 17, NULL, 10);
+        else if(strncmp(entry->d_name, "statusline-usage.", 17) == 0)
+            pid = (int)strtol(entry->d_name + 17, NULL, 10);
+        else
+            continue;
 
-        int pid = (int)strtol(entry->d_name + 17, NULL, 10);
         if(pid <= 0) continue;
         if(kill(pid, 0) == 0) continue;
 
@@ -1082,6 +1316,55 @@ get_git_status_cached(const char *repo_path, U32 *modified, U32 *staged,
     }
 }
 
+//~ Model Abbreviation
+// "Claude 3.5 Sonnet" -> "So3.5", "Opus 4.6" -> "Op4.6", "Haiku 4.5" -> "Ha4.5"
+
+internal U64
+abbreviate_model(const char *model, char *output, U64 output_capacity)
+{
+    // Known model family prefixes (match last word before version)
+    static const struct { const char *name; const char *abbrev; } families[] = {
+        {"Opus",   "Op"},
+        {"Sonnet", "So"},
+        {"Haiku",  "Ha"},
+    };
+
+    // Find version number (first digit followed by dot and digit)
+    const char *version = NULL;
+    for(const char *p = model; *p; p++)
+    {
+        if(*p >= '0' && *p <= '9' && p[1] == '.' && p[2] >= '0' && p[2] <= '9')
+        { version = p; break; }
+    }
+
+    // Find family name
+    const char *abbrev = NULL;
+    for(int i = 0; i < 3; i++)
+    {
+        if(strstr(model, families[i].name))
+        { abbrev = families[i].abbrev; break; }
+    }
+
+    if(abbrev && version)
+    {
+        char *cursor = output;
+        U64 abbrev_len = strlen(abbrev);
+        memcpy(cursor, abbrev, abbrev_len); cursor += abbrev_len;
+        // Copy version: digits, dots, digits
+        while(*version && ((*version >= '0' && *version <= '9') || *version == '.'))
+            *cursor++ = *version++;
+        *cursor = '\0';
+        return (U64)(cursor - output);
+    }
+
+    // Fallback: copy as-is
+    U64 len = strlen(model);
+    if(len >= output_capacity) len = output_capacity - 1;
+    memcpy(output, model, len);
+    output[len] = '\0';
+    return len;
+}
+
 //~ Branch Truncation
 
 internal const char *
@@ -1192,6 +1475,8 @@ struct Display_State
     S64    used_percent;
     S64    context_size;
     S64    last_update_sec;
+    double five_hour_pct;
+    double seven_day_pct;
     char   vim_mode[32];
 };
 
@@ -1310,7 +1595,7 @@ build_statusline(Output_Buffer *buffer, Display_State *state, Git_Status *git_st
 {
     B32 first = true;
 
-    // Vim mode
+    // Vim mode (icon only, color indicates mode)
     if(state->vim_mode[0])
     {
         const char *vim_background, *vim_foreground, *vim_icon;
@@ -1336,21 +1621,20 @@ build_statusline(Output_Buffer *buffer, Display_State *state, Git_Status *git_st
             memcpy(cursor, ANSI_BOLD, sizeof(ANSI_BOLD)-1); cursor += sizeof(ANSI_BOLD)-1;
         }
         memcpy(cursor, vim_icon, vim_icon_length); cursor += vim_icon_length;
-        *cursor++ = ' ';
-        U64 mode_length = strlen(state->vim_mode);
-        memcpy(cursor, state->vim_mode, mode_length); cursor += mode_length;
 
         segment(buffer, vim_background, vim_background_length, vim_foreground, vim_foreground_length, vim_text, (U64)(cursor - vim_text), first);
         first = false;
     }
 
-    // Model (bold)
+    // Model (abbreviated, bold)
     {
+        char abbrev[32];
+        U64 abbrev_length = abbreviate_model(state->model, abbrev, sizeof(abbrev));
+
         char model_text[128];
         memcpy(model_text, ANSI_BOLD, sizeof(ANSI_BOLD)-1);
-        U64 model_length = strlen(state->model);
-        memcpy(model_text + sizeof(ANSI_BOLD)-1, state->model, model_length);
-        U64 text_length = sizeof(ANSI_BOLD)-1 + model_length;
+        memcpy(model_text + sizeof(ANSI_BOLD)-1, abbrev, abbrev_length);
+        U64 text_length = sizeof(ANSI_BOLD)-1 + abbrev_length;
 
         segment_literal(buffer, ANSI_BG_PURPLE, ANSI_FG_BLACK, model_text, text_length, first);
         first = false;
@@ -1387,30 +1671,54 @@ build_statusline(Output_Buffer *buffer, Display_State *state, Git_Status *git_st
                 cost_text, (U64)(cursor - cost_text), false);
     }
 
-    // Lines changed
-    if(state->lines_added > 0 || state->lines_removed > 0)
+    // Usage quota
+    if(state->five_hour_pct >= 50 || state->seven_day_pct >= 50)
     {
-        char lines_text[128];
-        char *cursor = lines_text;
-        memcpy(cursor, ANSI_FG_WHITE, sizeof(ANSI_FG_WHITE)-1); cursor += sizeof(ANSI_FG_WHITE)-1;
-        memcpy(cursor, ICON_DIFF " ", sizeof(ICON_DIFF " ")-1); cursor += sizeof(ICON_DIFF " ")-1;
-        memcpy(cursor, ANSI_FG_GREEN, sizeof(ANSI_FG_GREEN)-1); cursor += sizeof(ANSI_FG_GREEN)-1;
-        *cursor++ = '+';
-        cursor += format_s64(cursor, state->lines_added);
-        *cursor++ = ' ';
-        memcpy(cursor, ANSI_FG_RED, sizeof(ANSI_FG_RED)-1); cursor += sizeof(ANSI_FG_RED)-1;
-        *cursor++ = '-';
-        cursor += format_s64(cursor, state->lines_removed);
+        char usage_text[256];
+        char *cursor = usage_text;
 
-        segment_no_foreground(buffer, ANSI_BG_DARK, lines_text, (U64)(cursor - lines_text), false);
+        // 5h: white label, bold colored percentage
+        const char *color_5h;
+        U64 color_5h_len;
+        if(state->five_hour_pct >= 90)       { color_5h = ANSI_FG_RED;    color_5h_len = sizeof(ANSI_FG_RED)-1;    }
+        else if(state->five_hour_pct >= 80)  { color_5h = ANSI_FG_ORANGE; color_5h_len = sizeof(ANSI_FG_ORANGE)-1; }
+        else if(state->five_hour_pct >= 50)  { color_5h = ANSI_FG_YELLOW; color_5h_len = sizeof(ANSI_FG_YELLOW)-1; }
+        else                                 { color_5h = ANSI_FG_GREEN;  color_5h_len = sizeof(ANSI_FG_GREEN)-1;  }
+
+        memcpy(cursor, ANSI_FG_WHITE, sizeof(ANSI_FG_WHITE)-1); cursor += sizeof(ANSI_FG_WHITE)-1;
+        memcpy(cursor, "5h ", 3); cursor += 3;
+        memcpy(cursor, ANSI_BOLD, sizeof(ANSI_BOLD)-1); cursor += sizeof(ANSI_BOLD)-1;
+        memcpy(cursor, color_5h, color_5h_len); cursor += color_5h_len;
+        cursor += format_u64(cursor, (U64)(state->five_hour_pct + 0.5));
+        *cursor++ = '%';
+
+        // Faint separator
+        memcpy(cursor, " " ANSI_FG_WHITE, sizeof(" " ANSI_FG_WHITE)-1);
+        cursor += sizeof(" " ANSI_FG_WHITE)-1;
+
+        // 7d: white label, bold colored percentage
+        const char *color_7d;
+        U64 color_7d_len;
+        if(state->seven_day_pct >= 90)       { color_7d = ANSI_FG_RED;    color_7d_len = sizeof(ANSI_FG_RED)-1;    }
+        else if(state->seven_day_pct >= 80)  { color_7d = ANSI_FG_ORANGE; color_7d_len = sizeof(ANSI_FG_ORANGE)-1; }
+        else if(state->seven_day_pct >= 50)  { color_7d = ANSI_FG_YELLOW; color_7d_len = sizeof(ANSI_FG_YELLOW)-1; }
+        else                                 { color_7d = ANSI_FG_GREEN;  color_7d_len = sizeof(ANSI_FG_GREEN)-1;  }
+
+        memcpy(cursor, "7d ", 3); cursor += 3;
+        memcpy(cursor, ANSI_BOLD, sizeof(ANSI_BOLD)-1); cursor += sizeof(ANSI_BOLD)-1;
+        memcpy(cursor, color_7d, color_7d_len); cursor += color_7d_len;
+        cursor += format_u64(cursor, (U64)(state->seven_day_pct + 0.5));
+        *cursor++ = '%';
+
+        segment_no_foreground(buffer, ANSI_BG_COMMENT, usage_text, (U64)(cursor - usage_text), false);
     }
 
     // Session duration + last update time
     if(state->total_duration_ms > 0)
     {
-        char duration_text[128];
+        char duration_text[256];
         char *cursor = duration_text;
-        memcpy(cursor, ICON_CLOCK " ", sizeof(ICON_CLOCK " ")-1); cursor += sizeof(ICON_CLOCK " ")-1;
+        memcpy(cursor, ANSI_FG_WHITE ICON_CLOCK " ", sizeof(ANSI_FG_WHITE ICON_CLOCK " ")-1); cursor += sizeof(ANSI_FG_WHITE ICON_CLOCK " ")-1;
         cursor += format_duration(state->total_duration_ms, cursor);
 
         if(state->last_update_sec > 0)
@@ -1437,14 +1745,12 @@ build_statusline(Output_Buffer *buffer, Display_State *state, Git_Status *git_st
             memcpy(cursor, ampm, 3); cursor += 3;
         }
 
-        segment_literal(buffer, ANSI_BG_DARK, ANSI_FG_WHITE, duration_text, (U64)(cursor - duration_text), false);
-    }
+        // Inline context bar after duration
+        memcpy(cursor, " " ANSI_FG_COMMENT "| ", sizeof(" " ANSI_FG_COMMENT "| ")-1);
+        cursor += sizeof(" " ANSI_FG_COMMENT "| ")-1;
+        cursor += make_context_bar(state->used_percent, state->context_size, cursor, sizeof(duration_text) - (U64)(cursor - duration_text));
 
-    // Context bar
-    {
-        char context_bar[512];
-        U64 context_bar_length = make_context_bar(state->used_percent, state->context_size, context_bar, sizeof(context_bar));
-        segment_no_foreground(buffer, ANSI_BG_DARK, context_bar, context_bar_length, false);
+        segment_no_foreground(buffer, ANSI_BG_DARK, duration_text, (U64)(cursor - duration_text), false);
     }
 
     // Context warnings
@@ -1548,6 +1854,14 @@ main(void)
     resolve_state(input, has_stdin, &state);
     U64 time_parse = time_microseconds();
 
+    // Usage quota (background fetch, ~5us on cache hit)
+    {
+        int gppid = get_grandparent_pid();
+        Usage_Cache usage = read_usage_cache(gppid);
+        state.five_hour_pct  = usage.five_hour_pct;
+        state.seven_day_pct  = usage.seven_day_pct;
+    }
+
     // Git status
     Git_Status git_status;
     memset(&git_status, 0, sizeof(git_status));
@@ -1566,21 +1880,24 @@ main(void)
     build_statusline(&output_buffer, &state, &git_status);
     U64 time_build = time_microseconds();
 
-    // Timing suffix (render time only)
-    U64 time_now = time_microseconds();
-    U64 total_microseconds = time_now - time_start;
-    output_literal(&output_buffer, "  " ANSI_FG_COMMENT);
-    if(total_microseconds >= 1000)
+    // Timing suffix (only when debug enabled)
+    if(debug)
     {
-        output_f64(&output_buffer, total_microseconds / 1000.0, 1);
-        output_literal(&output_buffer, "ms");
+        U64 time_now = time_microseconds();
+        U64 total_microseconds = time_now - time_start;
+        output_literal(&output_buffer, "  " ANSI_FG_COMMENT);
+        if(total_microseconds >= 1000)
+        {
+            output_f64(&output_buffer, total_microseconds / 1000.0, 1);
+            output_literal(&output_buffer, "ms");
+        }
+        else
+        {
+            output_u64(&output_buffer, total_microseconds);
+            output_literal(&output_buffer, "us");
+        }
+        output_literal(&output_buffer, ANSI_RESET);
     }
-    else
-    {
-        output_u64(&output_buffer, total_microseconds);
-        output_literal(&output_buffer, "us");
-    }
-    output_literal(&output_buffer, ANSI_RESET);
 
     write(STDOUT_FILENO, output_buffer.data, output_buffer.length);
 
