@@ -1,34 +1,29 @@
-// Claude Code Statusline - Odin Version (v4)
+// Claude Code Statusline - Odin Version (v5)
 //
 // A fast statusline for Claude Code written in Odin.
-// Port of the C version with enhanced visuals.
+// Full port of the C version with compact layout.
 //
 // Build: odin build . -o:speed -out:statusline_odin
 // Usage: Set in ~/.claude/settings.json statusLine.command
 //
 // Shared state files:
-//   /dev/shm/statusline-cache.<gppid>   - Per-session cached state (cost, tokens, pct, cwd,
-//                                         model, lines, duration) to prevent flicker during
-//                                         API calls and serve as fallback on stdin timeout
-//   /dev/shm/statusline-cleanup         - Sentinel file; mtime tracks last cleanup run
-//                                         (cleanup runs every 5 minutes)
-//   /dev/shm/claude-git-<hash>          - Per-repo git status cache (modified/staged counts)
-//                                         keyed by FNV-1a hash of repo path, mtime-invalidated
-//   /tmp/statusline-<uid>/<pid>.log     - Per-user, per-session debug timing logs
-//                                         (only when STATUSLINE_DEBUG=1)
+//   /dev/shm/statusline-cache.<gppid>   - Per-session cached state
+//   /dev/shm/statusline-usage.<gppid>   - Per-session usage quota cache
+//   /dev/shm/statusline-cleanup         - Sentinel for cleanup interval
+//   /dev/shm/claude-git-<hash>          - Per-repo git status cache
+//   /tmp/statusline-<uid>/<pid>.log     - Debug timing logs
 
 package main
 
 import "core:fmt"
-import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
 
-/* ---------------------------------------------------------------------------------- */
-/* ANSI Colors (Dracula Theme)                                                        */
-/* ---------------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* ANSI Colors (Dracula Theme)                                                */
+/* -------------------------------------------------------------------------- */
 
 ANSI_RESET      :: "\x1b[0m"
 ANSI_BOLD       :: "\x1b[1m"
@@ -56,28 +51,23 @@ ANSI_FG_CYAN    :: "\x1b[38;2;139;233;253m"
 ANSI_FG_PINK    :: "\x1b[38;2;255;121;198m"
 
 // Powerline separators
-SEP_ARROW   :: "\uE0B0"  //
 SEP_ROUND   :: "\uE0B4"  //
-SEP_FLAME   :: "\uE0C0"  //
 
 // Nerd Font icons
 ICON_BRANCH    :: "\uF126"   //  git branch
 ICON_FOLDER    :: "\uF07C"   //  folder open
 ICON_DOLLAR    :: "\uF155"   //  dollar
-ICON_TAG       :: "\uF02B"   //  tag
 ICON_CLOCK     :: "\uF017"   //  clock
-ICON_DIFF      :: "\uF440"   //  diff
 ICON_STASH     :: "\uF01C"   //  inbox/stash
-ICON_TOKENS    :: "\uF2DB"   //  microchip
 ICON_INSERT    :: "\uF040"   //  pencil (insert mode)
 ICON_NORMAL    :: "\uE7C5"   //  vim logo (normal mode)
 ICON_STAGED    :: "\uF00C"   //  checkmark (staged)
 ICON_MODIFIED  :: "\uF040"   //  pencil (modified)
 ICON_WARN      :: "\uF071"   //  warning triangle
 
-/* ---------------------------------------------------------------------------------- */
-/* Output Buffer                                                                      */
-/* ---------------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* Output Buffer                                                              */
+/* -------------------------------------------------------------------------- */
 
 OutBuf :: struct {
     data:    [4096]u8,
@@ -99,28 +89,48 @@ out_char :: proc(buf: ^OutBuf, c: u8) {
     }
 }
 
-/* ---------------------------------------------------------------------------------- */
-/* Segment Builder                                                                    */
-/* ---------------------------------------------------------------------------------- */
+out_int :: proc(buf: ^OutBuf, val: i64) {
+    tmp: [20]u8
+    s := fmt.bprintf(tmp[:], "%d", val)
+    out_str(buf, s)
+}
+
+out_f64 :: proc(buf: ^OutBuf, val: f64, decimals: int) {
+    tmp: [32]u8
+    s: string
+    switch decimals {
+    case 0: s = fmt.bprintf(tmp[:], "%.0f", val)
+    case 1: s = fmt.bprintf(tmp[:], "%.1f", val)
+    case 2: s = fmt.bprintf(tmp[:], "%.2f", val)
+    case:   s = fmt.bprintf(tmp[:], "%f", val)
+    }
+    out_str(buf, s)
+}
+
+/* -------------------------------------------------------------------------- */
+/* Segment Builder                                                            */
+/* -------------------------------------------------------------------------- */
 
 bg_to_fg :: proc(bg: string) -> string {
-    if len(bg) == 0 do return ""
-
-    idx := strings.index(bg, "48;2")
-    if idx < 0 do return ""
+    // All BG strings are \x1b[48;2;R;G;Bm — byte[2] is '4'
+    // FG equivalent is \x1b[38;2;R;G;Bm — just flip to '3'
+    if len(bg) < 4 do return ""
 
     @(static) fg_buf: [64]u8
-    if idx + len(bg[idx:]) >= len(fg_buf) do return ""
+    if len(bg) >= len(fg_buf) do return ""
 
-    copy(fg_buf[:], bg[:idx])
-    fg_buf[idx] = '3'
-    fg_buf[idx + 1] = '8'
-    copy(fg_buf[idx + 2:], bg[idx + 2:])
-
+    copy(fg_buf[:], bg)
+    fg_buf[2] = '3'
     return string(fg_buf[:len(bg)])
 }
 
-segment :: proc(buf: ^OutBuf, bg: string, fg: string, text: string, first: bool) {
+segment :: proc(
+    buf: ^OutBuf,
+    bg: string,
+    fg: string,
+    text: string,
+    first: bool,
+) {
     if !first && len(buf.prev_bg) > 0 {
         out_str(buf, bg)
         out_str(buf, bg_to_fg(buf.prev_bg))
@@ -146,141 +156,426 @@ segment_end :: proc(buf: ^OutBuf) {
     }
 }
 
-/* ---------------------------------------------------------------------------------- */
-/* JSON Parsing (Minimal)                                                             */
-/* ---------------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* JSON Parsing (Single-pass for stdin, per-key for usage API)                */
+/* -------------------------------------------------------------------------- */
 
-json_get_string :: proc(json: string, key: string) -> string {
+JsonFields :: struct {
+    current_dir:         string,
+    display_name:        string,
+    mode:                string,
+    total_cost_usd:      f64,
+    total_lines_added:   i64,
+    total_lines_removed: i64,
+    total_duration_ms:   i64,
+    used_percentage:     i64,
+    context_window_size: i64,
+}
+
+// Parse a string value at cursor (past ':'). Returns
+// slice into original json.
+json_parse_string_at :: proc(
+    json: string,
+    pos: ^int,
+) -> string {
+    i := pos^
+    for i < len(json) && (json[i] == ' ' || json[i] == '\t') {
+        i += 1
+    }
+    if i >= len(json) || json[i] != '"' do return ""
+    i += 1
+    start := i
+    for i < len(json) && json[i] != '"' {
+        i += 1
+    }
+    result := json[start:i]
+    if i < len(json) do i += 1
+    pos^ = i
+    return result
+}
+
+// Parse an i64 value at cursor (past ':')
+json_parse_i64_at :: proc(
+    json: string,
+    pos: ^int,
+) -> i64 {
+    i := pos^
+    for i < len(json) && (json[i] == ' ' || json[i] == '\t') {
+        i += 1
+    }
+    start := i
+    for i < len(json) &&
+        ((json[i] >= '0' && json[i] <= '9') ||
+            json[i] == '-' || json[i] == '+') {
+        i += 1
+    }
+    pos^ = i
+    if i == start do return 0
+    val, ok := strconv.parse_i64(json[start:i])
+    return ok ? val : 0
+}
+
+// Parse an f64 value at cursor (past ':')
+json_parse_f64_at :: proc(
+    json: string,
+    pos: ^int,
+) -> f64 {
+    i := pos^
+    for i < len(json) && (json[i] == ' ' || json[i] == '\t') {
+        i += 1
+    }
+    start := i
+    for i < len(json) &&
+        ((json[i] >= '0' && json[i] <= '9') ||
+            json[i] == '-' || json[i] == '+' ||
+            json[i] == '.' || json[i] == 'e' ||
+            json[i] == 'E') {
+        i += 1
+    }
+    pos^ = i
+    if i == start do return 0.0
+    val, ok := strconv.parse_f64(json[start:i])
+    return ok ? val : 0.0
+}
+
+// Try to match a key literal at position. Returns
+// length if matched, 0 otherwise.
+try_key :: proc(json: string, pos: int, key: string) -> int {
+    if pos + len(key) > len(json) do return 0
+    if json[pos:pos + len(key)] == key do return len(key)
+    return 0
+}
+
+// Single-pass: scan for '"', dispatch on char after it
+json_parse_all :: proc(json: string) -> JsonFields {
+    fields: JsonFields
+    i := 0
+    for i < len(json) {
+        // Scan to next '"'
+        for i < len(json) && json[i] != '"' {
+            i += 1
+        }
+        if i >= len(json) do break
+
+        klen: int
+        // Dispatch on char after opening quote
+        if i + 1 >= len(json) { i += 1; continue }
+        switch json[i + 1] {
+        case 'c':
+            if klen = try_key(json, i, "\"current_dir\":"); klen > 0 {
+                i += klen
+                fields.current_dir = json_parse_string_at(json, &i)
+                continue
+            }
+            if klen = try_key(json, i, "\"context_window_size\":"); klen > 0 {
+                i += klen
+                fields.context_window_size = json_parse_i64_at(json, &i)
+                continue
+            }
+        case 'd':
+            if klen = try_key(json, i, "\"display_name\":"); klen > 0 {
+                i += klen
+                fields.display_name = json_parse_string_at(json, &i)
+                continue
+            }
+        case 'm':
+            if klen = try_key(json, i, "\"mode\":"); klen > 0 {
+                i += klen
+                fields.mode = json_parse_string_at(json, &i)
+                continue
+            }
+        case 't':
+            if klen = try_key(json, i, "\"total_cost_usd\":"); klen > 0 {
+                i += klen
+                fields.total_cost_usd = json_parse_f64_at(json, &i)
+                continue
+            }
+            if klen = try_key(json, i, "\"total_lines_added\":"); klen > 0 {
+                i += klen
+                fields.total_lines_added = json_parse_i64_at(json, &i)
+                continue
+            }
+            if klen = try_key(json, i, "\"total_lines_removed\":"); klen > 0 {
+                i += klen
+                fields.total_lines_removed = json_parse_i64_at(json, &i)
+                continue
+            }
+            if klen = try_key(json, i, "\"total_duration_ms\":"); klen > 0 {
+                i += klen
+                fields.total_duration_ms = json_parse_i64_at(json, &i)
+                continue
+            }
+        case 'u':
+            if klen = try_key(json, i, "\"used_percentage\":"); klen > 0 {
+                i += klen
+                fields.used_percentage = json_parse_i64_at(json, &i)
+                continue
+            }
+        }
+        i += 1  // skip unrecognized quote
+    }
+    return fields
+}
+
+// Per-key helpers (used only by usage cache in
+// background child, not hot path)
+json_get_string :: proc(
+    json: string,
+    key: string,
+) -> string {
     needle_buf: [256]u8
-    needle := fmt.bprintf(needle_buf[:], "\"%s\":", key)
+    needle := fmt.bprintf(
+        needle_buf[:],
+        "\"%s\":",
+        key,
+    )
 
     start_idx := strings.index(json, needle)
     if start_idx < 0 do return ""
 
-    // Skip past key and colon, then whitespace
-    rest := strings.trim_left_space(json[start_idx + len(needle):])
-
-    // Expect opening quote
-    if len(rest) == 0 || rest[0] != '"' do return ""
-    rest = rest[1:]
-
-    // Find closing quote
-    end_idx := strings.index(rest, "\"")
-    if end_idx < 0 do return ""
-
-    return rest[:end_idx]
-}
-
-json_get_number :: proc(json: string, key: string) -> i64 {
-    needle_buf: [256]u8
-    needle := fmt.bprintf(needle_buf[:], "\"%s\":", key)
-
-    start_idx := strings.index(json, needle)
-    if start_idx < 0 do return 0
-
-    start := start_idx + len(needle)
-    rest := strings.trim_left_space(json[start:])
-
-    end := 0
-    for end < len(rest) {
-        c := rest[end]
-        if c >= '0' && c <= '9' || c == '-' || c == '+' {
-            end += 1
-        } else {
-            break
-        }
+    rest := json[start_idx + len(needle):]
+    i := 0
+    for i < len(rest) && (rest[i] == ' ' || rest[i] == '\t') {
+        i += 1
     }
-
-    if end == 0 do return 0
-    val, ok := strconv.parse_i64(rest[:end])
-    return ok ? val : 0
-}
-
-json_get_float :: proc(json: string, key: string) -> f64 {
-    needle_buf: [256]u8
-    needle := fmt.bprintf(needle_buf[:], "\"%s\":", key)
-
-    start_idx := strings.index(json, needle)
-    if start_idx < 0 do return 0.0
-
-    start := start_idx + len(needle)
-    rest := strings.trim_left_space(json[start:])
-
-    end := 0
-    for end < len(rest) {
-        c := rest[end]
-        if c >= '0' && c <= '9' || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' {
-            end += 1
-        } else {
-            break
-        }
+    if i >= len(rest) || rest[i] != '"' do return ""
+    i += 1
+    start := i
+    for i < len(rest) && rest[i] != '"' {
+        i += 1
     }
-
-    if end == 0 do return 0.0
-    val, ok := strconv.parse_f64(rest[:end])
-    return ok ? val : 0.0
+    return rest[start:i]
 }
 
-/* ---------------------------------------------------------------------------------- */
-/* Path Abbreviation                                                                  */
-/* ---------------------------------------------------------------------------------- */
+json_find_object_f64 :: proc(
+    json: string,
+    obj_key: string,
+    field_key: string,
+) -> f64 {
+    obj_needle_buf: [256]u8
+    obj_needle := fmt.bprintf(
+        obj_needle_buf[:],
+        "\"%s\"",
+        obj_key,
+    )
+
+    idx := strings.index(json, obj_needle)
+    if idx < 0 do return 0.0
+
+    rest := json[idx + len(obj_needle):]
+    brace := strings.index(rest, "{")
+    if brace < 0 do return 0.0
+
+    // Parse "utilization": <f64> from within object
+    obj := rest[brace:]
+    key_needle_buf: [256]u8
+    key_needle := fmt.bprintf(
+        key_needle_buf[:],
+        "\"%s\":",
+        field_key,
+    )
+    ki := strings.index(obj, key_needle)
+    if ki < 0 do return 0.0
+
+    pos := ki + len(key_needle)
+    return json_parse_f64_at(obj, &pos)
+}
+
+/* -------------------------------------------------------------------------- */
+/* Path Abbreviation (with issue number preservation)                         */
+/* -------------------------------------------------------------------------- */
 
 abbrev_path :: proc(path: string) -> string {
     @(static) result_buf: [256]u8
+    @(static) working_buf: [512]u8
 
-    home := os.get_env("HOME", context.temp_allocator)
+    home := string(posix.getenv("HOME"))
     buf: string
 
     if len(home) > 0 && strings.has_prefix(path, home) {
-        buf = strings.concatenate({"~", path[len(home):]}, context.temp_allocator)
+        working_buf[0] = '~'
+        rest := path[len(home):]
+        n := min(len(rest), len(working_buf) - 1)
+        copy(working_buf[1:], rest[:n])
+        buf = string(working_buf[:1 + n])
     } else {
         buf = path
     }
 
     if buf == "~" do return "~"
 
-    slash_count := strings.count(buf, "/")
-    if slash_count == 0 {
-        copy(result_buf[:], buf)
-        return string(result_buf[:len(buf)])
+    has_slash := false
+    for i in 0 ..< len(buf) {
+        if buf[i] == '/' { has_slash = true; break }
+    }
+    if !has_slash {
+        n := min(len(buf), len(result_buf) - 1)
+        copy(result_buf[:], buf[:n])
+        return string(result_buf[:n])
     }
 
-    parts := strings.split(buf, "/", context.temp_allocator)
+    // Find last slash position
+    last_slash := 0
+    for i in 0 ..< len(buf) {
+        if buf[i] == '/' do last_slash = i
+    }
 
     result_len := 0
-    for part, i in parts {
-        if len(part) == 0 do continue
+    scan := 0
 
-        if result_len > 0 {
+    for scan < len(buf) &&
+        result_len < len(result_buf) - 1 {
+        if scan > 0 && buf[scan] == '/' {
             result_buf[result_len] = '/'
             result_len += 1
+            scan += 1
+            continue
         }
 
-        if i < len(parts) - 1 && part[0] != '~' {
-            result_buf[result_len] = part[0]
-            result_len += 1
+        // Find end of this component
+        comp_start := scan
+        for scan < len(buf) && buf[scan] != '/' {
+            scan += 1
+        }
+        comp_len := scan - comp_start
+
+        if comp_start < last_slash &&
+            buf[comp_start] != '~' {
+            // Scan for digit run (issue number)
+            digit_start, digit_end: int
+            found_digits := false
+            for i in comp_start ..< comp_start + comp_len {
+                if buf[i] >= '0' && buf[i] <= '9' {
+                    if !found_digits {
+                        digit_start = i
+                        found_digits = true
+                    }
+                    digit_end = i + 1
+                } else if found_digits {
+                    break
+                }
+            }
+
+            if found_digits &&
+                digit_end - digit_start >= 2 {
+                // Copy digit run
+                dlen := digit_end - digit_start
+                n := min(
+                    dlen,
+                    len(result_buf) - 1 - result_len,
+                )
+                copy(
+                    result_buf[result_len:],
+                    buf[digit_start:digit_start + n],
+                )
+                result_len += n
+                // Ellipsis if more after digits
+                if digit_end < comp_start + comp_len &&
+                    result_len + 3 <=
+                        len(result_buf) - 1 {
+                    // U+2026 ellipsis (UTF-8: E2 80 A6)
+                    result_buf[result_len] = 0xe2
+                    result_buf[result_len + 1] = 0x80
+                    result_buf[result_len + 2] = 0xa6
+                    result_len += 3
+                }
+            } else {
+                // No issue number: first char only
+                if result_len < len(result_buf) - 1 {
+                    result_buf[result_len] =
+                        buf[comp_start]
+                    result_len += 1
+                }
+            }
         } else {
-            copy(result_buf[result_len:], part)
-            result_len += len(part)
+            // Last component or ~: copy fully
+            n := min(
+                comp_len,
+                len(result_buf) - 1 - result_len,
+            )
+            copy(
+                result_buf[result_len:],
+                buf[comp_start:comp_start + n],
+            )
+            result_len += n
         }
     }
 
     return string(result_buf[:result_len])
 }
 
-/* ---------------------------------------------------------------------------------- */
-/* Progress Bar (Compact)                                                             */
-/* ---------------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* Model Abbreviation                                                         */
+/* -------------------------------------------------------------------------- */
+
+abbreviate_model :: proc(model: string) -> string {
+    @(static) abbrev_buf: [32]u8
+
+    Family :: struct {
+        name:   string,
+        abbrev: string,
+    }
+    families := [3]Family{
+        {"Opus", "Op"},
+        {"Sonnet", "So"},
+        {"Haiku", "Ha"},
+    }
+
+    // Find version number (digit.digit)
+    version_start := -1
+    for i in 0 ..< len(model) - 2 {
+        if model[i] >= '0' && model[i] <= '9' &&
+            model[i + 1] == '.' &&
+            model[i + 2] >= '0' &&
+            model[i + 2] <= '9' {
+            version_start = i
+            break
+        }
+    }
+
+    // Find family name
+    abbrev: string
+    for f in families {
+        if strings.contains(model, f.name) {
+            abbrev = f.abbrev
+            break
+        }
+    }
+
+    if abbrev != "" && version_start >= 0 {
+        pos := 0
+        copy(abbrev_buf[:], abbrev)
+        pos = len(abbrev)
+        // Copy version digits and dots
+        i := version_start
+        for i < len(model) &&
+            ((model[i] >= '0' && model[i] <= '9') ||
+                    model[i] == '.') {
+            abbrev_buf[pos] = model[i]
+            pos += 1
+            i += 1
+        }
+        return string(abbrev_buf[:pos])
+    }
+
+    // Fallback: copy as-is
+    n := min(len(model), len(abbrev_buf) - 1)
+    copy(abbrev_buf[:], model[:n])
+    return string(abbrev_buf[:n])
+}
+
+/* -------------------------------------------------------------------------- */
+/* Context Bar (Compact block style)                                          */
+/* -------------------------------------------------------------------------- */
 
 make_context_bar :: proc(pct: i64, ctx_size: i64) -> string {
-    @(static) bar_buf: [512]u8
+    @(static) bar_buf: [256]u8
 
     clamped := min(pct, 100)
-    width :: 15
-    filled := (clamped * width) / 100
+    width :: 5
+    filled := int((clamped * width) / 100)
     empty := width - filled
 
-    // Color based on usage
     fill_color: string
     if clamped >= 90 {
         fill_color = ANSI_FG_RED
@@ -292,40 +587,44 @@ make_context_bar :: proc(pct: i64, ctx_size: i64) -> string {
         fill_color = ANSI_FG_GREEN
     }
 
-    bar := strings.builder_make(context.temp_allocator)
+    pos := 0
 
-    // Used tokens label
-    used_tokens := pct * ctx_size / 100
-    used_k := f64(used_tokens) / 1000.0
-    fmt.sbprintf(&bar, "%s%.0fk ", fill_color, used_k)
-
-    // Left cap + filled portion
-    strings.write_string(&bar, "\u257A")  // ╺ left half-line cap
-    for _ in 0 ..< filled do strings.write_string(&bar, "\u2501")  // ━
-
-    // Percentage at the boundary
-    fmt.sbprintf(&bar, " %d%% ", clamped)
-
-    // Empty portion + right cap
-    strings.write_string(&bar, ANSI_FG_COMMENT)
-    for _ in 0 ..< empty do strings.write_string(&bar, "\u2504")   // ┄
-    strings.write_string(&bar, "\u2578")  // ╸ right half-line cap
-
-    // Total context label
-    strings.write_string(&bar, fill_color)
-    if ctx_size >= 1_000_000 {
-        fmt.sbprintf(&bar, " %dM", ctx_size / 1_000_000)
-    } else {
-        fmt.sbprintf(&bar, " %dk", ctx_size / 1000)
+    // Filled blocks in fill color
+    copy(bar_buf[pos:], fill_color)
+    pos += len(fill_color)
+    for _ in 0 ..< filled {
+        // U+25B0 ▰ (UTF-8: E2 96 B0)
+        bar_buf[pos] = 0xe2
+        bar_buf[pos + 1] = 0x96
+        bar_buf[pos + 2] = 0xb0
+        pos += 3
     }
 
-    result := fmt.bprintf(bar_buf[:], "%s", strings.to_string(bar))
-    return result
+    // Empty blocks in white
+    copy(bar_buf[pos:], ANSI_FG_WHITE)
+    pos += len(ANSI_FG_WHITE)
+    for _ in 0 ..< empty {
+        // U+25B1 ▱ (UTF-8: E2 96 B1)
+        bar_buf[pos] = 0xe2
+        bar_buf[pos + 1] = 0x96
+        bar_buf[pos + 2] = 0xb1
+        pos += 3
+    }
+
+    // Percentage
+    bar_buf[pos] = ' '
+    pos += 1
+    copy(bar_buf[pos:], fill_color)
+    pos += len(fill_color)
+    pct_str := fmt.bprintf(bar_buf[pos:], "%d%%", clamped)
+    pos += len(pct_str)
+
+    return string(bar_buf[:pos])
 }
 
-/* ---------------------------------------------------------------------------------- */
-/* Duration Formatting                                                                */
-/* ---------------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* Duration Formatting                                                        */
+/* -------------------------------------------------------------------------- */
 
 format_duration :: proc(ms: i64) -> string {
     @(static) dur_buf: [32]u8
@@ -333,7 +632,11 @@ format_duration :: proc(ms: i64) -> string {
     if ms < 1000 {
         return fmt.bprintf(dur_buf[:], "%dms", ms)
     } else if ms < 60000 {
-        return fmt.bprintf(dur_buf[:], "%.1fs", f64(ms) / 1000.0)
+        return fmt.bprintf(
+            dur_buf[:],
+            "%.1fs",
+            f64(ms) / 1000.0,
+        )
     } else if ms < 3600000 {
         mins := ms / 60000
         secs := (ms % 60000) / 1000
@@ -345,9 +648,9 @@ format_duration :: proc(ms: i64) -> string {
     }
 }
 
-/* ---------------------------------------------------------------------------------- */
-/* Git Status (Fast Path)                                                             */
-/* ---------------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* Git Status (Fast Path)                                                     */
+/* -------------------------------------------------------------------------- */
 
 GitStatus :: struct {
     valid:       bool,
@@ -361,8 +664,14 @@ GitStatus :: struct {
 }
 
 git_read_stash_count :: proc(dir: string) -> i64 {
-    stash_path := strings.concatenate({dir, "/.git/logs/refs/stash"}, context.temp_allocator)
-    stash_cstr := strings.clone_to_cstring(stash_path, context.temp_allocator)
+    stash_path := strings.concatenate(
+        {dir, "/.git/logs/refs/stash"},
+        context.temp_allocator,
+    )
+    stash_cstr := strings.clone_to_cstring(
+        stash_path,
+        context.temp_allocator,
+    )
 
     fd := posix.open(stash_cstr, {})
     if fd < 0 do return 0
@@ -381,11 +690,22 @@ git_read_stash_count :: proc(dir: string) -> i64 {
     return count
 }
 
-git_read_branch_fast :: proc(dir: string) -> (branch: string, ok: bool) {
+git_read_branch_fast :: proc(
+    dir: string,
+) -> (
+    branch: string,
+    ok: bool,
+) {
     @(static) branch_buf: [128]u8
 
-    head_path := strings.concatenate({dir, "/.git/HEAD"}, context.temp_allocator)
-    head_cstr := strings.clone_to_cstring(head_path, context.temp_allocator)
+    head_path := strings.concatenate(
+        {dir, "/.git/HEAD"},
+        context.temp_allocator,
+    )
+    head_cstr := strings.clone_to_cstring(
+        head_path,
+        context.temp_allocator,
+    )
 
     fd := posix.open(head_cstr, {})
     if fd < 0 do return "", false
@@ -413,11 +733,10 @@ git_read_branch_fast :: proc(dir: string) -> (branch: string, ok: bool) {
     return "", false
 }
 
-/* ---------------------------------------------------------------------------------- */
-/* State Cache (prevents flicker during API calls)                                    */
-/* ---------------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* State Cache (prevents flicker during API calls)                            */
+/* -------------------------------------------------------------------------- */
 
-// Cache path includes grandparent PID (Claude's PID) to isolate multiple instances
 CACHE_PATH_PREFIX :: "/dev/shm/statusline-cache."
 
 CachedState :: struct #packed {
@@ -427,21 +746,30 @@ CachedState :: struct #packed {
     lines_added:    i64,
     lines_removed:  i64,
     duration_ms:    i64,
+    last_update_sec: i64,
     cwd:            [256]u8,
     model:          [64]u8,
 }
 
-// Get grandparent PID (Claude's PID) by reading /proc/<ppid>/status
 get_grandparent_pid :: proc() -> int {
+    @(static) cached_gppid: int = 0
+    if cached_gppid != 0 do return cached_gppid
+
     ppid := int(posix.getppid())
 
-    // Read /proc/<ppid>/status to find grandparent
     path_buf: [32]u8
-    path := fmt.bprintf(path_buf[:], "/proc/%d/status", ppid)
-    path_cstr := strings.clone_to_cstring(path, context.temp_allocator)
+    path := fmt.bprintf(
+        path_buf[:],
+        "/proc/%d/status",
+        ppid,
+    )
+    path_cstr := strings.clone_to_cstring(
+        path,
+        context.temp_allocator,
+    )
 
     fd := posix.open(path_cstr, {})
-    if fd < 0 do return ppid  // fallback to parent
+    if fd < 0 do return ppid
     defer posix.close(fd)
 
     buf: [1024]u8
@@ -449,7 +777,6 @@ get_grandparent_pid :: proc() -> int {
     if n <= 0 do return ppid
 
     content := string(buf[:n])
-    // Find "PPid:\t<number>"
     ppid_prefix :: "PPid:\t"
     idx := strings.index(content, ppid_prefix)
     if idx < 0 do return ppid
@@ -459,19 +786,31 @@ get_grandparent_pid :: proc() -> int {
     end := strings.index(rest, "\n")
     if end < 0 do end = len(rest)
 
-    gppid, ok := strconv.parse_int(strings.trim_space(rest[:end]))
-    return ok ? gppid : ppid
+    gppid, ok := strconv.parse_int(
+        strings.trim_space(rest[:end]),
+    )
+    result := ok ? gppid : ppid
+    cached_gppid = result
+    return result
 }
 
 get_cache_path :: proc() -> string {
     @(static) path_buf: [64]u8
     gppid := get_grandparent_pid()
-    return fmt.bprintf(path_buf[:], "%s%d", CACHE_PATH_PREFIX, gppid)
+    return fmt.bprintf(
+        path_buf[:],
+        "%s%d",
+        CACHE_PATH_PREFIX,
+        gppid,
+    )
 }
 
 read_cached_state :: proc() -> CachedState {
     cache_path := get_cache_path()
-    cache_cstr := strings.clone_to_cstring(cache_path, context.temp_allocator)
+    cache_cstr := strings.clone_to_cstring(
+        cache_path,
+        context.temp_allocator,
+    )
     fd := posix.open(cache_cstr, {})
     if fd < 0 do return {}
     defer posix.close(fd)
@@ -485,32 +824,41 @@ read_cached_state :: proc() -> CachedState {
 
 write_cached_state :: proc(state: CachedState) {
     cache_path := get_cache_path()
-    cache_cstr := strings.clone_to_cstring(cache_path, context.temp_allocator)
-    fd := posix.open(cache_cstr, {.WRONLY, .CREAT, .TRUNC}, {.IRUSR, .IWUSR})
+    cache_cstr := strings.clone_to_cstring(
+        cache_path,
+        context.temp_allocator,
+    )
+    fd := posix.open(
+        cache_cstr,
+        {.WRONLY, .CREAT, .TRUNC},
+        {.IRUSR, .IWUSR},
+    )
     if fd < 0 do return
     defer posix.close(fd)
-    s := state  // local copy so we can take address
+    s := state
     buf := transmute([^]u8)&s
     posix.write(fd, buf, size_of(CachedState))
 }
 
-CLEANUP_INTERVAL_S :: 300  // 5 minutes
+CLEANUP_INTERVAL_S :: 300
 
-// Clean up orphaned cache files from dead Claude processes
 cleanup_stale_caches :: proc() {
-    // Check if cleanup is due (sentinel file mtime)
     sentinel_cstr: cstring = "/dev/shm/statusline-cleanup"
     st: posix.stat_t
     now_ms := current_time_ms()
     if posix.stat(sentinel_cstr, &st) == .OK {
         last_s := i64(st.st_mtim.tv_sec)
-        if now_ms / 1000 - last_s < CLEANUP_INTERVAL_S do return
+        if now_ms / 1000 - last_s < CLEANUP_INTERVAL_S {
+            return
+        }
     }
-    // Touch sentinel
-    sentinel_fd := posix.open(sentinel_cstr, {.WRONLY, .CREAT, .TRUNC}, {.IRUSR, .IWUSR, .IRGRP, .IWGRP, .IROTH, .IWOTH})
+    sentinel_fd := posix.open(
+        sentinel_cstr,
+        {.WRONLY, .CREAT, .TRUNC},
+        {.IRUSR, .IWUSR, .IRGRP, .IWGRP, .IROTH, .IWOTH},
+    )
     if sentinel_fd >= 0 do posix.close(sentinel_fd)
 
-    PREFIX :: "statusline-cache."
     SHM_DIR :: "/dev/shm"
 
     dir := posix.opendir(SHM_DIR)
@@ -522,28 +870,55 @@ cleanup_stale_caches :: proc() {
         if entry == nil do break
 
         name := string(cstring(&entry.d_name[0]))
-        if !strings.has_prefix(name, PREFIX) do continue
 
-        // Extract PID from filename
-        pid_str := name[len(PREFIX):]
+        // Clean both cache and usage files
+        pid_str: string
+        if strings.has_prefix(
+            name,
+            "statusline-cache.",
+        ) {
+            pid_str = name[len("statusline-cache."):]
+        } else if strings.has_prefix(
+            name,
+            "statusline-usage.",
+        ) {
+            pid_str = name[len("statusline-usage."):]
+        } else {
+            continue
+        }
+
         pid, ok := strconv.parse_int(pid_str)
         if !ok || pid <= 0 do continue
+        if posix.kill(posix.pid_t(pid), .NONE) == .OK {
+            continue
+        }
 
-        // Check if process is still alive (kill with signal 0 just checks, doesn't kill)
-        if posix.kill(posix.pid_t(pid), .NONE) == .OK do continue
-
-        // Process is dead, remove the cache file
         path_buf: [64]u8
-        path := fmt.bprintf(path_buf[:], "%s/%s", SHM_DIR, name)
-        path_cstr := strings.clone_to_cstring(path, context.temp_allocator)
+        path := fmt.bprintf(
+            path_buf[:],
+            "%s/%s",
+            SHM_DIR,
+            name,
+        )
+        path_cstr := strings.clone_to_cstring(
+            path,
+            context.temp_allocator,
+        )
         posix.unlink(path_cstr)
     }
 
-    // Clean up stale debug logs in per-user subdir
+    // Clean up stale debug logs
     uid := posix.getuid()
     log_dir_buf: [64]u8
-    log_dir := fmt.bprintf(log_dir_buf[:], "/tmp/statusline-%d", uid)
-    log_dir_cstr := strings.clone_to_cstring(log_dir, context.temp_allocator)
+    log_dir := fmt.bprintf(
+        log_dir_buf[:],
+        "/tmp/statusline-%d",
+        uid,
+    )
+    log_dir_cstr := strings.clone_to_cstring(
+        log_dir,
+        context.temp_allocator,
+    )
 
     tmp_dir := posix.opendir(log_dir_cstr)
     if tmp_dir == nil do return
@@ -556,38 +931,44 @@ cleanup_stale_caches :: proc() {
         name := string(cstring(&entry.d_name[0]))
         if !strings.has_suffix(name, ".log") do continue
 
-        // Filename is just <pid>.log
         pid_str := strings.trim_suffix(name, ".log")
         log_pid, ok := strconv.parse_int(pid_str)
         if !ok || log_pid <= 0 do continue
-
-        if posix.kill(posix.pid_t(log_pid), .NONE) == .OK do continue
+        if posix.kill(posix.pid_t(log_pid), .NONE) == .OK {
+            continue
+        }
 
         tmp_path_buf: [96]u8
-        tmp_path := fmt.bprintf(tmp_path_buf[:], "%s/%s", log_dir, name)
-        tmp_path_cstr := strings.clone_to_cstring(tmp_path, context.temp_allocator)
+        tmp_path := fmt.bprintf(
+            tmp_path_buf[:],
+            "%s/%s",
+            log_dir,
+            name,
+        )
+        tmp_path_cstr := strings.clone_to_cstring(
+            tmp_path,
+            context.temp_allocator,
+        )
         posix.unlink(tmp_path_cstr)
     }
 }
 
-/* ---------------------------------------------------------------------------------- */
-/* Git Status Cache (shared across Claude instances via shm)                          */
-/* ---------------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* Git Status Cache                                                           */
+/* -------------------------------------------------------------------------- */
 
 GitCache :: struct #packed {
-    index_mtime_sec:  i64,  // .git/index mtime seconds
-    index_mtime_nsec: i64,  // .git/index mtime nanoseconds
-    modified:         u32,  // Unstaged modified files
-    staged:           u32,  // Staged files
-    ahead:            u32,  // Commits ahead of remote
-    behind:           u32,  // Commits behind remote
-    branch:           [64]u8,   // Branch name
-    repo_path:        [256]u8,  // Repo path (for validation)
+    index_mtime_sec:  i64,
+    index_mtime_nsec: i64,
+    modified:         u32,
+    staged:           u32,
+    ahead:            u32,
+    behind:           u32,
+    branch:           [64]u8,
+    repo_path:        [256]u8,
 }
 
-// Simple hash of repo path to create shm name
 hash_path :: proc(path: string) -> u32 {
-    // FNV-1a hash
     h: u32 = 2166136261
     for c in path {
         h ~= u32(c)
@@ -599,22 +980,45 @@ hash_path :: proc(path: string) -> u32 {
 get_git_cache_path :: proc(repo_path: string) -> string {
     @(static) path_buf: [64]u8
     h := hash_path(repo_path)
-    return fmt.bprintf(path_buf[:], "/dev/shm/claude-git-%08x", h)
+    return fmt.bprintf(
+        path_buf[:],
+        "/dev/shm/claude-git-%08x",
+        h,
+    )
 }
 
 current_time_ms :: proc() -> i64 {
     ts: posix.timespec
     posix.clock_gettime(.REALTIME, &ts)
-    return i64(ts.tv_sec) * 1000 + i64(ts.tv_nsec) / 1_000_000
+    return i64(ts.tv_sec) * 1000 +
+        i64(ts.tv_nsec) / 1_000_000
 }
 
-GIT_CACHE_TTL_MS :: 5000  // Working tree changes don't touch .git/index; TTL catches them
+current_time_sec :: proc() -> i64 {
+    ts: posix.timespec
+    posix.clock_gettime(.REALTIME, &ts)
+    return i64(ts.tv_sec)
+}
 
-CacheState :: enum { NONE, STALE, VALID }
+GIT_CACHE_TTL_MS :: 5000
 
-read_git_cache :: proc(repo_path: string) -> (cache: GitCache, state: CacheState) {
+CacheState :: enum {
+    NONE,
+    STALE,
+    VALID,
+}
+
+read_git_cache :: proc(
+    repo_path: string,
+) -> (
+    cache: GitCache,
+    state: CacheState,
+) {
     cache_path := get_git_cache_path(repo_path)
-    cache_cstr := strings.clone_to_cstring(cache_path, context.temp_allocator)
+    cache_cstr := strings.clone_to_cstring(
+        cache_path,
+        context.temp_allocator,
+    )
 
     fd := posix.open(cache_cstr, {})
     if fd < 0 do return {}, .NONE
@@ -624,34 +1028,58 @@ read_git_cache :: proc(repo_path: string) -> (cache: GitCache, state: CacheState
     n := posix.read(fd, buf, size_of(GitCache))
     if n != size_of(GitCache) do return {}, .NONE
 
-    // Validate repo path matches
     cached_repo := string(cstring(&cache.repo_path[0]))
     if cached_repo != repo_path do return {}, .NONE
 
-    // TTL: stat the cache file itself — its mtime is when we last wrote it
     cache_st: posix.stat_t
-    if posix.fstat(fd, &cache_st) != .OK do return cache, .STALE
-    cache_age_ms := current_time_ms() - (i64(cache_st.st_mtim.tv_sec) * 1000 + i64(cache_st.st_mtim.tv_nsec) / 1_000_000)
-    if cache_age_ms > GIT_CACHE_TTL_MS do return cache, .STALE
+    if posix.fstat(fd, &cache_st) != .OK {
+        return cache, .STALE
+    }
+    cache_age_ms := current_time_ms() -
+        (i64(cache_st.st_mtim.tv_sec) * 1000 +
+            i64(cache_st.st_mtim.tv_nsec) / 1_000_000)
+    if cache_age_ms > GIT_CACHE_TTL_MS {
+        return cache, .STALE
+    }
 
-    // .git/index mtime: catches git add/commit/stash immediately (within TTL window)
-    index_path := strings.concatenate({repo_path, "/.git/index"}, context.temp_allocator)
-    index_cstr := strings.clone_to_cstring(index_path, context.temp_allocator)
-    st: posix.stat_t
-    if posix.stat(index_cstr, &st) != .OK do return cache, .STALE
+    index_path := strings.concatenate(
+        {repo_path, "/.git/index"},
+        context.temp_allocator,
+    )
+    index_cstr := strings.clone_to_cstring(
+        index_path,
+        context.temp_allocator,
+    )
+    idx_st: posix.stat_t
+    if posix.stat(index_cstr, &idx_st) != .OK {
+        return cache, .STALE
+    }
 
-    if i64(st.st_mtim.tv_sec) == cache.index_mtime_sec &&
-       i64(st.st_mtim.tv_nsec) == cache.index_mtime_nsec {
+    if i64(idx_st.st_mtim.tv_sec) ==
+            cache.index_mtime_sec &&
+        i64(idx_st.st_mtim.tv_nsec) ==
+            cache.index_mtime_nsec {
         return cache, .VALID
     }
 
     return cache, .STALE
 }
 
-write_git_cache :: proc(repo_path: string, modified: u32, staged: u32, ahead: u32, behind: u32) {
-    // Stat .git/index to capture current mtime
-    index_path := strings.concatenate({repo_path, "/.git/index"}, context.temp_allocator)
-    index_cstr := strings.clone_to_cstring(index_path, context.temp_allocator)
+write_git_cache :: proc(
+    repo_path: string,
+    modified: u32,
+    staged: u32,
+    ahead: u32,
+    behind: u32,
+) {
+    index_path := strings.concatenate(
+        {repo_path, "/.git/index"},
+        context.temp_allocator,
+    )
+    index_cstr := strings.clone_to_cstring(
+        index_path,
+        context.temp_allocator,
+    )
     st: posix.stat_t
     if posix.stat(index_cstr, &st) != .OK do return
 
@@ -665,9 +1093,16 @@ write_git_cache :: proc(repo_path: string, modified: u32, staged: u32, ahead: u3
     copy(cache.repo_path[:], repo_path)
 
     cache_path := get_git_cache_path(repo_path)
-    cache_cstr := strings.clone_to_cstring(cache_path, context.temp_allocator)
+    cache_cstr := strings.clone_to_cstring(
+        cache_path,
+        context.temp_allocator,
+    )
 
-    fd := posix.open(cache_cstr, {.WRONLY, .CREAT, .TRUNC}, {.IRUSR, .IWUSR, .IRGRP, .IROTH})
+    fd := posix.open(
+        cache_cstr,
+        {.WRONLY, .CREAT, .TRUNC},
+        {.IRUSR, .IWUSR, .IRGRP, .IROTH},
+    )
     if fd < 0 do return
     defer posix.close(fd)
 
@@ -675,11 +1110,19 @@ write_git_cache :: proc(repo_path: string, modified: u32, staged: u32, ahead: u3
     posix.write(fd, buf, size_of(GitCache))
 }
 
-// Run git status --porcelain -b -uno via fork/exec (skips shell)
-run_git_status :: proc(repo_path: string) -> (modified: u32, staged: u32, ahead: u32, behind: u32) {
+run_git_status :: proc(
+    repo_path: string,
+) -> (
+    modified: u32,
+    staged: u32,
+    ahead: u32,
+    behind: u32,
+) {
     pipe_fds: [2]posix.FD
-    if posix.pipe(&pipe_fds) != .OK do return 0, 0, 0, 0
-    pipe_read  := pipe_fds[0]
+    if posix.pipe(&pipe_fds) != .OK {
+        return 0, 0, 0, 0
+    }
+    pipe_read := pipe_fds[0]
     pipe_write := pipe_fds[1]
 
     pid := posix.fork()
@@ -690,21 +1133,29 @@ run_git_status :: proc(repo_path: string) -> (modified: u32, staged: u32, ahead:
     }
 
     if pid == 0 {
-        // Child: chdir, redirect stdout, exec git
         posix.close(pipe_read)
-        repo_cstr := strings.clone_to_cstring(repo_path, context.temp_allocator)
+        repo_cstr := strings.clone_to_cstring(
+            repo_path,
+            context.temp_allocator,
+        )
         posix.chdir(repo_cstr)
-        posix.dup2(pipe_write, 1)  // stdout
+        posix.dup2(pipe_write, 1)
         dev_null := posix.open("/dev/null", {.WRONLY})
-        if dev_null >= 0 do posix.dup2(dev_null, 2)  // stderr -> /dev/null
+        if dev_null >= 0 do posix.dup2(dev_null, 2)
         posix.close(pipe_write)
 
-        argv := []cstring{"git", "status", "--porcelain", "-b", "-uno", nil}
+        argv := []cstring{
+            "git",
+            "status",
+            "--porcelain",
+            "-b",
+            "-uno",
+            nil,
+        }
         posix.execvp("git", raw_data(argv))
         posix._exit(127)
     }
 
-    // Parent: read output, parse, waitpid
     posix.close(pipe_write)
 
     buf: [4096]u8
@@ -712,14 +1163,17 @@ run_git_status :: proc(repo_path: string) -> (modified: u32, staged: u32, ahead:
     for {
         remaining := len(buf) - total_read
         if remaining <= 0 do break
-        n := posix.read(pipe_read, raw_data(buf[total_read:]), uint(remaining))
+        n := posix.read(
+            pipe_read,
+            raw_data(buf[total_read:]),
+            uint(remaining),
+        )
         if n <= 0 do break
         total_read += int(n)
     }
     posix.close(pipe_read)
     posix.waitpid(pid, nil, {})
 
-    // Parse porcelain output line by line
     output := string(buf[:total_read])
     rest := output
     for len(rest) > 0 {
@@ -734,27 +1188,41 @@ run_git_status :: proc(repo_path: string) -> (modified: u32, staged: u32, ahead:
         }
         if len(line) < 2 do continue
 
-        // ## branch...remote [ahead N, behind M]
         if line[0] == '#' && line[1] == '#' {
-            if idx := strings.index(line, "["); idx >= 0 {
+            if idx := strings.index(line, "[");
+                idx >= 0 {
                 bracket := line[idx:]
-                if a := strings.index(bracket, "ahead "); a >= 0 {
+                if a := strings.index(
+                    bracket,
+                    "ahead ",
+                ); a >= 0 {
                     num_start := a + 6
                     num_end := num_start
-                    for num_end < len(bracket) && bracket[num_end] >= '0' && bracket[num_end] <= '9' {
+                    for num_end < len(bracket) &&
+                        bracket[num_end] >= '0' &&
+                        bracket[num_end] <= '9' {
                         num_end += 1
                     }
-                    if v, ok := strconv.parse_int(bracket[num_start:num_end]); ok {
+                    if v, ok := strconv.parse_int(
+                        bracket[num_start:num_end],
+                    ); ok {
                         ahead = u32(v)
                     }
                 }
-                if b := strings.index(bracket, "behind "); b >= 0 {
+                if b := strings.index(
+                    bracket,
+                    "behind ",
+                ); b >= 0 {
                     num_start := b + 7
                     num_end := num_start
-                    for num_end < len(bracket) && bracket[num_end] >= '0' && bracket[num_end] <= '9' {
+                    for num_end < len(bracket) &&
+                        bracket[num_end] >= '0' &&
+                        bracket[num_end] <= '9' {
                         num_end += 1
                     }
-                    if v, ok := strconv.parse_int(bracket[num_start:num_end]); ok {
+                    if v, ok := strconv.parse_int(
+                        bracket[num_start:num_end],
+                    ); ok {
                         behind = u32(v)
                     }
                 }
@@ -762,7 +1230,6 @@ run_git_status :: proc(repo_path: string) -> (modified: u32, staged: u32, ahead:
             continue
         }
 
-        // X = staged, Y = unstaged (no untracked with -uno)
         if line[0] != ' ' && line[0] != '?' {
             staged += 1
         }
@@ -774,45 +1241,278 @@ run_git_status :: proc(repo_path: string) -> (modified: u32, staged: u32, ahead:
     return modified, staged, ahead, behind
 }
 
-// Get git status with caching and background refresh
-get_git_status_cached :: proc(repo_path: string) -> (modified: u32, staged: u32, ahead: u32, behind: u32, state: CacheState) {
+get_git_status_cached :: proc(
+    repo_path: string,
+) -> (
+    modified: u32,
+    staged: u32,
+    ahead: u32,
+    behind: u32,
+    state: CacheState,
+) {
     cache, cache_state := read_git_cache(repo_path)
 
     switch cache_state {
     case .VALID:
-        return cache.modified, cache.staged, cache.ahead, cache.behind, .VALID
+        return cache.modified, cache.staged,
+            cache.ahead, cache.behind, .VALID
     case .STALE:
-        // Return stale data immediately, double-fork to refresh in background
         bg_pid := posix.fork()
         if bg_pid == 0 {
-            // First child: fork again so grandchild is orphaned (no zombie)
             if posix.fork() == 0 {
-                // Grandchild: refresh cache and exit
                 m, s, a, b := run_git_status(repo_path)
                 write_git_cache(repo_path, m, s, a, b)
             }
             posix._exit(0)
         }
         if bg_pid > 0 {
-            posix.waitpid(bg_pid, nil, {})  // Reap first child immediately
+            posix.waitpid(bg_pid, nil, {})
         }
-        return cache.modified, cache.staged, cache.ahead, cache.behind, .STALE
+        return cache.modified, cache.staged,
+            cache.ahead, cache.behind, .STALE
     case .NONE:
-        // First-ever miss: block and run
-        modified, staged, ahead, behind = run_git_status(repo_path)
-        write_git_cache(repo_path, modified, staged, ahead, behind)
+        modified, staged, ahead, behind =
+            run_git_status(repo_path)
+        write_git_cache(
+            repo_path,
+            modified,
+            staged,
+            ahead,
+            behind,
+        )
         return modified, staged, ahead, behind, .NONE
     }
 
     return 0, 0, 0, 0, .NONE
 }
 
-/* ---------------------------------------------------------------------------------- */
-/* Git Segment Builder                                                                */
-/* ---------------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* Usage Quota Cache                                                          */
+/* -------------------------------------------------------------------------- */
 
-// Truncate branch name if too long
-truncate_branch :: proc(branch: string, max_len: int) -> string {
+USAGE_CACHE_TTL_S :: 60
+USAGE_CACHE_PREFIX :: "/dev/shm/statusline-usage."
+
+UsageCache :: struct #packed {
+    fetch_time_sec: i64,
+    five_hour_pct:  f64,
+    seven_day_pct:  f64,
+}
+
+get_usage_cache_path :: proc(gppid: int) -> string {
+    @(static) path_buf: [64]u8
+    return fmt.bprintf(
+        path_buf[:],
+        "%s%d",
+        USAGE_CACHE_PREFIX,
+        gppid,
+    )
+}
+
+refresh_usage_cache :: proc(gppid: int) {
+    first_fork := posix.fork()
+    if first_fork < 0 do return
+    if first_fork > 0 {
+        posix.waitpid(first_fork, nil, {})
+        return
+    }
+
+    // Middle child - fork grandchild and exit
+    if posix.fork() != 0 do posix._exit(0)
+
+    // Grandchild: read credentials, curl, parse, write
+    home := string(posix.getenv("HOME"))
+    if len(home) == 0 do posix._exit(1)
+
+    cred_path_buf: [512]u8
+    cred_path := fmt.bprintf(
+        cred_path_buf[:],
+        "%s/.claude/.credentials.json",
+        home,
+    )
+    cred_cstr := strings.clone_to_cstring(
+        cred_path,
+        context.temp_allocator,
+    )
+
+    cred_fd := posix.open(cred_cstr, {})
+    if cred_fd < 0 do posix._exit(1)
+
+    cred_buf: [4096]u8
+    cred_len := posix.read(
+        cred_fd,
+        raw_data(&cred_buf),
+        len(cred_buf) - 1,
+    )
+    posix.close(cred_fd)
+    if cred_len <= 0 do posix._exit(1)
+
+    cred_json := string(cred_buf[:cred_len])
+
+    // Find claudeAiOauth object, extract accessToken
+    oauth_idx := strings.index(
+        cred_json,
+        "\"claudeAiOauth\"",
+    )
+    if oauth_idx < 0 do posix._exit(1)
+
+    oauth_rest := cred_json[oauth_idx:]
+    brace_idx := strings.index(oauth_rest, "{")
+    if brace_idx < 0 do posix._exit(1)
+
+    oauth_obj := oauth_rest[brace_idx:]
+    token := json_get_string(oauth_obj, "accessToken")
+    if len(token) == 0 do posix._exit(1)
+
+    // Build Authorization header
+    auth_buf: [2048]u8
+    auth_header := fmt.bprintf(
+        auth_buf[:],
+        "Authorization: Bearer %s",
+        token,
+    )
+    auth_cstr := strings.clone_to_cstring(
+        auth_header,
+        context.temp_allocator,
+    )
+
+    // Fork/exec curl
+    pipe_fds: [2]posix.FD
+    if posix.pipe(&pipe_fds) != .OK do posix._exit(1)
+
+    curl_pid := posix.fork()
+    if curl_pid < 0 do posix._exit(1)
+
+    if curl_pid == 0 {
+        posix.close(pipe_fds[0])
+        posix.dup2(pipe_fds[1], 1)
+        dev_null := posix.open("/dev/null", {.WRONLY})
+        if dev_null >= 0 {
+            posix.dup2(dev_null, 2)
+            posix.close(dev_null)
+        }
+        posix.close(pipe_fds[1])
+
+        beta_cstr: cstring =
+            "anthropic-beta: oauth-2025-04-20"
+        url_cstr: cstring =
+            "https://api.anthropic.com/api/oauth/usage"
+
+        argv := []cstring{
+            "curl", "-s", "--max-time", "10",
+            "-H", auth_cstr,
+            "-H", beta_cstr,
+            url_cstr,
+            nil,
+        }
+        posix.execvp("curl", raw_data(argv))
+        posix._exit(127)
+    }
+
+    posix.close(pipe_fds[1])
+
+    response_buf: [8192]u8
+    total_read := 0
+    for {
+        remaining := len(response_buf) - total_read - 1
+        if remaining <= 0 do break
+        n := posix.read(
+            pipe_fds[0],
+            raw_data(response_buf[total_read:]),
+            uint(remaining),
+        )
+        if n <= 0 do break
+        total_read += int(n)
+    }
+    posix.close(pipe_fds[0])
+    posix.waitpid(curl_pid, nil, {})
+
+    response := string(response_buf[:total_read])
+
+    // Parse: five_hour.utilization, seven_day.utilization
+    five_pct := json_find_object_f64(
+        response,
+        "five_hour",
+        "utilization",
+    )
+    seven_pct := json_find_object_f64(
+        response,
+        "seven_day",
+        "utilization",
+    )
+
+    // Write cache
+    cache: UsageCache
+    cache.fetch_time_sec = current_time_sec()
+    cache.five_hour_pct = five_pct
+    cache.seven_day_pct = seven_pct
+
+    cache_path := get_usage_cache_path(gppid)
+    cache_cstr := strings.clone_to_cstring(
+        cache_path,
+        context.temp_allocator,
+    )
+
+    cache_fd := posix.open(
+        cache_cstr,
+        {.WRONLY, .CREAT, .TRUNC},
+        {.IRUSR, .IWUSR},
+    )
+    if cache_fd >= 0 {
+        c := cache
+        posix.write(
+            cache_fd,
+            transmute([^]u8)&c,
+            size_of(UsageCache),
+        )
+        posix.close(cache_fd)
+    }
+    posix._exit(0)
+}
+
+read_usage_cache :: proc(gppid: int) -> UsageCache {
+    cache_path := get_usage_cache_path(gppid)
+    cache_cstr := strings.clone_to_cstring(
+        cache_path,
+        context.temp_allocator,
+    )
+
+    fd := posix.open(cache_cstr, {})
+    if fd < 0 {
+        refresh_usage_cache(gppid)
+        return {}
+    }
+
+    cache: UsageCache
+    n := posix.read(
+        fd,
+        transmute([^]u8)&cache,
+        size_of(UsageCache),
+    )
+    posix.close(fd)
+
+    if n != size_of(UsageCache) {
+        refresh_usage_cache(gppid)
+        return {}
+    }
+
+    // Check TTL
+    now := current_time_sec()
+    if now - cache.fetch_time_sec > USAGE_CACHE_TTL_S {
+        refresh_usage_cache(gppid)
+    }
+
+    return cache
+}
+
+/* -------------------------------------------------------------------------- */
+/* Git Segment Builder                                                        */
+/* -------------------------------------------------------------------------- */
+
+truncate_branch :: proc(
+    branch: string,
+    max_len: int,
+) -> string {
     @(static) trunc_buf: [64]u8
     if len(branch) <= max_len {
         return branch
@@ -822,50 +1522,51 @@ truncate_branch :: proc(branch: string, max_len: int) -> string {
     return string(trunc_buf[:max_len])
 }
 
-build_git_segment :: proc(buf: ^OutBuf, gs: ^GitStatus) {
+build_git_segment :: proc(
+    buf: ^OutBuf,
+    gs: ^GitStatus,
+) {
     if !gs.valid do return
 
-    text := strings.builder_make(context.temp_allocator)
-    strings.write_string(&text, ICON_BRANCH)
-    strings.write_string(&text, " ")
-    strings.write_string(&text, truncate_branch(gs.branch, 20))
+    text_buf: [256]u8
+    text := fmt.bprintf(text_buf[:], "%s %s", ICON_BRANCH, truncate_branch(gs.branch, 20))
 
-    // Color based on status: green=clean, orange=dirty
-    bg: string
-    if gs.modified > 0 || gs.staged > 0 {
-        bg = ANSI_BG_ORANGE
-    } else {
-        bg = ANSI_BG_GREEN
-    }
-    segment(buf, bg, ANSI_FG_BLACK, strings.to_string(text), false)
+    bg := gs.modified > 0 || gs.staged > 0 ? ANSI_BG_ORANGE : ANSI_BG_GREEN
+    segment(buf, bg, ANSI_FG_BLACK, text, false)
 
-    // Show counts if any changes or ahead/behind
-    if gs.staged > 0 || gs.modified > 0 || gs.stashes > 0 || gs.ahead > 0 || gs.behind > 0 {
-        status_text := strings.builder_make(context.temp_allocator)
+    if gs.staged > 0 || gs.modified > 0 ||
+        gs.stashes > 0 || gs.ahead > 0 ||
+        gs.behind > 0 {
+        st_buf: [256]u8
+        pos := 0
         if gs.ahead > 0 {
-            fmt.sbprintf(&status_text, "%s\u2191%d ", ANSI_FG_GREEN, gs.ahead)  // ↑
+            s := fmt.bprintf(st_buf[pos:], "%s\u2191%d ", ANSI_FG_GREEN, gs.ahead)
+            pos += len(s)
         }
         if gs.behind > 0 {
-            fmt.sbprintf(&status_text, "%s\u2193%d ", ANSI_FG_RED, gs.behind)  // ↓
+            s := fmt.bprintf(st_buf[pos:], "%s\u2193%d ", ANSI_FG_RED, gs.behind)
+            pos += len(s)
         }
         if gs.staged > 0 {
-            fmt.sbprintf(&status_text, "%s%s%d ", ANSI_FG_GREEN, ICON_STAGED, gs.staged)
+            s := fmt.bprintf(st_buf[pos:], "%s%s%d ", ANSI_FG_GREEN, ICON_STAGED, gs.staged)
+            pos += len(s)
         }
         if gs.modified > 0 {
-            fmt.sbprintf(&status_text, "%s%s%d ", ANSI_FG_ORANGE, ICON_MODIFIED, gs.modified)
+            s := fmt.bprintf(st_buf[pos:], "%s%s%d ", ANSI_FG_ORANGE, ICON_MODIFIED, gs.modified)
+            pos += len(s)
         }
         if gs.stashes > 0 {
-            fmt.sbprintf(&status_text, "%s%s%d", ANSI_FG_PURPLE, ICON_STASH, gs.stashes)
+            s := fmt.bprintf(st_buf[pos:], "%s%s%d", ANSI_FG_PURPLE, ICON_STASH, gs.stashes)
+            pos += len(s)
         }
-        status_str := strings.trim_right_space(strings.to_string(status_text))
-        segment(buf, ANSI_BG_DARK, "", status_str, false)
+        for pos > 0 && st_buf[pos - 1] == ' ' do pos -= 1
+        segment(buf, ANSI_BG_DARK, "", string(st_buf[:pos]), false)
     }
 }
 
-
-/* ---------------------------------------------------------------------------------- */
-/* Display State                                                                      */
-/* ---------------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* Display State                                                              */
+/* -------------------------------------------------------------------------- */
 
 DisplayState :: struct {
     cwd:               string,
@@ -876,82 +1577,124 @@ DisplayState :: struct {
     total_duration_ms: i64,
     used_pct:          i64,
     ctx_size:          i64,
+    last_update_sec:   i64,
+    five_hour_pct:     f64,
+    seven_day_pct:     f64,
     vim_mode:          string,
 }
 
 DebugTimings :: struct {
-    t_start, t_cleanup, t_read, t_parse, t_git, t_build: time.Tick,
+    t_start:   time.Tick,
+    t_cleanup: time.Tick,
+    t_read:    time.Tick,
+    t_parse:   time.Tick,
+    t_git:     time.Tick,
+    t_build:   time.Tick,
 }
 
-/* ---------------------------------------------------------------------------------- */
-/* Stdin Reader                                                                       */
-/* ---------------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* Stdin Reader                                                               */
+/* -------------------------------------------------------------------------- */
 
 STDIN_TIMEOUT_MS :: 50
 
 read_stdin :: proc() -> (string, bool) {
     @(static) input_buf: [8192]u8
-    input_len := 0
 
-    pfds := [1]posix.pollfd{{fd = 0, events = {.IN}}}
-    if posix.poll(raw_data(&pfds), 1, STDIN_TIMEOUT_MS) > 0 {
-        for {
-            remaining := len(input_buf) - input_len - 1
-            if remaining <= 0 do break
-            n := posix.read(0, raw_data(input_buf[input_len:]), uint(remaining))
-            if n <= 0 do break
-            input_len += int(n)
-        }
-        return string(input_buf[:input_len]), false
+    pfds := [1]posix.pollfd{
+        {fd = 0, events = {.IN}},
+    }
+    if posix.poll(raw_data(&pfds), 1, STDIN_TIMEOUT_MS) >
+        0 {
+        // Single read - JSON is <4KB, arrives atomically
+        n := posix.read(
+            0,
+            raw_data(&input_buf),
+            len(input_buf) - 1,
+        )
+        if n <= 0 do return "", true
+        return string(input_buf[:n]), false
     }
     return "", true
 }
 
-/* ---------------------------------------------------------------------------------- */
-/* State Resolution (JSON + Cache Merge)                                              */
-/* ---------------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* State Resolution (JSON + Cache Merge)                                      */
+/* -------------------------------------------------------------------------- */
 
-resolve_state :: proc(input: string, stdin_timeout: bool) -> DisplayState {
+resolve_state :: proc(
+    input: string,
+    stdin_timeout: bool,
+) -> DisplayState {
     @(static) cached: CachedState
     cached = read_cached_state()
     state: DisplayState
 
     if !stdin_timeout {
-        json_cwd           := json_get_string(input, "current_dir")
-        json_model         := json_get_string(input, "display_name")
-        json_cost          := json_get_float (input, "total_cost_usd")
-        json_lines_added   := json_get_number(input, "total_lines_added")
-        json_lines_removed := json_get_number(input, "total_lines_removed")
-        json_duration      := json_get_number(input, "total_duration_ms")
-        json_pct           := json_get_number(input, "used_percentage")
-        json_ctx_size      := json_get_number(input, "context_window_size")
-        state.vim_mode      = json_get_string(input, "mode")
+        f                  := json_parse_all(input)
+        json_cwd           := f.current_dir
+        json_model         := f.display_name
+        json_cost          := f.total_cost_usd
+        json_lines_added   := f.total_lines_added
+        json_lines_removed := f.total_lines_removed
+        json_duration      := f.total_duration_ms
+        json_pct           := f.used_percentage
+        json_ctx_size      := f.context_window_size
+        state.vim_mode      = f.mode
 
-        // Overlay non-zero JSON with cache (prevents flicker during API calls)
-        state.cwd               = len(json_cwd) > 0 ? json_cwd : string(cstring(&cached.cwd[0]))
-        state.model             = len(json_model) > 0 ? json_model : string(cstring(&cached.model[0]))
-        state.cost_usd          = json_cost > 0 ? json_cost : cached.cost_usd
-        state.lines_added       = json_lines_added > 0 ? json_lines_added : cached.lines_added
-        state.lines_removed     = json_lines_removed > 0 ? json_lines_removed : cached.lines_removed
-        state.total_duration_ms = json_duration > 0 ? json_duration : cached.duration_ms
-        state.used_pct          = json_pct > 0 ? json_pct : cached.used_pct
-        state.ctx_size          = json_ctx_size > 0 ? json_ctx_size : cached.context_size
+        cached_cwd              := string(cstring(&cached.cwd[0]))
+        cached_model            := string(cstring(&cached.model[0]))
+        state.cwd                = len(json_cwd) > 0 ? json_cwd : cached_cwd
+        state.model              = len(json_model) > 0 ? json_model : cached_model
+        state.cost_usd           = json_cost > 0 ? json_cost : cached.cost_usd
+        state.lines_added        = json_lines_added > 0 ? json_lines_added : cached.lines_added
+        state.lines_removed      = json_lines_removed > 0 ? json_lines_removed : cached.lines_removed
+        state.total_duration_ms  = json_duration > 0 ? json_duration : cached.duration_ms
+        state.used_pct           = json_pct > 0 ? json_pct : cached.used_pct
+        state.ctx_size           = json_ctx_size > 0 ? json_ctx_size : cached.context_size
+        state.last_update_sec    = current_time_sec()
 
-        // Update full-snapshot cache
+        // Update cache
         new_cache: CachedState
-        new_cache.used_pct      = max(json_pct, cached.used_pct)
-        new_cache.context_size  = max(json_ctx_size, cached.context_size)
-        new_cache.cost_usd      = max(json_cost, cached.cost_usd)
-        new_cache.lines_added   = max(json_lines_added, cached.lines_added)
-        new_cache.lines_removed = max(json_lines_removed, cached.lines_removed)
-        new_cache.duration_ms   = max(json_duration, cached.duration_ms)
+        new_cache.used_pct = max(
+            json_pct,
+            cached.used_pct,
+        )
+        new_cache.context_size = max(
+            json_ctx_size,
+            cached.context_size,
+        )
+        new_cache.cost_usd = max(
+            json_cost,
+            cached.cost_usd,
+        )
+        new_cache.lines_added = max(
+            json_lines_added,
+            cached.lines_added,
+        )
+        new_cache.lines_removed = max(
+            json_lines_removed,
+            cached.lines_removed,
+        )
+        new_cache.duration_ms = max(
+            json_duration,
+            cached.duration_ms,
+        )
+        new_cache.last_update_sec =
+            state.last_update_sec
         if len(json_cwd) > 0 {
-            copy(new_cache.cwd[:len(new_cache.cwd)-1], json_cwd)
+            copy(
+                new_cache.cwd[:len(new_cache.cwd) - 1],
+                json_cwd,
+            )
         } else {
             new_cache.cwd = cached.cwd
         }
         if len(json_model) > 0 {
-            copy(new_cache.model[:len(new_cache.model)-1], json_model)
+            copy(
+                new_cache.model[:len(new_cache.model) - 1],
+                json_model,
+            )
         } else {
             new_cache.model = cached.model
         }
@@ -959,7 +1702,6 @@ resolve_state :: proc(input: string, stdin_timeout: bool) -> DisplayState {
             write_cached_state(new_cache)
         }
     } else {
-        // Stdin timeout: render entirely from cached snapshot
         state.cwd               = string(cstring(&cached.cwd[0]))
         state.model             = string(cstring(&cached.model[0]))
         state.cost_usd          = cached.cost_usd
@@ -968,19 +1710,58 @@ resolve_state :: proc(input: string, stdin_timeout: bool) -> DisplayState {
         state.total_duration_ms = cached.duration_ms
         state.used_pct          = cached.used_pct
         state.ctx_size          = cached.context_size
+        state.last_update_sec   = cached.last_update_sec
     }
 
     return state
 }
 
-/* ---------------------------------------------------------------------------------- */
-/* Statusline Builder                                                                 */
-/* ---------------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* Time Formatting                                                            */
+/* -------------------------------------------------------------------------- */
 
-build_statusline :: proc(buf: ^OutBuf, state: ^DisplayState, gs: ^GitStatus) {
+format_time_12h :: proc(epoch_sec: i64) -> string {
+    @(static) time_buf: [16]u8
+
+    // Convert epoch to local time via localtime_r
+    // We use posix tm struct
+    t := posix.time_t(epoch_sec)
+    local: posix.tm
+    posix.localtime_r(&t, &local)
+
+    hour := int(local.tm_hour) % 12
+    if hour == 0 do hour = 12
+    ampm := int(local.tm_hour) < 12 ? " AM" : " PM"
+
+    return fmt.bprintf(
+        time_buf[:],
+        "%d:%02d:%02d%s",
+        hour,
+        int(local.tm_min),
+        int(local.tm_sec),
+        ampm,
+    )
+}
+
+usage_color :: proc(pct: f64) -> string {
+    if pct >= 90 do return ANSI_FG_RED
+    if pct >= 80 do return ANSI_FG_ORANGE
+    if pct >= 50 do return ANSI_FG_YELLOW
+    return ANSI_FG_GREEN
+}
+
+/* -------------------------------------------------------------------------- */
+/* Statusline Builder                                                         */
+/* -------------------------------------------------------------------------- */
+
+build_statusline :: proc(
+    buf   : ^OutBuf,
+    state : ^DisplayState,
+    gs    : ^GitStatus,
+) {
     first := true
 
-    // Vim mode (first, as primary state indicator)
+    // Vim mode (icon only, color indicates mode)
     if len(state.vim_mode) > 0 {
         vim_bg, vim_fg, vim_icon: string
         is_insert := state.vim_mode == "INSERT"
@@ -993,27 +1774,27 @@ build_statusline :: proc(buf: ^OutBuf, state: ^DisplayState, gs: ^GitStatus) {
             vim_fg = ANSI_FG_WHITE
             vim_icon = ICON_NORMAL
         }
-        vim_text := strings.builder_make(context.temp_allocator)
+        vim_buf: [64]u8
+        vim_text: string
         if is_insert {
-            fmt.sbprintf(&vim_text, "%s%s %s", ANSI_BOLD, vim_icon, state.vim_mode)
+            vim_text = fmt.bprintf(vim_buf[:], "%s%s", ANSI_BOLD, vim_icon)
         } else {
-            fmt.sbprintf(&vim_text, "%s %s", vim_icon, state.vim_mode)
+            vim_text = vim_icon
         }
-        segment(buf, vim_bg, vim_fg, strings.to_string(vim_text), first)
+        segment(buf, vim_bg, vim_fg, vim_text, first)
         first = false
     }
 
-    // Model (bold)
-    model_text := strings.builder_make(context.temp_allocator)
-    strings.write_string(&model_text, ANSI_BOLD)
-    strings.write_string(&model_text, state.model)
-    segment(buf, ANSI_BG_PURPLE, ANSI_FG_BLACK, strings.to_string(model_text), first)
+    // Model (abbreviated, bold)
+    model_buf: [128]u8
+    model_text := fmt.bprintf(model_buf[:], "%s%s", ANSI_BOLD, abbreviate_model(state.model))
+    segment(buf, ANSI_BG_PURPLE, ANSI_FG_BLACK, model_text, first)
     first = false
 
     // Path
-    path_text := strings.builder_make(context.temp_allocator)
-    fmt.sbprintf(&path_text, "%s %s", ICON_FOLDER, abbrev_path(state.cwd))
-    segment(buf, ANSI_BG_DARK, ANSI_FG_WHITE, strings.to_string(path_text), false)
+    path_buf: [300]u8
+    path_text := fmt.bprintf(path_buf[:], "%s %s", ICON_FOLDER, abbrev_path(state.cwd))
+    segment(buf, ANSI_BG_DARK, ANSI_FG_WHITE, path_text, false)
 
     // Git
     if gs.valid {
@@ -1031,101 +1812,176 @@ build_statusline :: proc(buf: ^OutBuf, state: ^DisplayState, gs: ^GitStatus) {
     } else {
         cost_bg = ANSI_BG_MINT
     }
-    cost_text := strings.builder_make(context.temp_allocator)
-    fmt.sbprintf(&cost_text, "%s %.2f", ICON_DOLLAR, state.cost_usd)
-    segment(buf, cost_bg, ANSI_FG_BLACK, strings.to_string(cost_text), false)
+    cost_buf: [64]u8
+    cost_text := fmt.bprintf(cost_buf[:], "%s %.2f", ICON_DOLLAR, state.cost_usd)
+    segment(buf, cost_bg, ANSI_FG_BLACK, cost_text, false)
 
-    // Lines changed
-    if state.lines_added > 0 || state.lines_removed > 0 {
-        lines_text := strings.builder_make(context.temp_allocator)
-        fmt.sbprintf(&lines_text, "%s%s %s+%d %s-%d",
-            ANSI_FG_WHITE, ICON_DIFF,
-            ANSI_FG_GREEN, state.lines_added,
-            ANSI_FG_RED, state.lines_removed)
-        segment(buf, ANSI_BG_DARK, "", strings.to_string(lines_text), false)
+    // Usage quota (when >= 50%)
+    if state.five_hour_pct >= 50 || state.seven_day_pct >= 50 {
+        color_5h := usage_color(state.five_hour_pct)
+        color_7d := usage_color(state.seven_day_pct)
+        usage_buf: [256]u8
+        usage_text := fmt.bprintf(
+            usage_buf[:],
+            "%s5h %s%s%d%% %s7d %s%s%d%%",
+            ANSI_FG_WHITE, ANSI_BOLD, color_5h, i64(state.five_hour_pct + 0.5),
+            ANSI_FG_WHITE, ANSI_BOLD, color_7d, i64(state.seven_day_pct + 0.5),
+        )
+        segment(buf, ANSI_BG_COMMENT, "", usage_text, false)
     }
 
-    // Session duration
+    // Combined: duration | last update | context bar
     if state.total_duration_ms > 0 {
-        dur_text := strings.builder_make(context.temp_allocator)
-        fmt.sbprintf(&dur_text, "%s %s", ICON_CLOCK, format_duration(state.total_duration_ms))
-        segment(buf, ANSI_BG_DARK, ANSI_FG_WHITE, strings.to_string(dur_text), false)
-    }
+        dur_buf: [512]u8
+        pos := 0
+        s := fmt.bprintf(dur_buf[:], "%s%s %s", ANSI_FG_WHITE, ICON_CLOCK, format_duration(state.total_duration_ms))
+        pos += len(s)
 
-    // Context window: used ━━━ pct% ┄┄┄ total
-    bar := make_context_bar(state.used_pct, state.ctx_size)
-    segment(buf, ANSI_BG_DARK, "", bar, false)
+        if state.last_update_sec > 0 {
+            s2 := fmt.bprintf(dur_buf[pos:], " %s| %s%s", ANSI_FG_COMMENT, ANSI_FG_WHITE, format_time_12h(state.last_update_sec))
+            pos += len(s2)
+        }
+
+        s3 := fmt.bprintf(dur_buf[pos:], " %s| ", ANSI_FG_COMMENT)
+        pos += len(s3)
+
+        bar := make_context_bar(state.used_pct, state.ctx_size)
+        copy(dur_buf[pos:], bar)
+        pos += len(bar)
+
+        segment(buf, ANSI_BG_DARK, "", string(dur_buf[:pos]), false)
+    }
 
     // Context limit warnings
     if state.used_pct >= 80 {
-        warn_text := strings.builder_make(context.temp_allocator)
+        warn_buf: [128]u8
+        warn_text: string
         warn_bg: string
         if state.used_pct >= 95 {
-            fmt.sbprintf(&warn_text, "%s%s CRITICAL COMPACT", ANSI_BOLD, ICON_WARN)
+            warn_text = fmt.bprintf(warn_buf[:], "%s%s CRITICAL COMPACT", ANSI_BOLD, ICON_WARN)
             warn_bg = ANSI_BG_RED
         } else if state.used_pct >= 90 {
-            fmt.sbprintf(&warn_text, "%s%s LOW CTX COMPACT", ANSI_BOLD, ICON_WARN)
+            warn_text = fmt.bprintf(warn_buf[:], "%s%s LOW CTX COMPACT", ANSI_BOLD, ICON_WARN)
             warn_bg = ANSI_BG_RED
         } else {
-            fmt.sbprintf(&warn_text, "%s CTX 80%%+", ICON_WARN)
+            warn_text = fmt.bprintf(warn_buf[:], "%s CTX 80%%+", ICON_WARN)
             warn_bg = ANSI_BG_YELLOW
         }
-        segment(buf, warn_bg, ANSI_FG_BLACK, strings.to_string(warn_text), false)
+        segment(buf, warn_bg, ANSI_FG_BLACK, warn_text, false)
     }
 
     segment_end(buf)
 }
 
-/* ---------------------------------------------------------------------------------- */
-/* Debug Logging                                                                      */
-/* ---------------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* Debug Logging                                                              */
+/* -------------------------------------------------------------------------- */
 
-write_debug_log :: proc(timings: ^DebugTimings, gs: ^GitStatus, stdin_timeout: bool) {
+write_debug_log :: proc(
+    timings       : ^DebugTimings,
+    gs            : ^GitStatus,
+    stdin_timeout : bool,
+) {
     t_end := time.tick_now()
     gppid := get_grandparent_pid()
     cache_str: string
     switch gs.cache_state {
-    case .VALID: cache_str = "valid"
-    case .STALE: cache_str = "stale"
-    case .NONE:  cache_str = "miss"
+    case .VALID:
+        cache_str = "valid"
+    case .STALE:
+        cache_str = "stale"
+    case .NONE:
+        cache_str = "miss"
     }
     stdin_str := stdin_timeout ? "timeout" : "ok"
     debug_buf: [512]u8
-    debug_str := fmt.bprintf(debug_buf[:],
+    debug_str := fmt.bprintf(
+        debug_buf[:],
         "cleanup=%dus read=%dus(%s) parse=%dus git=%dus(%s) build=%dus total=%dus\n",
-        i64(time.duration_microseconds(time.tick_diff(timings.t_start, timings.t_cleanup))),
-        i64(time.duration_microseconds(time.tick_diff(timings.t_cleanup, timings.t_read))),
+        i64(time.duration_microseconds(
+            time.tick_diff(
+                timings.t_start,
+                timings.t_cleanup,
+            ),
+        )),
+        i64(time.duration_microseconds(
+            time.tick_diff(
+                timings.t_cleanup,
+                timings.t_read,
+            ),
+        )),
         stdin_str,
-        i64(time.duration_microseconds(time.tick_diff(timings.t_read, timings.t_parse))),
-        i64(time.duration_microseconds(time.tick_diff(timings.t_parse, timings.t_git))),
+        i64(time.duration_microseconds(
+            time.tick_diff(
+                timings.t_read,
+                timings.t_parse,
+            ),
+        )),
+        i64(time.duration_microseconds(
+            time.tick_diff(
+                timings.t_parse,
+                timings.t_git,
+            ),
+        )),
         cache_str,
-        i64(time.duration_microseconds(time.tick_diff(timings.t_git, timings.t_build))),
-        i64(time.duration_microseconds(time.tick_diff(timings.t_start, t_end))))
+        i64(time.duration_microseconds(
+            time.tick_diff(
+                timings.t_git,
+                timings.t_build,
+            ),
+        )),
+        i64(time.duration_microseconds(
+            time.tick_diff(timings.t_start, t_end),
+        )),
+    )
 
     uid := posix.getuid()
     dir_buf: [64]u8
-    dir_path := fmt.bprintf(dir_buf[:], "/tmp/statusline-%d", uid)
-    dir_cstr := strings.clone_to_cstring(dir_path, context.temp_allocator)
+    dir_path := fmt.bprintf(
+        dir_buf[:],
+        "/tmp/statusline-%d",
+        uid,
+    )
+    dir_cstr := strings.clone_to_cstring(
+        dir_path,
+        context.temp_allocator,
+    )
     posix.mkdir(dir_cstr, {.IRUSR, .IWUSR, .IXUSR})
 
     log_path_buf: [96]u8
-    log_path := fmt.bprintf(log_path_buf[:], "%s/%d.log", dir_path, gppid)
-    log_cstr := strings.clone_to_cstring(log_path, context.temp_allocator)
-    log_fd := posix.open(log_cstr, {.WRONLY, .CREAT, .APPEND}, {.IRUSR, .IWUSR})
+    log_path := fmt.bprintf(
+        log_path_buf[:],
+        "%s/%d.log",
+        dir_path,
+        gppid,
+    )
+    log_cstr := strings.clone_to_cstring(
+        log_path,
+        context.temp_allocator,
+    )
+    log_fd := posix.open(
+        log_cstr,
+        {.WRONLY, .CREAT, .APPEND},
+        {.IRUSR, .IWUSR},
+    )
     if log_fd >= 0 {
-        posix.write(log_fd, raw_data(debug_buf[:]), uint(len(debug_str)))
+        posix.write(
+            log_fd,
+            raw_data(debug_buf[:]),
+            uint(len(debug_str)),
+        )
         posix.close(log_fd)
     }
 }
 
-/* ---------------------------------------------------------------------------------- */
-/* Main                                                                               */
-/* ---------------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* Main                                                                       */
+/* -------------------------------------------------------------------------- */
 
 main :: proc() {
     timings: DebugTimings
     timings.t_start = time.tick_now()
-    debug := os.get_env("STATUSLINE_DEBUG", context.temp_allocator) != ""
+    debug := posix.getenv("STATUSLINE_DEBUG") != nil
 
     cleanup_stale_caches()
     if debug do timings.t_cleanup = time.tick_now()
@@ -1136,13 +1992,23 @@ main :: proc() {
     state := resolve_state(input, stdin_timeout)
     if debug do timings.t_parse = time.tick_now()
 
+    // Usage quota (background fetch, ~5us on cache hit)
+    gppid := get_grandparent_pid()
+    usage := read_usage_cache(gppid)
+    state.five_hour_pct = usage.five_hour_pct
+    state.seven_day_pct = usage.seven_day_pct
+
     // Git status
     gs: GitStatus
-    if branch, ok := git_read_branch_fast(state.cwd); ok {
-        gs.valid = true
-        gs.branch = branch
-        gs.stashes = git_read_stash_count(state.cwd)
-        gs.modified, gs.staged, gs.ahead, gs.behind, gs.cache_state = get_git_status_cached(state.cwd)
+    if len(state.cwd) > 0 {
+        if branch, ok := git_read_branch_fast(state.cwd);
+            ok {
+            gs.valid = true
+            gs.branch = branch
+            gs.stashes = git_read_stash_count(state.cwd)
+            gs.modified, gs.staged, gs.ahead, gs.behind, gs.cache_state =
+                get_git_status_cached(state.cwd)
+        }
     }
     if debug do timings.t_git = time.tick_now()
 
@@ -1151,17 +2017,33 @@ main :: proc() {
     build_statusline(&buf, &state, &gs)
     if debug do timings.t_build = time.tick_now()
 
-    // Timing suffix
-    t_now := time.tick_now()
-    total_us := i64(time.duration_microseconds(time.tick_diff(timings.t_start, t_now)))
-    timing_buf: [64]u8
-    timing_str: string
-    if total_us >= 1000 {
-        timing_str = fmt.bprintf(timing_buf[:], "  %s%.1fms%s", ANSI_FG_COMMENT, f64(total_us) / 1000.0, ANSI_RESET)
-    } else {
-        timing_str = fmt.bprintf(timing_buf[:], "  %s%dus%s", ANSI_FG_COMMENT, total_us, ANSI_RESET)
+    // Timing suffix (only in debug mode)
+    if debug {
+        t_now := time.tick_now()
+        total_us := i64(time.duration_microseconds(
+            time.tick_diff(timings.t_start, t_now),
+        ))
+        timing_buf: [64]u8
+        timing_str: string
+        if total_us >= 1000 {
+            timing_str = fmt.bprintf(
+                timing_buf[:],
+                "  %s%.1fms%s",
+                ANSI_FG_COMMENT,
+                f64(total_us) / 1000.0,
+                ANSI_RESET,
+            )
+        } else {
+            timing_str = fmt.bprintf(
+                timing_buf[:],
+                "  %s%dus%s",
+                ANSI_FG_COMMENT,
+                total_us,
+                ANSI_RESET,
+            )
+        }
+        out_str(&buf, timing_str)
     }
-    out_str(&buf, timing_str)
 
     posix.write(1, raw_data(&buf.data), uint(buf.len))
 
