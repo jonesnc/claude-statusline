@@ -161,15 +161,18 @@ segment_end :: proc(buf: ^OutBuf) {
 /* -------------------------------------------------------------------------- */
 
 JsonFields :: struct {
-    current_dir:         string,
-    display_name:        string,
-    mode:                string,
-    total_cost_usd:      f64,
-    total_lines_added:   i64,
-    total_lines_removed: i64,
-    total_duration_ms:   i64,
-    used_percentage:     i64,
-    context_window_size: i64,
+    current_dir:           string,
+    display_name:          string,
+    mode:                  string,
+    total_cost_usd:        f64,
+    total_lines_added:     i64,
+    total_lines_removed:   i64,
+    total_duration_ms:     i64,
+    total_api_duration_ms: i64,
+    used_percentage:       i64,
+    context_window_size:   i64,
+    total_input_tokens:    i64,
+    total_output_tokens:   i64,
 }
 
 // Parse a string value at cursor (past ':'). Returns
@@ -303,6 +306,21 @@ json_parse_all :: proc(json: string) -> JsonFields {
             if klen = try_key(json, i, "\"total_duration_ms\":"); klen > 0 {
                 i += klen
                 fields.total_duration_ms = json_parse_i64_at(json, &i)
+                continue
+            }
+            if klen = try_key(json, i, "\"total_api_duration_ms\":"); klen > 0 {
+                i += klen
+                fields.total_api_duration_ms = json_parse_i64_at(json, &i)
+                continue
+            }
+            if klen = try_key(json, i, "\"total_input_tokens\":"); klen > 0 {
+                i += klen
+                fields.total_input_tokens = json_parse_i64_at(json, &i)
+                continue
+            }
+            if klen = try_key(json, i, "\"total_output_tokens\":"); klen > 0 {
+                i += klen
+                fields.total_output_tokens = json_parse_i64_at(json, &i)
                 continue
             }
         case 'u':
@@ -568,56 +586,106 @@ abbreviate_model :: proc(model: string) -> string {
 /* Context Bar (Compact block style)                                          */
 /* -------------------------------------------------------------------------- */
 
-make_context_bar :: proc(pct: i64, ctx_size: i64) -> string {
+// Fractional block characters: ▏▎▍▌▋▊▉█ (1/8 to 8/8)
+FRAC_BLOCKS :: [8]string{
+    "\u258F", "\u258E", "\u258D", "\u258C",
+    "\u258B", "\u258A", "\u2589", "\u2588",
+}
+EMPTY_BLOCK :: "\u2591"  // ░
+
+// Color zone for a given cell position (0-based) in a
+// 5-cell bar. Each cell = 20%.
+// 0-1: green (0-40%), 2: yellow (40-60%),
+// 3: orange (60-80%), 4: red (80-100%)
+zone_color :: proc(cell: int) -> string {
+    switch cell {
+    case 0, 1: return ANSI_FG_GREEN
+    case 2:    return ANSI_FG_YELLOW
+    case 3:    return ANSI_FG_ORANGE
+    case:      return ANSI_FG_RED
+    }
+}
+
+// Color for the percentage label (matches leading edge)
+pct_label_color :: proc(pct: i64) -> string {
+    if pct >= 80 do return ANSI_FG_RED
+    if pct >= 60 do return ANSI_FG_ORANGE
+    if pct >= 40 do return ANSI_FG_YELLOW
+    return ANSI_FG_GREEN
+}
+
+make_context_bar :: proc(
+    pct: i64,
+    ctx_size: i64,
+    input_tokens: i64,
+) -> string {
     @(static) bar_buf: [256]u8
 
     clamped := min(pct, 100)
-    width :: 5
-    filled := int((clamped * width) / 100)
-    empty := width - filled
-
-    fill_color: string
-    if clamped >= 90 {
-        fill_color = ANSI_FG_RED
-    } else if clamped >= 80 {
-        fill_color = ANSI_FG_ORANGE
-    } else if clamped >= 50 {
-        fill_color = ANSI_FG_YELLOW
-    } else {
-        fill_color = ANSI_FG_GREEN
-    }
+    WIDTH :: 5
+    // Total fractional steps (5 cells × 8 eighths)
+    total_steps := int(clamped * WIDTH * 8 / 100)
 
     pos := 0
 
-    // Filled blocks in fill color
-    copy(bar_buf[pos:], fill_color)
-    pos += len(fill_color)
-    for _ in 0 ..< filled {
-        // U+25B0 ▰ (UTF-8: E2 96 B0)
-        bar_buf[pos] = 0xe2
-        bar_buf[pos + 1] = 0x96
-        bar_buf[pos + 2] = 0xb0
-        pos += 3
+    // Token count (bright white)
+    if input_tokens > 0 {
+        tok_buf: [16]u8
+        tok := format_tokens(tok_buf[:], input_tokens)
+        s := fmt.bprintf(bar_buf[pos:], "%s%s ", ANSI_FG_WHITE, tok)
+        pos += len(s)
     }
 
-    // Empty blocks in white
-    copy(bar_buf[pos:], ANSI_FG_WHITE)
-    pos += len(ANSI_FG_WHITE)
-    for _ in 0 ..< empty {
-        // U+25B1 ▱ (UTF-8: E2 96 B1)
-        bar_buf[pos] = 0xe2
-        bar_buf[pos + 1] = 0x96
-        bar_buf[pos + 2] = 0xb1
-        pos += 3
+    // Left border
+    copy(bar_buf[pos:], ANSI_FG_COMMENT)
+    pos += len(ANSI_FG_COMMENT)
+    copy(bar_buf[pos:], "\u2595")  // ▕
+    pos += len("\u2595")
+
+    // Bar: 5 cells with color zones and fractional fill
+    remaining := total_steps
+    for cell in 0 ..< WIDTH {
+        color := zone_color(cell)
+        copy(bar_buf[pos:], color)
+        pos += len(color)
+
+        if remaining >= 8 {
+            // Full block
+            copy(bar_buf[pos:], FRAC_BLOCKS[7])
+            pos += len(FRAC_BLOCKS[7])
+            remaining -= 8
+        } else if remaining > 0 {
+            // Partial block (1/8 to 7/8)
+            blocks := FRAC_BLOCKS
+            frac := blocks[remaining - 1]
+            copy(bar_buf[pos:], frac)
+            pos += len(frac)
+            remaining = 0
+        } else {
+            // Empty
+            copy(bar_buf[pos:], ANSI_FG_DARK)
+            pos += len(ANSI_FG_DARK)
+            copy(bar_buf[pos:], EMPTY_BLOCK)
+            pos += len(EMPTY_BLOCK)
+        }
     }
 
-    // Percentage
+    // Right border
+    copy(bar_buf[pos:], ANSI_FG_COMMENT)
+    pos += len(ANSI_FG_COMMENT)
+    copy(bar_buf[pos:], "\u258F")  // ▏
+    pos += len("\u258F")
+
+    // Percentage label
     bar_buf[pos] = ' '
     pos += 1
-    copy(bar_buf[pos:], fill_color)
-    pos += len(fill_color)
-    pct_str := fmt.bprintf(bar_buf[pos:], "%d%%", clamped)
-    pos += len(pct_str)
+    label_color := pct_label_color(clamped)
+    copy(bar_buf[pos:], label_color)
+    pos += len(label_color)
+    s := fmt.bprintf(bar_buf[pos:], "%d", clamped)
+    pos += len(s)
+    bar_buf[pos] = '%'
+    pos += 1
 
     return string(bar_buf[:pos])
 }
@@ -646,6 +714,13 @@ format_duration :: proc(ms: i64) -> string {
         mins := (ms % 3600000) / 60000
         return fmt.bprintf(dur_buf[:], "%dh%dm", hours, mins)
     }
+}
+
+format_tokens :: proc(buf: []u8, tokens: i64) -> string {
+    if tokens >= 1_000_000 {
+        return fmt.bprintf(buf, "%.1fM", f64(tokens) / 1_000_000.0)
+    }
+    return fmt.bprintf(buf, "%dk", tokens / 1000)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -740,15 +815,18 @@ git_read_branch_fast :: proc(
 CACHE_PATH_PREFIX :: "/dev/shm/statusline-cache."
 
 CachedState :: struct #packed {
-    used_pct:       i64,
-    context_size:   i64,
-    cost_usd:       f64,
-    lines_added:    i64,
-    lines_removed:  i64,
-    duration_ms:    i64,
+    used_pct:        i64,
+    context_size:    i64,
+    cost_usd:        f64,
+    lines_added:     i64,
+    lines_removed:   i64,
+    duration_ms:     i64,
+    api_duration_ms: i64,
     last_update_sec: i64,
-    cwd:            [256]u8,
-    model:          [64]u8,
+    input_tokens:    i64,
+    output_tokens:   i64,
+    cwd:             [256]u8,
+    model:           [64]u8,
 }
 
 get_grandparent_pid :: proc() -> int {
@@ -1313,12 +1391,17 @@ refresh_usage_cache :: proc(gppid: int) {
     first_fork := posix.fork()
     if first_fork < 0 do return
     if first_fork > 0 {
+        // Use WNOHANG-style: wait briefly, don't block forever
         posix.waitpid(first_fork, nil, {})
         return
     }
 
-    // Middle child - fork grandchild and exit
-    if posix.fork() != 0 do posix._exit(0)
+    // Middle child - fork grandchild and exit immediately
+    grandchild := posix.fork()
+    if grandchild != 0 {
+        posix._exit(0)
+        // unreachable - but just in case
+    }
 
     // Grandchild: read credentials, curl, parse, write
     home := string(posix.getenv("HOME"))
@@ -1571,16 +1654,19 @@ build_git_segment :: proc(
 DisplayState :: struct {
     cwd:               string,
     model:             string,
-    cost_usd:          f64,
-    lines_added:       i64,
-    lines_removed:     i64,
-    total_duration_ms: i64,
-    used_pct:          i64,
-    ctx_size:          i64,
-    last_update_sec:   i64,
-    five_hour_pct:     f64,
-    seven_day_pct:     f64,
-    vim_mode:          string,
+    cost_usd:           f64,
+    lines_added:        i64,
+    lines_removed:      i64,
+    total_duration_ms:  i64,
+    api_duration_ms:    i64,
+    used_pct:           i64,
+    ctx_size:           i64,
+    last_update_sec:    i64,
+    input_tokens:       i64,
+    output_tokens:      i64,
+    five_hour_pct:      f64,
+    seven_day_pct:      f64,
+    vim_mode:           string,
 }
 
 DebugTimings :: struct {
@@ -1638,8 +1724,11 @@ resolve_state :: proc(
         json_lines_added   := f.total_lines_added
         json_lines_removed := f.total_lines_removed
         json_duration      := f.total_duration_ms
+        json_api_dur       := f.total_api_duration_ms
         json_pct           := f.used_percentage
         json_ctx_size      := f.context_window_size
+        json_in_tok        := f.total_input_tokens
+        json_out_tok       := f.total_output_tokens
         state.vim_mode      = f.mode
 
         cached_cwd              := string(cstring(&cached.cwd[0]))
@@ -1650,8 +1739,11 @@ resolve_state :: proc(
         state.lines_added        = json_lines_added > 0 ? json_lines_added : cached.lines_added
         state.lines_removed      = json_lines_removed > 0 ? json_lines_removed : cached.lines_removed
         state.total_duration_ms  = json_duration > 0 ? json_duration : cached.duration_ms
+        state.api_duration_ms    = json_api_dur > 0 ? json_api_dur : cached.api_duration_ms
         state.used_pct           = json_pct > 0 ? json_pct : cached.used_pct
         state.ctx_size           = json_ctx_size > 0 ? json_ctx_size : cached.context_size
+        state.input_tokens       = json_in_tok > 0 ? json_in_tok : cached.input_tokens
+        state.output_tokens      = json_out_tok > 0 ? json_out_tok : cached.output_tokens
         state.last_update_sec    = current_time_sec()
 
         // Update cache
@@ -1679,6 +1771,18 @@ resolve_state :: proc(
         new_cache.duration_ms = max(
             json_duration,
             cached.duration_ms,
+        )
+        new_cache.api_duration_ms = max(
+            json_api_dur,
+            cached.api_duration_ms,
+        )
+        new_cache.input_tokens = max(
+            json_in_tok,
+            cached.input_tokens,
+        )
+        new_cache.output_tokens = max(
+            json_out_tok,
+            cached.output_tokens,
         )
         new_cache.last_update_sec =
             state.last_update_sec
@@ -1708,8 +1812,11 @@ resolve_state :: proc(
         state.lines_added       = cached.lines_added
         state.lines_removed     = cached.lines_removed
         state.total_duration_ms = cached.duration_ms
+        state.api_duration_ms   = cached.api_duration_ms
         state.used_pct          = cached.used_pct
         state.ctx_size          = cached.context_size
+        state.input_tokens      = cached.input_tokens
+        state.output_tokens     = cached.output_tokens
         state.last_update_sec   = cached.last_update_sec
     }
 
@@ -1830,22 +1937,27 @@ build_statusline :: proc(
         segment(buf, ANSI_BG_COMMENT, "", usage_text, false)
     }
 
-    // Combined: duration | last update | context bar
+    // Combined: duration | API time | last update | tokens | context bar
     if state.total_duration_ms > 0 {
         dur_buf: [512]u8
         pos := 0
         s := fmt.bprintf(dur_buf[:], "%s%s %s", ANSI_FG_WHITE, ICON_CLOCK, format_duration(state.total_duration_ms))
         pos += len(s)
 
-        if state.last_update_sec > 0 {
-            s2 := fmt.bprintf(dur_buf[pos:], " %s| %s%s", ANSI_FG_COMMENT, ANSI_FG_WHITE, format_time_12h(state.last_update_sec))
+        if state.api_duration_ms > 0 {
+            s2 := fmt.bprintf(dur_buf[pos:], " %s\u26A1%s%s", ANSI_FG_YELLOW, ANSI_FG_WHITE, format_duration(state.api_duration_ms))
             pos += len(s2)
         }
 
-        s3 := fmt.bprintf(dur_buf[pos:], " %s| ", ANSI_FG_COMMENT)
-        pos += len(s3)
+        if state.last_update_sec > 0 {
+            s3 := fmt.bprintf(dur_buf[pos:], " %s| %s%s", ANSI_FG_COMMENT, ANSI_FG_WHITE, format_time_12h(state.last_update_sec))
+            pos += len(s3)
+        }
 
-        bar := make_context_bar(state.used_pct, state.ctx_size)
+        s5 := fmt.bprintf(dur_buf[pos:], " %s| ", ANSI_FG_COMMENT)
+        pos += len(s5)
+
+        bar := make_context_bar(state.used_pct, state.ctx_size, state.input_tokens)
         copy(dur_buf[pos:], bar)
         pos += len(bar)
 
