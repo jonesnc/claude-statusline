@@ -169,7 +169,7 @@ JsonFields :: struct {
     total_lines_removed:   i64,
     total_duration_ms:     i64,
     total_api_duration_ms: i64,
-    used_percentage:       i64,
+    used_percentage:       f64,
     context_window_size:   i64,
     total_input_tokens:    i64,
     total_output_tokens:   i64,
@@ -326,7 +326,7 @@ json_parse_all :: proc(json: string) -> JsonFields {
         case 'u':
             if klen = try_key(json, i, "\"used_percentage\":"); klen > 0 {
                 i += klen
-                fields.used_percentage = json_parse_i64_at(json, &i)
+                fields.used_percentage = json_parse_f64_at(json, &i)
                 continue
             }
         }
@@ -619,7 +619,7 @@ make_context_bar :: proc(
     ctx_size: i64,
     input_tokens: i64,
 ) -> string {
-    @(static) bar_buf: [256]u8
+    @(static) bar_buf: [512]u8
 
     clamped := min(pct, 100)
     WIDTH :: 5
@@ -1725,7 +1725,8 @@ resolve_state :: proc(
         json_lines_removed := f.total_lines_removed
         json_duration      := f.total_duration_ms
         json_api_dur       := f.total_api_duration_ms
-        json_pct           := f.used_percentage
+        json_pct_f64       := f.used_percentage
+        json_pct           := i64(json_pct_f64 + 0.5)
         json_ctx_size      := f.context_window_size
         json_in_tok        := f.total_input_tokens
         json_out_tok       := f.total_output_tokens
@@ -1748,10 +1749,8 @@ resolve_state :: proc(
 
         // Update cache
         new_cache: CachedState
-        new_cache.used_pct = max(
-            json_pct,
-            cached.used_pct,
-        )
+        new_cache.used_pct =
+            json_pct > 0 ? json_pct : cached.used_pct
         new_cache.context_size = max(
             json_ctx_size,
             cached.context_size,
