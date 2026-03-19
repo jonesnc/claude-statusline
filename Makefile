@@ -27,11 +27,15 @@ clean:
 	rm -f $(BIN) statusline_odin
 
 install: $(BIN)
+	-mv $(PREFIX)/$(BIN) $(PREFIX)/$(BIN).old
 	cp $(BIN) $(PREFIX)/$(BIN)
+	-rm -f $(PREFIX)/$(BIN).old
 	@echo "Installed to $(PREFIX)/$(BIN)"
 
 install-odin: statusline_odin
+	-mv $(PREFIX)/$(BIN) $(PREFIX)/$(BIN).old
 	cp statusline_odin $(PREFIX)/$(BIN)
+	-rm -f $(PREFIX)/$(BIN).old
 	@echo "Installed Odin version to $(PREFIX)/$(BIN)"
 
 bench: $(BIN) statusline_odin

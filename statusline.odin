@@ -1725,8 +1725,6 @@ resolve_state :: proc(
         json_lines_removed := f.total_lines_removed
         json_duration      := f.total_duration_ms
         json_api_dur       := f.total_api_duration_ms
-        json_pct_f64       := f.used_percentage
-        json_pct           := i64(json_pct_f64 + 0.5)
         json_ctx_size      := f.context_window_size
         json_in_tok        := f.total_input_tokens
         json_out_tok       := f.total_output_tokens
@@ -1741,16 +1739,23 @@ resolve_state :: proc(
         state.lines_removed      = json_lines_removed > 0 ? json_lines_removed : cached.lines_removed
         state.total_duration_ms  = json_duration > 0 ? json_duration : cached.duration_ms
         state.api_duration_ms    = json_api_dur > 0 ? json_api_dur : cached.api_duration_ms
-        state.used_pct           = json_pct > 0 ? json_pct : cached.used_pct
         state.ctx_size           = json_ctx_size > 0 ? json_ctx_size : cached.context_size
+        // Compute pct from tokens/size to handle dynamic context windows
+        in_tok := json_in_tok > 0 ? json_in_tok : cached.input_tokens
+        ctx_sz := state.ctx_size
+        if in_tok > 0 && ctx_sz > 0 {
+            state.used_pct = i64(f64(in_tok) / f64(ctx_sz) * 100.0 + 0.5)
+        } else {
+            json_pct := i64(f.used_percentage + 0.5)
+            state.used_pct = json_pct > 0 ? json_pct : cached.used_pct
+        }
         state.input_tokens       = json_in_tok > 0 ? json_in_tok : cached.input_tokens
         state.output_tokens      = json_out_tok > 0 ? json_out_tok : cached.output_tokens
         state.last_update_sec    = current_time_sec()
 
         // Update cache
         new_cache: CachedState
-        new_cache.used_pct =
-            json_pct > 0 ? json_pct : cached.used_pct
+        new_cache.used_pct = state.used_pct
         new_cache.context_size = max(
             json_ctx_size,
             cached.context_size,
