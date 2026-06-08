@@ -10,6 +10,11 @@ CFLAGS   := -O3 -march=native -Wall -Wextra -Wno-unused-parameter -Wno-unused-re
 # Odin version
 ODIN     := odin
 OFLAGS   := -o:speed -no-bounds-check -disable-assert -microarch:native
+# Distro packages (e.g. Fedora) install the std-lib collections under
+# /usr/lib/odin but don't export ODIN_ROOT, so `odin build` can't find
+# the 'base' collection. Default it here if the env doesn't set it.
+ODIN_ROOT ?= $(firstword $(wildcard /usr/lib/odin /usr/share/odin) $(HOME)/odin)
+export ODIN_ROOT
 
 .PHONY: all clean install install-odin bench odin
 

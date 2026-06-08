@@ -174,6 +174,7 @@ JsonFields :: struct {
     context_window_size:   i64,
     total_input_tokens:    i64,
     total_output_tokens:   i64,
+    exceeds_200k:          bool,
 }
 
 // Parse a string value at cursor (past ':'). Returns
@@ -324,6 +325,18 @@ json_parse_all :: proc(json: string) -> JsonFields {
                 fields.total_output_tokens = json_parse_i64_at(json, &i)
                 continue
             }
+        case 'e':
+            if klen = try_key(json, i, "\"exceeds_200k_tokens\":"); klen > 0 {
+                i += klen
+                // value is a bare literal: skip space, check for 't'
+                j := i
+                for j < len(json) && (json[j] == ' ' || json[j] == '\t') {
+                    j += 1
+                }
+                fields.exceeds_200k = j < len(json) && json[j] == 't'
+                i = j
+                continue
+            }
         case 'u':
             if klen = try_key(json, i, "\"used_percentage\":"); klen > 0 {
                 i += klen
@@ -374,7 +387,7 @@ json_find_object_f64 :: proc(
     obj_needle_buf: [256]u8
     obj_needle := fmt.bprintf(
         obj_needle_buf[:],
-        "\"%s\"",
+        "\"%s\":",
         obj_key,
     )
 
@@ -398,6 +411,90 @@ json_find_object_f64 :: proc(
 
     pos := ki + len(key_needle)
     return json_parse_f64_at(obj, &pos)
+}
+
+// Like json_find_object_f64 but returns a string field (e.g. resets_at).
+json_find_object_str :: proc(
+    json: string,
+    obj_key: string,
+    field_key: string,
+) -> string {
+    obj_needle_buf: [256]u8
+    obj_needle := fmt.bprintf(
+        obj_needle_buf[:],
+        "\"%s\":",
+        obj_key,
+    )
+
+    idx := strings.index(json, obj_needle)
+    if idx < 0 do return ""
+
+    rest := json[idx + len(obj_needle):]
+    brace := strings.index(rest, "{")
+    if brace < 0 do return ""
+
+    obj := rest[brace:]
+    key_needle_buf: [256]u8
+    key_needle := fmt.bprintf(
+        key_needle_buf[:],
+        "\"%s\":",
+        field_key,
+    )
+    ki := strings.index(obj, key_needle)
+    if ki < 0 do return ""
+
+    pos := ki + len(key_needle)
+    return json_parse_string_at(obj, &pos)
+}
+
+// Days since Unix epoch for a civil (proleptic Gregorian) date.
+// Howard Hinnant's days_from_civil algorithm.
+days_from_civil :: proc(y, m, d: i64) -> i64 {
+    yy := m <= 2 ? y - 1 : y
+    era := (yy >= 0 ? yy : yy - 399) / 400
+    yoe := yy - era * 400
+    doy := (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1
+    doe := yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+// Parse an RFC3339/ISO8601 timestamp ("2026-06-07T18:00:00Z") to epoch
+// seconds (UTC). Returns 0 on any parse failure. Sub-second and timezone
+// offsets are ignored — the API returns UTC ("Z").
+iso8601_to_epoch :: proc(s: string) -> i64 {
+    if len(s) < 19 do return 0
+    if s[4] != '-' || s[7] != '-' || s[10] != 'T' do return 0
+
+    pi :: proc(sub: string) -> (i64, bool) {
+        return strconv.parse_i64(sub)
+    }
+    y,  oy := pi(s[0:4])
+    mo, om := pi(s[5:7])
+    d,  od := pi(s[8:10])
+    h,  oh := pi(s[11:13])
+    mi, oi := pi(s[14:16])
+    se, os := pi(s[17:19])
+    if !(oy && om && od && oh && oi && os) do return 0
+    if mo < 1 || mo > 12 do return 0
+
+    days := days_from_civil(y, mo, d)
+    return days * 86400 + h * 3600 + mi * 60 + se
+}
+
+// Compact "resets in" countdown: 45m, 2h13m, or 3d2h for longer windows.
+format_countdown :: proc(buf: []u8, secs: i64) -> string {
+    if secs <= 0 do return ""
+    if secs < 3600 {
+        return fmt.bprintf(buf, "%dm", secs / 60)
+    }
+    if secs < 86400 {
+        h := secs / 3600
+        m := (secs % 3600) / 60
+        return fmt.bprintf(buf, "%dh%dm", h, m)
+    }
+    d := secs / 86400
+    h := (secs % 86400) / 3600
+    return fmt.bprintf(buf, "%dd%dh", d, h)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1350,9 +1447,13 @@ USAGE_CACHE_TTL_S :: 60
 USAGE_CACHE_PREFIX :: "/dev/shm/statusline-usage."
 
 UsageCache :: struct #packed {
-    fetch_time_sec: i64,
-    five_hour_pct:  f64,
-    seven_day_pct:  f64,
+    fetch_time_sec:     i64,
+    five_hour_pct:      f64,
+    seven_day_pct:      f64,
+    seven_day_opus_pct: f64,
+    five_hour_reset:    i64,  // epoch sec, 0 if unknown
+    seven_day_reset:    i64,
+    opus_reset:         i64,
 }
 
 get_usage_cache_path :: proc(gppid: int) -> string {
@@ -1490,16 +1591,20 @@ refresh_usage_cache :: proc(gppid: int) {
 
     response := string(response_buf[:total_read])
 
-    // Parse: five_hour.utilization, seven_day.utilization
-    five_pct := json_find_object_f64(
-        response,
-        "five_hour",
-        "utilization",
+    // Parse utilization + reset timestamps for each window. seven_day_opus
+    // is the Max-plan Opus-specific weekly cap (may be absent → 0).
+    five_pct := json_find_object_f64(response, "five_hour", "utilization")
+    seven_pct := json_find_object_f64(response, "seven_day", "utilization")
+    opus_pct := json_find_object_f64(response, "seven_day_opus", "utilization")
+
+    five_reset := iso8601_to_epoch(
+        json_find_object_str(response, "five_hour", "resets_at"),
     )
-    seven_pct := json_find_object_f64(
-        response,
-        "seven_day",
-        "utilization",
+    seven_reset := iso8601_to_epoch(
+        json_find_object_str(response, "seven_day", "resets_at"),
+    )
+    opus_reset := iso8601_to_epoch(
+        json_find_object_str(response, "seven_day_opus", "resets_at"),
     )
 
     // Write cache
@@ -1507,6 +1612,10 @@ refresh_usage_cache :: proc(gppid: int) {
     cache.fetch_time_sec = current_time_sec()
     cache.five_hour_pct = five_pct
     cache.seven_day_pct = seven_pct
+    cache.seven_day_opus_pct = opus_pct
+    cache.five_hour_reset = five_reset
+    cache.seven_day_reset = seven_reset
+    cache.opus_reset = opus_reset
 
     cache_path := get_usage_cache_path(gppid)
     cache_cstr := strings.clone_to_cstring(
@@ -1644,6 +1753,11 @@ DisplayState :: struct {
     output_tokens:      i64,
     five_hour_pct:      f64,
     seven_day_pct:      f64,
+    seven_day_opus_pct: f64,
+    five_hour_reset:    i64,
+    seven_day_reset:    i64,
+    opus_reset:         i64,
+    exceeds_200k:       bool,
     vim_mode:           string,
 }
 
@@ -1735,6 +1849,7 @@ resolve_state :: proc(
         }
         state.input_tokens       = json_in_tok > 0 ? json_in_tok : cached.input_tokens
         state.output_tokens      = json_out_tok > 0 ? json_out_tok : cached.output_tokens
+        state.exceeds_200k       = f.exceeds_200k
         state.last_update_sec    = current_time_sec()
 
         // Update cache
@@ -1838,6 +1953,11 @@ format_time_12h :: proc(epoch_sec: i64) -> string {
     )
 }
 
+// Minimum window utilization before the usage segment appears. Set low so
+// the 5h rate-limit window — the real constraint on a subscription — shows
+// well before it bites.
+USAGE_SHOW_PCT :: 25
+
 usage_color :: proc(pct: f64) -> string {
     if pct >= 90 do return ANSI_FG_RED
     if pct >= 80 do return ANSI_FG_ORANGE
@@ -1896,33 +2016,64 @@ build_statusline :: proc(
         build_git_segment(buf, gs)
     }
 
-    // Cost
-    cost_bg: string
-    if state.cost_usd >= 10.0 {
-        cost_bg = ANSI_BG_RED
-    } else if state.cost_usd >= 5.0 {
-        cost_bg = ANSI_BG_ORANGE
-    } else if state.cost_usd >= 1.0 {
-        cost_bg = ANSI_BG_CYAN
-    } else {
-        cost_bg = ANSI_BG_MINT
-    }
-    cost_buf: [64]u8
-    cost_text := fmt.bprintf(cost_buf[:], "%s %.2f", ICON_DOLLAR, state.cost_usd)
-    segment(buf, cost_bg, ANSI_FG_BLACK, cost_text, false)
+    // Cost intentionally omitted: total_cost_usd is an API-equivalent figure,
+    // NOT a real charge on a flat subscription. Showing dollars on a Pro plan
+    // is misleading, so it's dropped in favor of the real ceiling — usage.
 
-    // Usage quota (when >= 50%)
-    if state.five_hour_pct >= 50 || state.seven_day_pct >= 50 {
+    // Usage quota — the REAL ceiling on a subscription. Shown from 25% (not
+    // 50%) so the 5h window you'll actually hit mid-task is visible early.
+    // Opus weekly cap (Max plans) and a countdown to the soonest reset are
+    // appended when relevant.
+    if state.five_hour_pct >= USAGE_SHOW_PCT ||
+        state.seven_day_pct >= USAGE_SHOW_PCT ||
+        state.seven_day_opus_pct >= 50 {
         color_5h := usage_color(state.five_hour_pct)
         color_7d := usage_color(state.seven_day_pct)
         usage_buf: [256]u8
-        usage_text := fmt.bprintf(
+        pos := 0
+        s := fmt.bprintf(
             usage_buf[:],
             "%s5h %s%s%d%% %s7d %s%s%d%%",
             ANSI_FG_WHITE, ANSI_BOLD, color_5h, i64(state.five_hour_pct + 0.5),
             ANSI_FG_WHITE, ANSI_BOLD, color_7d, i64(state.seven_day_pct + 0.5),
         )
-        segment(buf, ANSI_BG_COMMENT, "", usage_text, false)
+        pos += len(s)
+
+        // Opus weekly cap (only when it's actually meaningful)
+        if state.seven_day_opus_pct >= 50 {
+            color_op := usage_color(state.seven_day_opus_pct)
+            so := fmt.bprintf(
+                usage_buf[pos:],
+                " %sop %s%s%d%%",
+                ANSI_FG_WHITE, ANSI_BOLD, color_op,
+                i64(state.seven_day_opus_pct + 0.5),
+            )
+            pos += len(so)
+        }
+
+        // Countdown to the soonest relevant reset. Prefer the 5h window
+        // when it's the one driving the display; fall back to weekly.
+        now := current_time_sec()
+        reset_epoch: i64 = 0
+        if state.five_hour_pct >= USAGE_SHOW_PCT && state.five_hour_reset > now {
+            reset_epoch = state.five_hour_reset
+        } else if state.seven_day_opus_pct >= 50 && state.opus_reset > now {
+            reset_epoch = state.opus_reset
+        } else if state.seven_day_reset > now {
+            reset_epoch = state.seven_day_reset
+        }
+        if reset_epoch > now {
+            cd_buf: [16]u8
+            cd := format_countdown(cd_buf[:], reset_epoch - now)
+            sr := fmt.bprintf(
+                usage_buf[pos:],
+                " %s%s%s",
+                ANSI_FG_WHITE, ICON_SYNC, cd,
+            )
+            pos += len(sr)
+        }
+
+        segment(buf, ANSI_BG_COMMENT, "", string(usage_buf[:pos]), false)
     }
 
     // Combined: duration | API time | last update | tokens | context bar
@@ -1940,6 +2091,14 @@ build_statusline :: proc(
         if state.last_update_sec > 0 {
             s3 := fmt.bprintf(dur_buf[pos:], " %s| %s%s %s", ANSI_FG_COMMENT, ANSI_FG_WHITE, ICON_SYNC, format_time_12h(state.last_update_sec))
             pos += len(s3)
+        }
+
+        // Output tokens generated this session (the expensive half of the
+        // bill; the context bar only reflects input/context occupancy).
+        if state.output_tokens > 0 {
+            otok_buf: [16]u8
+            s4 := fmt.bprintf(dur_buf[pos:], " %s| %s↑%s", ANSI_FG_COMMENT, ANSI_FG_WHITE, format_tokens(otok_buf[:], state.output_tokens))
+            pos += len(s4)
         }
 
         s5 := fmt.bprintf(dur_buf[pos:], " %s| ", ANSI_FG_COMMENT)
@@ -2100,6 +2259,10 @@ main :: proc() {
     usage := read_usage_cache(gppid)
     state.five_hour_pct = usage.five_hour_pct
     state.seven_day_pct = usage.seven_day_pct
+    state.seven_day_opus_pct = usage.seven_day_opus_pct
+    state.five_hour_reset = usage.five_hour_reset
+    state.seven_day_reset = usage.seven_day_reset
+    state.opus_reset = usage.opus_reset
 
     // Git status
     gs: GitStatus
