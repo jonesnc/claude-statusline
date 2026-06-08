@@ -41,6 +41,7 @@ install-odin: statusline_odin
 	-mv $(PREFIX)/$(BIN) $(PREFIX)/$(BIN).old
 	cp statusline_odin $(PREFIX)/$(BIN)
 	-rm -f $(PREFIX)/$(BIN).old
+	@echo "$(CURDIR)" > $(PREFIX)/statusline-src
 	@echo "Installed Odin version to $(PREFIX)/$(BIN)"
 
 bench: $(BIN) statusline_odin

@@ -2226,6 +2226,114 @@ write_debug_log :: proc(
 }
 
 /* -------------------------------------------------------------------------- */
+/* Auto-Update (once per day, fire-and-forget)                               */
+/* -------------------------------------------------------------------------- */
+
+AUTO_UPDATE_INTERVAL_S :: 86400
+
+maybe_auto_update :: proc() {
+    home := string(posix.getenv("HOME"))
+    if len(home) == 0 do return
+
+    sentinel_buf: [256]u8
+    sentinel_path := fmt.bprintf(
+        sentinel_buf[:],
+        "%s/.claude/statusline-last-update",
+        home,
+    )
+    sentinel_cstr := strings.clone_to_cstring(
+        sentinel_path,
+        context.temp_allocator,
+    )
+
+    st: posix.stat_t
+    now := current_time_sec()
+    if posix.stat(sentinel_cstr, &st) == .OK {
+        if now - i64(st.st_mtim.tv_sec) < AUTO_UPDATE_INTERVAL_S {
+            return
+        }
+    }
+
+    // Read repo source path written by `make install-odin`
+    src_path_buf: [512]u8
+    src_path_file := fmt.bprintf(
+        src_path_buf[:],
+        "%s/.claude/statusline-src",
+        home,
+    )
+    src_cstr := strings.clone_to_cstring(
+        src_path_file,
+        context.temp_allocator,
+    )
+
+    src_fd := posix.open(src_cstr, {})
+    if src_fd < 0 do return
+
+    src_data: [512]u8
+    n := posix.read(src_fd, raw_data(&src_data), len(src_data) - 1)
+    posix.close(src_fd)
+    if n <= 0 do return
+
+    src_dir := strings.trim_right_space(string(src_data[:n]))
+    if len(src_dir) == 0 do return
+
+    // Touch sentinel immediately to prevent concurrent runs
+    touch_fd := posix.open(
+        sentinel_cstr,
+        {.WRONLY, .CREAT, .TRUNC},
+        {.IRUSR, .IWUSR},
+    )
+    if touch_fd >= 0 do posix.close(touch_fd)
+
+    // Double-fork so grandchild is reparented to init (fully detached)
+    first_fork := posix.fork()
+    if first_fork < 0 do return
+    if first_fork > 0 {
+        posix.waitpid(first_fork, nil, {})
+        return
+    }
+
+    // Middle child
+    grandchild := posix.fork()
+    if grandchild != 0 do posix._exit(0)
+
+    // Grandchild: pull then rebuild+install
+    src_dir_cstr := strings.clone_to_cstring(
+        src_dir,
+        context.temp_allocator,
+    )
+
+    dev_null := posix.open("/dev/null", {.RDWR})
+    if dev_null >= 0 {
+        posix.dup2(dev_null, 0)
+        posix.dup2(dev_null, 1)
+        posix.dup2(dev_null, 2)
+        if dev_null > 2 do posix.close(dev_null)
+    }
+
+    // git pull --ff-only -q
+    git_pid := posix.fork()
+    if git_pid == 0 {
+        git_argv := []cstring{
+            "git", "-C", src_dir_cstr,
+            "pull", "--ff-only", "-q",
+            nil,
+        }
+        posix.execvp("git", raw_data(git_argv))
+        posix._exit(127)
+    }
+    if git_pid > 0 do posix.waitpid(git_pid, nil, {})
+
+    // make install-odin (exec directly — grandchild becomes make)
+    make_argv := []cstring{
+        "make", "-C", src_dir_cstr, "install-odin",
+        nil,
+    }
+    posix.execvp("make", raw_data(make_argv))
+    posix._exit(127)
+}
+
+/* -------------------------------------------------------------------------- */
 /* Main                                                                       */
 /* -------------------------------------------------------------------------- */
 
@@ -2235,6 +2343,7 @@ main :: proc() {
     debug := posix.getenv("STATUSLINE_DEBUG") != nil
 
     cleanup_stale_caches()
+    maybe_auto_update()
     if debug do timings.t_cleanup = time.tick_now()
 
     input, stdin_timeout := read_stdin()
