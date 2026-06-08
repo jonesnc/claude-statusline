@@ -443,7 +443,7 @@ abbrev_path :: proc(path: string) -> string {
 
     for scan < len(buf) &&
         result_len < len(result_buf) - 1 {
-        if scan > 0 && buf[scan] == '/' {
+        if buf[scan] == '/' {
             result_buf[result_len] = '/'
             result_len += 1
             scan += 1
@@ -1740,14 +1740,20 @@ resolve_state :: proc(
         state.total_duration_ms  = json_duration > 0 ? json_duration : cached.duration_ms
         state.api_duration_ms    = json_api_dur > 0 ? json_api_dur : cached.api_duration_ms
         state.ctx_size           = json_ctx_size > 0 ? json_ctx_size : cached.context_size
-        // Compute pct from tokens/size to handle dynamic context windows
-        in_tok := json_in_tok > 0 ? json_in_tok : cached.input_tokens
-        ctx_sz := state.ctx_size
-        if in_tok > 0 && ctx_sz > 0 {
-            state.used_pct = i64(f64(in_tok) / f64(ctx_sz) * 100.0 + 0.5)
+        // used_percentage from Claude Code is authoritative: it accounts for cache tokens.
+        // total_input_tokens only counts raw (non-cached) tokens and severely
+        // underrepresents context usage when cache hits dominate.
+        json_pct := i64(f.used_percentage + 0.5)
+        if json_pct > 0 {
+            state.used_pct = json_pct
         } else {
-            json_pct := i64(f.used_percentage + 0.5)
-            state.used_pct = json_pct > 0 ? json_pct : cached.used_pct
+            in_tok := json_in_tok > 0 ? json_in_tok : cached.input_tokens
+            ctx_sz := state.ctx_size
+            if in_tok > 0 && ctx_sz > 0 {
+                state.used_pct = i64(f64(in_tok) / f64(ctx_sz) * 100.0 + 0.5)
+            } else {
+                state.used_pct = cached.used_pct
+            }
         }
         state.input_tokens       = json_in_tok > 0 ? json_in_tok : cached.input_tokens
         state.output_tokens      = json_out_tok > 0 ? json_out_tok : cached.output_tokens
@@ -1961,7 +1967,10 @@ build_statusline :: proc(
         s5 := fmt.bprintf(dur_buf[pos:], " %s| ", ANSI_FG_COMMENT)
         pos += len(s5)
 
-        bar := make_context_bar(state.used_pct, state.ctx_size, state.input_tokens)
+        // Derive bar token count from pct*size: total_input_tokens excludes cache
+        // hits and would show near-zero even when context window is heavily used.
+        bar_tok := state.ctx_size * state.used_pct / 100
+        bar := make_context_bar(state.used_pct, state.ctx_size, bar_tok)
         copy(dur_buf[pos:], bar)
         pos += len(bar)
 
