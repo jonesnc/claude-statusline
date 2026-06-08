@@ -175,7 +175,6 @@ JsonFields :: struct {
     total_lines_added:     i64,
     total_lines_removed:   i64,
     total_duration_ms:     i64,
-    total_api_duration_ms: i64,
     used_percentage:       f64,
     context_window_size:   i64,
     total_input_tokens:    i64,
@@ -373,11 +372,6 @@ json_parse_all :: proc(json: string) -> JsonFields {
             if klen = try_key(json, i, "\"total_duration_ms\":"); klen > 0 {
                 i += klen
                 fields.total_duration_ms = json_parse_i64_at(json, &i)
-                continue
-            }
-            if klen = try_key(json, i, "\"total_api_duration_ms\":"); klen > 0 {
-                i += klen
-                fields.total_api_duration_ms = json_parse_i64_at(json, &i)
                 continue
             }
         case 'e':
@@ -974,7 +968,6 @@ CachedState :: struct #packed {
     lines_added:     i64,
     lines_removed:   i64,
     duration_ms:     i64,
-    api_duration_ms: i64,
     last_update_sec: i64,
     input_tokens:    i64,
     cwd:             [256]u8,
@@ -1821,7 +1814,6 @@ DisplayState :: struct {
     lines_added:        i64,
     lines_removed:      i64,
     total_duration_ms:  i64,
-    api_duration_ms:    i64,
     used_pct:           i64,
     ctx_size:           i64,
     last_update_sec:    i64,
@@ -1890,7 +1882,6 @@ resolve_state :: proc(
         json_lines_added   := f.total_lines_added
         json_lines_removed := f.total_lines_removed
         json_duration      := f.total_duration_ms
-        json_api_dur       := f.total_api_duration_ms
         json_ctx_size      := f.context_window_size
         json_in_tok        := f.total_input_tokens
         state.vim_mode      = f.mode
@@ -1902,7 +1893,6 @@ resolve_state :: proc(
         state.lines_added        = json_lines_added > 0 ? json_lines_added : cached.lines_added
         state.lines_removed      = json_lines_removed > 0 ? json_lines_removed : cached.lines_removed
         state.total_duration_ms  = json_duration > 0 ? json_duration : cached.duration_ms
-        state.api_duration_ms    = json_api_dur > 0 ? json_api_dur : cached.api_duration_ms
         state.ctx_size           = json_ctx_size > 0 ? json_ctx_size : cached.context_size
         // context_window.used_percentage is authoritative — it accounts for
         // cache tokens. Only fall back to total_input_tokens/ctx_size when the
@@ -1942,10 +1932,6 @@ resolve_state :: proc(
             json_duration,
             cached.duration_ms,
         )
-        new_cache.api_duration_ms = max(
-            json_api_dur,
-            cached.api_duration_ms,
-        )
         // Current context occupancy (v2.1.132+): store the latest value, not
         // the high-water mark — it must be able to fall after a /compact.
         // Keep the last known value when this frame omits it (post-compact the
@@ -1979,7 +1965,6 @@ resolve_state :: proc(
         state.lines_added       = cached.lines_added
         state.lines_removed     = cached.lines_removed
         state.total_duration_ms = cached.duration_ms
-        state.api_duration_ms   = cached.api_duration_ms
         state.used_pct          = cached.used_pct
         state.ctx_size          = cached.context_size
         state.input_tokens      = cached.input_tokens
@@ -2015,11 +2000,6 @@ format_time_12h :: proc(epoch_sec: i64) -> string {
         ampm,
     )
 }
-
-// Minimum window utilization before the usage segment appears. Set low so
-// the 5h rate-limit window — the real constraint on a subscription — shows
-// well before it bites.
-USAGE_SHOW_PCT :: 25
 
 usage_color :: proc(pct: f64) -> string {
     if pct >= 90 do return ANSI_FG_RED
@@ -2092,13 +2072,11 @@ build_statusline :: proc(
     // NOT a real charge on a flat subscription. Showing dollars on a Pro plan
     // is misleading, so it's dropped in favor of the real ceiling — usage.
 
-    // Usage quota — the REAL ceiling on a subscription. Shown from 25% (not
-    // 50%) so the 5h window you'll actually hit mid-task is visible early.
+    // Usage quota — the REAL ceiling on a subscription, so show it whenever
+    // it's known (any successful fetch sets a reset timestamp), at any level.
     // Opus weekly cap (Max plans) and a countdown to the soonest reset are
     // appended when relevant.
-    if state.five_hour_pct >= USAGE_SHOW_PCT ||
-        state.seven_day_pct >= USAGE_SHOW_PCT ||
-        state.seven_day_opus_pct >= 50 {
+    if state.five_hour_reset > 0 || state.seven_day_reset > 0 {
         // 5h and 7d share one color, driven by whichever window is hotter,
         // so the pair reads as a single rate-limit risk indicator.
         color_rl := rate_limit_color(max(state.five_hour_pct, state.seven_day_pct))
@@ -2128,7 +2106,7 @@ build_statusline :: proc(
         // when it's the one driving the display; fall back to weekly.
         now := current_time_sec()
         reset_epoch: i64 = 0
-        if state.five_hour_pct >= USAGE_SHOW_PCT && state.five_hour_reset > now {
+        if state.five_hour_reset > now {
             reset_epoch = state.five_hour_reset
         } else if state.seven_day_opus_pct >= 50 && state.opus_reset > now {
             reset_epoch = state.opus_reset
@@ -2152,17 +2130,12 @@ build_statusline :: proc(
         segment(buf, ANSI_BG_COMMENT, "", string(usage_buf[:pos]), false)
     }
 
-    // Combined: duration | API time | last update | tokens | context bar
+    // Combined: duration | last update | tokens | context bar
     if state.total_duration_ms > 0 {
         dur_buf: [512]u8
         pos := 0
         s := fmt.bprintf(dur_buf[:], "%s%s %s", ANSI_FG_WHITE, ICON_CLOCK, format_duration(state.total_duration_ms))
         pos += len(s)
-
-        if state.api_duration_ms > 0 {
-            s2 := fmt.bprintf(dur_buf[pos:], " %s\u26A1%s%s", ANSI_FG_YELLOW, ANSI_FG_WHITE, format_duration(state.api_duration_ms))
-            pos += len(s2)
-        }
 
         if state.last_update_sec > 0 {
             s3 := fmt.bprintf(dur_buf[pos:], " %s| %s%s %s", ANSI_FG_COMMENT, ANSI_FG_WHITE, ICON_SYNC, format_time_12h(state.last_update_sec))
@@ -2224,10 +2197,16 @@ write_debug_log :: proc(
         cache_str = "miss"
     }
     stdin_str := stdin_timeout ? "timeout" : "ok"
+    // Claude Code sets COLUMNS/LINES (v2.1.153+) since stdout is a pipe, not a
+    // TTY. Logged here so terminal-width-dependent work can confirm the values.
+    cols_c := posix.getenv("COLUMNS")
+    lines_c := posix.getenv("LINES")
+    cols_s := cols_c != nil ? string(cols_c) : "unset"
+    lines_s := lines_c != nil ? string(lines_c) : "unset"
     debug_buf: [512]u8
     debug_str := fmt.bprintf(
         debug_buf[:],
-        "cleanup=%dus read=%dus(%s) parse=%dus git=%dus(%s) build=%dus total=%dus\n",
+        "cleanup=%dus read=%dus(%s) parse=%dus git=%dus(%s) build=%dus total=%dus cols=%s lines=%s\n",
         i64(time.duration_microseconds(
             time.tick_diff(
                 timings.t_start,
@@ -2263,6 +2242,8 @@ write_debug_log :: proc(
         i64(time.duration_microseconds(
             time.tick_diff(timings.t_start, t_end),
         )),
+        cols_s,
+        lines_s,
     )
 
     uid := posix.getuid()
