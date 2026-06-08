@@ -165,7 +165,6 @@ JsonFields :: struct {
     current_dir:           string,
     display_name:          string,
     mode:                  string,
-    total_cost_usd:        f64,
     total_lines_added:     i64,
     total_lines_removed:   i64,
     total_duration_ms:     i64,
@@ -290,11 +289,6 @@ json_parse_all :: proc(json: string) -> JsonFields {
                 continue
             }
         case 't':
-            if klen = try_key(json, i, "\"total_cost_usd\":"); klen > 0 {
-                i += klen
-                fields.total_cost_usd = json_parse_f64_at(json, &i)
-                continue
-            }
             if klen = try_key(json, i, "\"total_lines_added\":"); klen > 0 {
                 i += klen
                 fields.total_lines_added = json_parse_i64_at(json, &i)
@@ -795,6 +789,10 @@ format_tokens :: proc(buf: []u8, tokens: i64) -> string {
     if tokens >= 1_000_000 {
         return fmt.bprintf(buf, "%.1fM", f64(tokens) / 1_000_000.0)
     }
+    // Below 1k, show the raw count — "0k" reads like nothing happened.
+    if tokens < 1000 {
+        return fmt.bprintf(buf, "%d", tokens)
+    }
     return fmt.bprintf(buf, "%dk", tokens / 1000)
 }
 
@@ -892,7 +890,6 @@ CACHE_PATH_PREFIX :: "/dev/shm/statusline-cache."
 CachedState :: struct #packed {
     used_pct:        i64,
     context_size:    i64,
-    cost_usd:        f64,
     lines_added:     i64,
     lines_removed:   i64,
     duration_ms:     i64,
@@ -1741,7 +1738,6 @@ build_git_segment :: proc(
 DisplayState :: struct {
     cwd:               string,
     model:             string,
-    cost_usd:           f64,
     lines_added:        i64,
     lines_removed:      i64,
     total_duration_ms:  i64,
@@ -1812,7 +1808,6 @@ resolve_state :: proc(
         f                  := json_parse_all(input)
         json_cwd           := f.current_dir
         json_model         := f.display_name
-        json_cost          := f.total_cost_usd
         json_lines_added   := f.total_lines_added
         json_lines_removed := f.total_lines_removed
         json_duration      := f.total_duration_ms
@@ -1826,7 +1821,6 @@ resolve_state :: proc(
         cached_model            := string(cstring(&cached.model[0]))
         state.cwd                = len(json_cwd) > 0 ? json_cwd : cached_cwd
         state.model              = len(json_model) > 0 ? json_model : cached_model
-        state.cost_usd           = json_cost > 0 ? json_cost : cached.cost_usd
         state.lines_added        = json_lines_added > 0 ? json_lines_added : cached.lines_added
         state.lines_removed      = json_lines_removed > 0 ? json_lines_removed : cached.lines_removed
         state.total_duration_ms  = json_duration > 0 ? json_duration : cached.duration_ms
@@ -1858,10 +1852,6 @@ resolve_state :: proc(
         new_cache.context_size = max(
             json_ctx_size,
             cached.context_size,
-        )
-        new_cache.cost_usd = max(
-            json_cost,
-            cached.cost_usd,
         )
         new_cache.lines_added = max(
             json_lines_added,
@@ -1911,7 +1901,6 @@ resolve_state :: proc(
     } else {
         state.cwd               = string(cstring(&cached.cwd[0]))
         state.model             = string(cstring(&cached.model[0]))
-        state.cost_usd          = cached.cost_usd
         state.lines_added       = cached.lines_added
         state.lines_removed     = cached.lines_removed
         state.total_duration_ms = cached.duration_ms
