@@ -591,18 +591,19 @@ FRAC_BLOCKS :: [8]string{
     "\u258F", "\u258E", "\u258D", "\u258C",
     "\u258B", "\u258A", "\u2589", "\u2588",
 }
-EMPTY_BLOCK :: "\u2591"  // ░
+FILLED_BLOCK :: "\u25b0"  // filled rectangle
+EMPTY_BLOCK :: "\u25b1"  // empty (outlined) rectangle
 
 // Color zone for a given cell position (0-based) in a
-// 5-cell bar. Each cell = 20%.
-// 0-1: green (0-40%), 2: yellow (40-60%),
-// 3: orange (60-80%), 4: red (80-100%)
+// 10-cell bar. Each cell = 10%.
+// 0-3: green (0-40%), 4-5: yellow (40-60%),
+// 6-7: orange (60-80%), 8-9: red (80-100%)
 zone_color :: proc(cell: int) -> string {
     switch cell {
-    case 0, 1: return ANSI_FG_GREEN
-    case 2:    return ANSI_FG_YELLOW
-    case 3:    return ANSI_FG_ORANGE
-    case:      return ANSI_FG_RED
+    case 0, 1, 2, 3: return ANSI_FG_GREEN
+    case 4, 5:       return ANSI_FG_YELLOW
+    case 6, 7:       return ANSI_FG_ORANGE
+    case:            return ANSI_FG_RED
     }
 }
 
@@ -622,9 +623,9 @@ make_context_bar :: proc(
     @(static) bar_buf: [512]u8
 
     clamped := min(pct, 100)
-    WIDTH :: 5
-    // Total fractional steps (5 cells × 8 eighths)
-    total_steps := int(clamped * WIDTH * 8 / 100)
+    WIDTH :: 10
+    // Number of filled cells (rounded)
+    filled := int((clamped * WIDTH + 50) / 100)
 
     pos := 0
 
@@ -636,45 +637,21 @@ make_context_bar :: proc(
         pos += len(s)
     }
 
-    // Left border
-    copy(bar_buf[pos:], ANSI_FG_COMMENT)
-    pos += len(ANSI_FG_COMMENT)
-    copy(bar_buf[pos:], "\u2595")  // ▕
-    pos += len("\u2595")
-
-    // Bar: 5 cells with color zones and fractional fill
-    remaining := total_steps
+    // Bar: WIDTH cells of filled / empty rectangles with color zones
     for cell in 0 ..< WIDTH {
-        color := zone_color(cell)
-        copy(bar_buf[pos:], color)
-        pos += len(color)
-
-        if remaining >= 8 {
-            // Full block
-            copy(bar_buf[pos:], FRAC_BLOCKS[7])
-            pos += len(FRAC_BLOCKS[7])
-            remaining -= 8
-        } else if remaining > 0 {
-            // Partial block (1/8 to 7/8)
-            blocks := FRAC_BLOCKS
-            frac := blocks[remaining - 1]
-            copy(bar_buf[pos:], frac)
-            pos += len(frac)
-            remaining = 0
+        if cell < filled {
+            color := zone_color(cell)
+            copy(bar_buf[pos:], color)
+            pos += len(color)
+            copy(bar_buf[pos:], FILLED_BLOCK)
+            pos += len(FILLED_BLOCK)
         } else {
-            // Empty
-            copy(bar_buf[pos:], ANSI_FG_DARK)
-            pos += len(ANSI_FG_DARK)
+            copy(bar_buf[pos:], ANSI_FG_WHITE)
+            pos += len(ANSI_FG_WHITE)
             copy(bar_buf[pos:], EMPTY_BLOCK)
             pos += len(EMPTY_BLOCK)
         }
     }
-
-    // Right border
-    copy(bar_buf[pos:], ANSI_FG_COMMENT)
-    pos += len(ANSI_FG_COMMENT)
-    copy(bar_buf[pos:], "\u258F")  // ▏
-    pos += len("\u258F")
 
     // Percentage label
     bar_buf[pos] = ' '
