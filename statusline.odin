@@ -179,7 +179,6 @@ JsonFields :: struct {
     used_percentage:       f64,
     context_window_size:   i64,
     total_input_tokens:    i64,
-    total_output_tokens:   i64,
     exceeds_200k:          bool,
 }
 
@@ -257,6 +256,61 @@ try_key :: proc(json: string, pos: int, key: string) -> int {
     return 0
 }
 
+// Return the index just past the '}' that matches the '{' at open_idx.
+// Skips braces that appear inside quoted strings.
+json_object_end :: proc(json: string, open_idx: int) -> int {
+    depth := 0
+    in_str := false
+    i := open_idx
+    for i < len(json) {
+        c := json[i]
+        if in_str {
+            if c == '\\' { i += 2; continue }
+            if c == '"' do in_str = false
+        } else if c == '"' {
+            in_str = true
+        } else if c == '{' {
+            depth += 1
+        } else if c == '}' {
+            depth -= 1
+            if depth == 0 do return i + 1
+        }
+        i += 1
+    }
+    return i
+}
+
+// Parse the token/percentage fields from the slice spanning the
+// `context_window` object. Scoped on purpose: `used_percentage` also lives
+// under `rate_limits.{five_hour,seven_day}`, and a flat whole-document scan
+// would grab whichever copy appears last (the 7-day quota), not the context.
+parse_context_window :: proc(json: string, fields: ^JsonFields) {
+    i := 0
+    for i < len(json) {
+        for i < len(json) && json[i] != '"' {
+            i += 1
+        }
+        if i >= len(json) do break
+        klen: int
+        if klen = try_key(json, i, "\"total_input_tokens\":"); klen > 0 {
+            i += klen
+            fields.total_input_tokens = json_parse_i64_at(json, &i)
+            continue
+        }
+        if klen = try_key(json, i, "\"context_window_size\":"); klen > 0 {
+            i += klen
+            fields.context_window_size = json_parse_i64_at(json, &i)
+            continue
+        }
+        if klen = try_key(json, i, "\"used_percentage\":"); klen > 0 {
+            i += klen
+            fields.used_percentage = json_parse_f64_at(json, &i)
+            continue
+        }
+        i += 1
+    }
+}
+
 // Single-pass: scan for '"', dispatch on char after it
 json_parse_all :: proc(json: string) -> JsonFields {
     fields: JsonFields
@@ -278,9 +332,19 @@ json_parse_all :: proc(json: string) -> JsonFields {
                 fields.current_dir = json_parse_string_at(json, &i)
                 continue
             }
-            if klen = try_key(json, i, "\"context_window_size\":"); klen > 0 {
+            if klen = try_key(json, i, "\"context_window\":"); klen > 0 {
                 i += klen
-                fields.context_window_size = json_parse_i64_at(json, &i)
+                // Skip whitespace to the opening brace, then parse the whole
+                // object as a scoped unit. context_window can be null early
+                // in a session / right after /compact — guard for that.
+                for i < len(json) && (json[i] == ' ' || json[i] == '\t') {
+                    i += 1
+                }
+                if i < len(json) && json[i] == '{' {
+                    end := json_object_end(json, i)
+                    parse_context_window(json[i:end], &fields)
+                    i = end
+                }
                 continue
             }
         case 'd':
@@ -316,16 +380,6 @@ json_parse_all :: proc(json: string) -> JsonFields {
                 fields.total_api_duration_ms = json_parse_i64_at(json, &i)
                 continue
             }
-            if klen = try_key(json, i, "\"total_input_tokens\":"); klen > 0 {
-                i += klen
-                fields.total_input_tokens = json_parse_i64_at(json, &i)
-                continue
-            }
-            if klen = try_key(json, i, "\"total_output_tokens\":"); klen > 0 {
-                i += klen
-                fields.total_output_tokens = json_parse_i64_at(json, &i)
-                continue
-            }
         case 'e':
             if klen = try_key(json, i, "\"exceeds_200k_tokens\":"); klen > 0 {
                 i += klen
@@ -336,12 +390,6 @@ json_parse_all :: proc(json: string) -> JsonFields {
                 }
                 fields.exceeds_200k = j < len(json) && json[j] == 't'
                 i = j
-                continue
-            }
-        case 'u':
-            if klen = try_key(json, i, "\"used_percentage\":"); klen > 0 {
-                i += klen
-                fields.used_percentage = json_parse_f64_at(json, &i)
                 continue
             }
         }
@@ -728,10 +776,19 @@ make_context_bar :: proc(
 
     pos := 0
 
-    // Token count (bright white)
+    // Token count (bright white), right-aligned to the width of the full
+    // context window (the largest value it can reach) so the bar after it
+    // never shifts horizontally as the count grows or shrinks.
     if input_tokens > 0 {
         tok_buf: [16]u8
         tok := format_tokens(tok_buf[:], input_tokens)
+        width_buf: [16]u8
+        full := format_tokens(width_buf[:], ctx_size)
+        field := ctx_size > 0 ? len(full) : len(tok)
+        for _ in len(tok) ..< field {
+            bar_buf[pos] = ' '
+            pos += 1
+        }
         s := fmt.bprintf(bar_buf[pos:], "%s%s ", ANSI_FG_WHITE, tok)
         pos += len(s)
     }
@@ -792,15 +849,32 @@ format_duration :: proc(ms: i64) -> string {
     }
 }
 
+// Exact count with thousands separators (no rounding), e.g. 69287 -> "69,287".
+// The previous "%dk" form rounded 69287 down to "69k", hiding real movement.
 format_tokens :: proc(buf: []u8, tokens: i64) -> string {
-    if tokens >= 1_000_000 {
-        return fmt.bprintf(buf, "%.1fM", f64(tokens) / 1_000_000.0)
-    }
-    // Below 1k, show the raw count — "0k" reads like nothing happened.
     if tokens < 1000 {
         return fmt.bprintf(buf, "%d", tokens)
     }
-    return fmt.bprintf(buf, "%dk", tokens / 1000)
+    // Collect digits least-significant first.
+    digits: [24]u8
+    n := tokens
+    dlen := 0
+    for n > 0 {
+        digits[dlen] = u8('0' + (n % 10))
+        n /= 10
+        dlen += 1
+    }
+    // Emit most-significant first, inserting a comma every third digit.
+    pos := 0
+    for idx := dlen - 1; idx >= 0; idx -= 1 {
+        buf[pos] = digits[idx]
+        pos += 1
+        if idx > 0 && idx % 3 == 0 {
+            buf[pos] = ','
+            pos += 1
+        }
+    }
+    return string(buf[:pos])
 }
 
 /* -------------------------------------------------------------------------- */
@@ -903,7 +977,6 @@ CachedState :: struct #packed {
     api_duration_ms: i64,
     last_update_sec: i64,
     input_tokens:    i64,
-    output_tokens:   i64,
     cwd:             [256]u8,
     model:           [64]u8,
 }
@@ -1753,7 +1826,6 @@ DisplayState :: struct {
     ctx_size:           i64,
     last_update_sec:    i64,
     input_tokens:       i64,
-    output_tokens:      i64,
     five_hour_pct:      f64,
     seven_day_pct:      f64,
     seven_day_opus_pct: f64,
@@ -1821,7 +1893,6 @@ resolve_state :: proc(
         json_api_dur       := f.total_api_duration_ms
         json_ctx_size      := f.context_window_size
         json_in_tok        := f.total_input_tokens
-        json_out_tok       := f.total_output_tokens
         state.vim_mode      = f.mode
 
         cached_cwd              := string(cstring(&cached.cwd[0]))
@@ -1833,9 +1904,9 @@ resolve_state :: proc(
         state.total_duration_ms  = json_duration > 0 ? json_duration : cached.duration_ms
         state.api_duration_ms    = json_api_dur > 0 ? json_api_dur : cached.api_duration_ms
         state.ctx_size           = json_ctx_size > 0 ? json_ctx_size : cached.context_size
-        // used_percentage from Claude Code is authoritative: it accounts for cache tokens.
-        // total_input_tokens only counts raw (non-cached) tokens and severely
-        // underrepresents context usage when cache hits dominate.
+        // context_window.used_percentage is authoritative — it accounts for
+        // cache tokens. Only fall back to total_input_tokens/ctx_size when the
+        // percentage is missing (e.g. briefly after a /compact).
         json_pct := i64(f.used_percentage + 0.5)
         if json_pct > 0 {
             state.used_pct = json_pct
@@ -1849,7 +1920,6 @@ resolve_state :: proc(
             }
         }
         state.input_tokens       = json_in_tok > 0 ? json_in_tok : cached.input_tokens
-        state.output_tokens      = json_out_tok > 0 ? json_out_tok : cached.output_tokens
         state.exceeds_200k       = f.exceeds_200k
         state.last_update_sec    = current_time_sec()
 
@@ -1876,14 +1946,12 @@ resolve_state :: proc(
             json_api_dur,
             cached.api_duration_ms,
         )
-        new_cache.input_tokens = max(
-            json_in_tok,
-            cached.input_tokens,
-        )
-        new_cache.output_tokens = max(
-            json_out_tok,
-            cached.output_tokens,
-        )
+        // Current context occupancy (v2.1.132+): store the latest value, not
+        // the high-water mark — it must be able to fall after a /compact.
+        // Keep the last known value when this frame omits it (post-compact the
+        // context_window object can be null until the next API response).
+        new_cache.input_tokens =
+            json_in_tok > 0 ? json_in_tok : cached.input_tokens
         new_cache.last_update_sec =
             state.last_update_sec
         if len(json_cwd) > 0 {
@@ -1915,7 +1983,6 @@ resolve_state :: proc(
         state.used_pct          = cached.used_pct
         state.ctx_size          = cached.context_size
         state.input_tokens      = cached.input_tokens
-        state.output_tokens     = cached.output_tokens
         state.last_update_sec   = cached.last_update_sec
     }
 
@@ -2089,21 +2156,13 @@ build_statusline :: proc(
             pos += len(s3)
         }
 
-        // Output tokens generated this session (the expensive half of the
-        // bill; the context bar only reflects input/context occupancy).
-        if state.output_tokens > 0 {
-            otok_buf: [16]u8
-            s4 := fmt.bprintf(dur_buf[pos:], " %s| %s↑%s", ANSI_FG_COMMENT, ANSI_FG_WHITE, format_tokens(otok_buf[:], state.output_tokens))
-            pos += len(s4)
-        }
-
         s5 := fmt.bprintf(dur_buf[pos:], " %s| ", ANSI_FG_COMMENT)
         pos += len(s5)
 
-        // Derive bar token count from pct*size: total_input_tokens excludes cache
-        // hits and would show near-zero even when context window is heavily used.
-        bar_tok := state.ctx_size * state.used_pct / 100
-        bar := make_context_bar(state.used_pct, state.ctx_size, bar_tok)
+        // total_input_tokens is the real current context occupancy (input +
+        // cache read/write) as of Claude Code v2.1.132+, so show it exactly
+        // rather than deriving a coarse count from the integer percentage.
+        bar := make_context_bar(state.used_pct, state.ctx_size, state.input_tokens)
         copy(dur_buf[pos:], bar)
         pos += len(bar)
 
