@@ -2028,6 +2028,15 @@ usage_color :: proc(pct: f64) -> string {
     return ANSI_FG_GREEN
 }
 
+// 5h/7d rate-limit color: stays green through normal use and only escalates
+// when a window is genuinely near its cap. (usage_color, used for the Opus
+// weekly cap, keeps its earlier-warning thresholds.)
+rate_limit_color :: proc(pct: f64) -> string {
+    if pct >= 90 do return ANSI_FG_RED
+    if pct >= 80 do return ANSI_FG_ORANGE
+    return ANSI_FG_GREEN
+}
+
 /* -------------------------------------------------------------------------- */
 /* Statusline Builder                                                         */
 /* -------------------------------------------------------------------------- */
@@ -2090,15 +2099,16 @@ build_statusline :: proc(
     if state.five_hour_pct >= USAGE_SHOW_PCT ||
         state.seven_day_pct >= USAGE_SHOW_PCT ||
         state.seven_day_opus_pct >= 50 {
-        color_5h := usage_color(state.five_hour_pct)
-        color_7d := usage_color(state.seven_day_pct)
+        // 5h and 7d share one color, driven by whichever window is hotter,
+        // so the pair reads as a single rate-limit risk indicator.
+        color_rl := rate_limit_color(max(state.five_hour_pct, state.seven_day_pct))
         usage_buf: [256]u8
         pos := 0
         s := fmt.bprintf(
             usage_buf[:],
             "%s5h %s%s%d%% %s7d %s%s%d%%",
-            ANSI_FG_WHITE, ANSI_BOLD, color_5h, i64(state.five_hour_pct + 0.5),
-            ANSI_FG_WHITE, ANSI_BOLD, color_7d, i64(state.seven_day_pct + 0.5),
+            ANSI_FG_WHITE, ANSI_BOLD, color_rl, i64(state.five_hour_pct + 0.5),
+            ANSI_FG_WHITE, ANSI_BOLD, color_rl, i64(state.seven_day_pct + 0.5),
         )
         pos += len(s)
 
@@ -2128,10 +2138,13 @@ build_statusline :: proc(
         if reset_epoch > now {
             cd_buf: [16]u8
             cd := format_countdown(cd_buf[:], reset_epoch - now)
+            // "|" separates the usage totals from the reset countdown. Use
+            // FG_DARK, not FG_COMMENT — this segment's background IS
+            // ANSI_BG_COMMENT, so a comment-colored bar would be invisible.
             sr := fmt.bprintf(
                 usage_buf[pos:],
-                " %s%s%s",
-                ANSI_FG_WHITE, ICON_SYNC, cd,
+                " %s| %s%s%s",
+                ANSI_FG_DARK, ANSI_FG_WHITE, ICON_SYNC, cd,
             )
             pos += len(sr)
         }
