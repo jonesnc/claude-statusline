@@ -133,10 +133,17 @@ segment :: proc(
     first: bool,
 ) {
     if !first && len(buf.prev_bg) > 0 {
-        out_str(buf, bg)
-        out_str(buf, bg_to_fg(buf.prev_bg))
-        out_str(buf, SEP_ROUND)
-        out_str(buf, ANSI_RESET)
+        if buf.prev_bg == bg {
+            out_str(buf, bg)
+            out_str(buf, ANSI_FG_COMMENT)
+            out_str(buf, "|")
+            out_str(buf, ANSI_RESET)
+        } else {
+            out_str(buf, bg)
+            out_str(buf, bg_to_fg(buf.prev_bg))
+            out_str(buf, SEP_ROUND)
+            out_str(buf, ANSI_RESET)
+        }
     }
 
     out_str(buf, bg)
