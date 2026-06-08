@@ -64,6 +64,7 @@ ICON_NORMAL    :: "\uE7C5"   //  vim logo (normal mode)
 ICON_STAGED    :: "\uF00C"   //  checkmark (staged)
 ICON_MODIFIED  :: "\uF040"   //  pencil (modified)
 ICON_WARN      :: "\uF071"   //  warning triangle
+ICON_SYNC      :: "\uF0EC"   //  exchange (last send/receive)
 
 /* -------------------------------------------------------------------------- */
 /* Output Buffer                                                              */
@@ -1937,7 +1938,7 @@ build_statusline :: proc(
         }
 
         if state.last_update_sec > 0 {
-            s3 := fmt.bprintf(dur_buf[pos:], " %s| %s%s", ANSI_FG_COMMENT, ANSI_FG_WHITE, format_time_12h(state.last_update_sec))
+            s3 := fmt.bprintf(dur_buf[pos:], " %s| %s%s %s", ANSI_FG_COMMENT, ANSI_FG_WHITE, ICON_SYNC, format_time_12h(state.last_update_sec))
             pos += len(s3)
         }
 
