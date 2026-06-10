@@ -181,6 +181,10 @@ JsonFields :: struct {
     total_input_tokens:    i64,
     exceeds_200k:          bool,
     thinking_enabled:      bool,
+    rl_five_hour_pct:      f64,
+    rl_five_hour_reset:    i64,
+    rl_seven_day_pct:      f64,
+    rl_seven_day_reset:    i64,
 }
 
 // Parse a string value at cursor (past ':'). Returns
@@ -313,6 +317,47 @@ parse_context_window :: proc(json: string, fields: ^JsonFields) {
 }
 
 // Single-pass: scan for '"', dispatch on char after it
+// Parse one rate-limit window object: {"used_percentage": N, "resets_at": E}
+// (resets_at is epoch seconds). Scoped like parse_context_window because
+// used_percentage also appears under context_window.
+parse_rate_window :: proc(obj: string) -> (pct: f64, reset: i64) {
+    if i := strings.index(obj, "\"used_percentage\":"); i >= 0 {
+        pos := i + len("\"used_percentage\":")
+        pct = json_parse_f64_at(obj, &pos)
+    }
+    if i := strings.index(obj, "\"resets_at\":"); i >= 0 {
+        pos := i + len("\"resets_at\":")
+        reset = json_parse_i64_at(obj, &pos)
+    }
+    return
+}
+
+// Scoped parse of the `rate_limits` object — quota straight from the stdin
+// JSON every render. This is the PRIMARY quota source; the background OAuth
+// usage fetch proved flaky (a failed fetch writes an all-zeros cache with a
+// fresh TTL, blanking the quota segment for 60s+) and is now only a
+// fallback plus the source for the opus weekly window.
+parse_rate_limits :: proc(json: string, fields: ^JsonFields) {
+    if i := strings.index(json, "\"five_hour\":"); i >= 0 {
+        start := i + len("\"five_hour\":")
+        for start < len(json) && json[start] != '{' do start += 1
+        if start < len(json) {
+            end := json_object_end(json, start)
+            fields.rl_five_hour_pct, fields.rl_five_hour_reset =
+                parse_rate_window(json[start:end])
+        }
+    }
+    if i := strings.index(json, "\"seven_day\":"); i >= 0 {
+        start := i + len("\"seven_day\":")
+        for start < len(json) && json[start] != '{' do start += 1
+        if start < len(json) {
+            end := json_object_end(json, start)
+            fields.rl_seven_day_pct, fields.rl_seven_day_reset =
+                parse_rate_window(json[start:end])
+        }
+    }
+}
+
 json_parse_all :: proc(json: string) -> JsonFields {
     fields: JsonFields
     i := 0
@@ -393,6 +438,19 @@ json_parse_all :: proc(json: string) -> JsonFields {
                         }
                         fields.thinking_enabled = j < len(obj) && obj[j] == 't'
                     }
+                    i = end
+                }
+                continue
+            }
+        case 'r':
+            if klen = try_key(json, i, "\"rate_limits\":"); klen > 0 {
+                i += klen
+                for i < len(json) && (json[i] == ' ' || json[i] == '\t') {
+                    i += 1
+                }
+                if i < len(json) && json[i] == '{' {
+                    end := json_object_end(json, i)
+                    parse_rate_limits(json[i:end], &fields)
                     i = end
                 }
                 continue
@@ -1911,6 +1969,13 @@ resolve_state :: proc(
         state.vim_mode      = f.mode
         state.thinking_enabled = f.thinking_enabled
 
+        // Quota from stdin JSON (per-render fresh) — primary source; the
+        // background OAuth fetch cache is only a fallback (see main).
+        state.five_hour_pct   = f.rl_five_hour_pct
+        state.five_hour_reset = f.rl_five_hour_reset
+        state.seven_day_pct   = f.rl_seven_day_pct
+        state.seven_day_reset = f.rl_seven_day_reset
+
         cached_cwd              := string(cstring(&cached.cwd[0]))
         cached_model            := string(cstring(&cached.model[0]))
         state.cwd                = len(json_cwd) > 0 ? json_cwd : cached_cwd
@@ -2448,14 +2513,19 @@ main :: proc() {
     state := resolve_state(input, stdin_timeout)
     if debug do timings.t_parse = time.tick_now()
 
-    // Usage quota (background fetch, ~5us on cache hit)
+    // Usage quota: stdin JSON rate_limits (set in resolve_state) is the
+    // primary source. The background OAuth fetch cache fills in only when
+    // the JSON had none (stdin timeout / older Claude Code), and is the
+    // sole source for the opus weekly window, which the JSON lacks.
     gppid := get_grandparent_pid()
     usage := read_usage_cache(gppid)
-    state.five_hour_pct = usage.five_hour_pct
-    state.seven_day_pct = usage.seven_day_pct
+    if state.five_hour_reset == 0 && state.seven_day_reset == 0 {
+        state.five_hour_pct = usage.five_hour_pct
+        state.seven_day_pct = usage.seven_day_pct
+        state.five_hour_reset = usage.five_hour_reset
+        state.seven_day_reset = usage.seven_day_reset
+    }
     state.seven_day_opus_pct = usage.seven_day_opus_pct
-    state.five_hour_reset = usage.five_hour_reset
-    state.seven_day_reset = usage.seven_day_reset
     state.opus_reset = usage.opus_reset
 
     // Git status
