@@ -65,6 +65,7 @@ ICON_STAGED    :: "\uF00C"   //  checkmark (staged)
 ICON_MODIFIED  :: "\uF040"   //  pencil (modified)
 ICON_WARN      :: "\uF071"   //  warning triangle
 ICON_SYNC      :: "\uF0EC"   //  exchange (last send/receive)
+ICON_BRAIN     :: "\U000F09D1"   // \uDB82\uDDD1 md-brain (extended thinking on)
 
 /* -------------------------------------------------------------------------- */
 /* Output Buffer                                                              */
@@ -179,6 +180,7 @@ JsonFields :: struct {
     context_window_size:   i64,
     total_input_tokens:    i64,
     exceeds_200k:          bool,
+    thinking_enabled:      bool,
 }
 
 // Parse a string value at cursor (past ':'). Returns
@@ -372,6 +374,27 @@ json_parse_all :: proc(json: string) -> JsonFields {
             if klen = try_key(json, i, "\"total_duration_ms\":"); klen > 0 {
                 i += klen
                 fields.total_duration_ms = json_parse_i64_at(json, &i)
+                continue
+            }
+            if klen = try_key(json, i, "\"thinking\":"); klen > 0 {
+                i += klen
+                // value is an object {"enabled": true}. Skip to the brace,
+                // grab it as a scoped unit (can be null), find "enabled".
+                for i < len(json) && (json[i] == ' ' || json[i] == '\t') {
+                    i += 1
+                }
+                if i < len(json) && json[i] == '{' {
+                    end := json_object_end(json, i)
+                    obj := json[i:end]
+                    if ei := strings.index(obj, "\"enabled\":"); ei >= 0 {
+                        j := ei + len("\"enabled\":")
+                        for j < len(obj) && (obj[j] == ' ' || obj[j] == '\t') {
+                            j += 1
+                        }
+                        fields.thinking_enabled = j < len(obj) && obj[j] == 't'
+                    }
+                    i = end
+                }
                 continue
             }
         case 'e':
@@ -1826,6 +1849,7 @@ DisplayState :: struct {
     opus_reset:         i64,
     exceeds_200k:       bool,
     vim_mode:           string,
+    thinking_enabled:   bool,
 }
 
 DebugTimings :: struct {
@@ -1885,6 +1909,7 @@ resolve_state :: proc(
         json_ctx_size      := f.context_window_size
         json_in_tok        := f.total_input_tokens
         state.vim_mode      = f.mode
+        state.thinking_enabled = f.thinking_enabled
 
         cached_cwd              := string(cstring(&cached.cwd[0]))
         cached_model            := string(cstring(&cached.model[0]))
@@ -2052,9 +2077,20 @@ build_statusline :: proc(
         first = false
     }
 
-    // Model (abbreviated, bold)
+    // Model (abbreviated, bold). A brain glyph trails the name when extended
+    // thinking is enabled for the session (thinking.enabled in stdin JSON).
     model_buf: [128]u8
-    model_text := fmt.bprintf(model_buf[:], "%s%s", ANSI_BOLD, abbreviate_model(state.model))
+    model_text: string
+    if state.thinking_enabled {
+        model_text = fmt.bprintf(
+            model_buf[:], "%s%s %s", ANSI_BOLD,
+            abbreviate_model(state.model), ICON_BRAIN,
+        )
+    } else {
+        model_text = fmt.bprintf(
+            model_buf[:], "%s%s", ANSI_BOLD, abbreviate_model(state.model),
+        )
+    }
     segment(buf, ANSI_BG_PURPLE, ANSI_FG_BLACK, model_text, first)
     first = false
 
