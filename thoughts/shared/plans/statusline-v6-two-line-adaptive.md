@@ -475,7 +475,7 @@ still sub-millisecond; `git status` clean; every Progress box below ticked.
 - [x] Milestone 2 — layout engine (display_width, segment table, fit, COLUMNS, dedup, two-line emit) — done 2026-07-31 16:05 MDT
 - [x] Milestone 3 — forward-looking metrics (quota projection, burn rate + TTC, worktree icon, untracked) — done 2026-07-31 16:09 MDT
 - [x] Milestone 4 — PR + CI status segment — done 2026-07-31 16:13 MDT (no existing producer found; see Surprises)
-- [ ] Milestone 5 — OSC8 (gated; record outcome even if discarded)
+- [x] Milestone 5 — OSC8 (gated; record outcome even if discarded) — done 2026-07-31 16:16 MDT, KEPT (see Surprises)
 - [ ] Milestone 6 — `--demo` mode, delete the prototype
 
 ---
@@ -543,3 +543,10 @@ Record anything that contradicts this plan here, then stop with a clean tree.
   URL (a single mysuu-portal entry from 12:53 today), not by repo+branch,
   so it looks like a one-off written by some past ad-hoc session. Built
   the plan's own double-fork `gh` fetcher instead.
+- **Milestone 5 OSC8 verdict (2026-07-31): KEPT.** Claude Code measures with
+  bare `Bun.stringWidth(e, {ambiguousIsNarrow:!0})` — no ANSI-strip layer in
+  front of it (confirmed in the 2.1.220 binary). Downloaded bun 1.3.14 and
+  tested directly: `Bun.stringWidth` returns 4 for `#257` plain, CSI-wrapped,
+  OSC8 ST-terminated, and OSC8 BEL-terminated — OSC8 measures zero-width, so
+  the hyperlink cannot mis-measure the line. The PR number is wrapped in
+  `\x1b]8;;<url>\x1b\\`; whether the terminal underlines it is cosmetic.

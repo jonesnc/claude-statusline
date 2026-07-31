@@ -2883,11 +2883,22 @@ build_line1 :: proc(l: ^SegList, state: ^DisplayState, gs: ^GitStatus, pr: ^PrSt
         case .REVIEW_REQUIRED: prbg = ANSI_BG_ORANGE; prfg = ANSI_FG_BLACK
         case .NONE:            prbg = ANSI_BG_DARK;   prfg = ANSI_FG_WHITE
         }
+        // OSC8 hyperlink around the PR number. Zero visible cells: verified
+        // that Bun.stringWidth({ambiguousIsNarrow:true}) — the exact call
+        // Claude Code measures with — counts OSC8 (BEL- or ST-terminated)
+        // as width 0 (Bun 1.3.14). display_width here skips OSC too.
+        num: string
+        if len(pr.url) > 0 {
+            num = fmt.tprintf("\x1b]8;;%s\x1b\\#%d\x1b]8;;\x1b\\",
+                pr.url, pr.number)
+        } else {
+            num = fmt.tprintf("#%d", pr.number)
+        }
         add_seg(l, Seg{
             name = "pr", bg = prbg, fg = prfg,
             stages = {
-                fmt.tprintf("#%d %s%s%s", pr.number, gcol, glyph, cnt),
-                fmt.tprintf("#%d %s%s", pr.number, gcol, glyph),
+                fmt.tprintf("%s %s%s%s", num, gcol, glyph, cnt),
+                fmt.tprintf("%s %s%s", num, gcol, glyph),
                 fmt.tprintf("%s%s", gcol, glyph),
             },
             n_stages = 3, priority = 85,
