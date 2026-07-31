@@ -835,12 +835,17 @@ FRAC_BLOCKS :: [8]string{
 FILLED_BLOCK :: "\u25b0"  // filled rectangle
 EMPTY_BLOCK :: "\u25b1"  // empty (outlined) rectangle
 
-// Color for the percentage label (matches leading edge)
+// Color for the percentage label (matches leading edge).
+//
+// Thresholds track when compaction actually looms, not raw fill. Half a context
+// window is a normal working state, so the old 40%/60% yellow/orange pair spent
+// most of a session shouting; auto-compact is the real event, and it lands
+// around 80-92%.
 pct_label_color :: proc(pct: i64) -> string {
-    if pct >= 80 do return ANSI_FG_RED
-    if pct >= 60 do return ANSI_FG_ORANGE
-    if pct >= 40 do return ANSI_FG_YELLOW
-    return ANSI_FG_GREEN
+    if pct >= 90 do return ANSI_FG_RED      // compact imminent
+    if pct >= 80 do return ANSI_FG_ORANGE   // compact soon
+    if pct >= 65 do return ANSI_FG_YELLOW   // worth knowing
+    return ANSI_FG_GREEN                    // normal working range
 }
 
 make_context_bar :: proc(
@@ -2493,11 +2498,25 @@ resolve_state :: proc(
 /* Time Formatting                                                            */
 /* -------------------------------------------------------------------------- */
 
+// Opus weekly cap. Warns one step earlier than the 5h/7d windows because a
+// weekly cap is slow to recover from — but 50% was too early: burning half your
+// weekly Opus allowance by midweek is on-plan, not a problem.
 usage_color :: proc(pct: f64) -> string {
     if pct >= 90 do return ANSI_FG_RED
     if pct >= 80 do return ANSI_FG_ORANGE
-    if pct >= 50 do return ANSI_FG_YELLOW
+    if pct >= 70 do return ANSI_FG_YELLOW
     return ANSI_FG_GREEN
+}
+
+// Projected end-of-window quota. Finishing a window just under the cap is the
+// BEST possible outcome on a flat subscription, so everything under 100% is
+// green — a projection of 99% is not a warning, it is perfect pacing. Only a
+// real overshoot is concerning, and severity is how early you would be capped.
+projection_color :: proc(proj: f64) -> string {
+    if proj >= 200 do return ANSI_FG_RED      // capped around half-way in
+    if proj >= 140 do return ANSI_FG_ORANGE   // capped well before reset
+    if proj >= 105 do return ANSI_FG_YELLOW   // capped near the end
+    return ANSI_FG_GREEN                      // finishes under the cap
 }
 
 // 5h/7d rate-limit color: stays green through normal use and only escalates
@@ -2793,7 +2812,15 @@ build_line1 :: proc(l: ^SegList, state: ^DisplayState, gs: ^GitStatus, pr: ^PrSt
         abbrev_path(abbrev_buf[:], state.cwd), context.temp_allocator)
     base := path_basename(state.cwd)
     path_short := fmt.tprintf("~/…/%s", base)
-    dup := gs.valid && base == gs.branch
+    // Compare against the branch's LAST component, not the whole ref: real
+    // branches are prefixed (feat/queue-monitor-dashboard) while the worktree
+    // directory is not, so exact equality never matched and the elision never
+    // fired — which silently cost the ~22 cells this whole thing exists to save.
+    branch_leaf := gs.branch
+    if i := strings.last_index_byte(gs.branch, '/'); i >= 0 {
+        branch_leaf = gs.branch[i + 1:]
+    }
+    dup := gs.valid && base == branch_leaf
     path_seg: Seg
     if dup {
         path_seg = Seg{
@@ -2929,10 +2956,13 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
             elapsed_frac := f64(now_p - start) / 18000.0
             if elapsed_frac >= 0.10 && elapsed_frac <= 1.0 {
                 proj := state.five_hour_pct / elapsed_frac
-                pc := rate_limit_color(proj)
+                pc := projection_color(proj)
                 v: string
-                if proj > 100 {
-                    v = ">100"
+                // Show the real overshoot. Clamping at ">100" hid exactly the
+                // information that now drives severity — 110% and 400% are very
+                // different situations. Same 4-char worst case either way.
+                if proj > 999 {
+                    v = ">999"
                 } else {
                     v = fmt.tprintf("%d", i64(proj + 0.5))
                 }
@@ -3029,16 +3059,19 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
         })
     }
 
-    // Context warning
-    if state.used_pct >= 80 {
-        crit := state.used_pct >= 90
+    // Context warning. Deliberately later than the bar's own color ramp: the
+    // bar already goes yellow at 65 and orange at 80, so this full-width banner
+    // is reserved for "act now". Firing it at 80 made it near-permanent
+    // furniture, which is the fastest way to teach yourself to ignore it.
+    if state.used_pct >= 88 {
+        crit := state.used_pct >= 94
         add_seg(l, Seg{
             name = "warn",
             bg = crit ? ANSI_BG_RED : ANSI_BG_YELLOW,
             fg = ANSI_FG_BLACK,
             stages = {
                 fmt.tprintf("%s%s %s", ANSI_BOLD, ICON_WARN,
-                    crit ? "COMPACT NOW" : "CTX 80%+"),
+                    crit ? "COMPACT NOW" : "CTX HIGH"),
                 fmt.tprintf("%s%s", ANSI_BOLD, ICON_WARN),
                 "",
             },
