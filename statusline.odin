@@ -16,6 +16,7 @@
 package main
 
 import "core:fmt"
+import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:sys/posix"
@@ -3283,10 +3284,170 @@ maybe_auto_update :: proc() {
 }
 
 /* -------------------------------------------------------------------------- */
+/* --demo: layout verification (replaces the Python prototype)               */
+/* -------------------------------------------------------------------------- */
+
+DemoScenario :: struct {
+    title: string,
+    state: DisplayState,
+    gs:    GitStatus,
+    pr:    PrStatus,
+}
+
+demo_scenarios :: proc(now: i64) -> [5]DemoScenario {
+    // Canned states ported from the layout prototype. Quota resets are
+    // chosen so the countdown text matches the prototype ("1h5m" / "47m");
+    // the 5h projection is DERIVED from (pct, resets_at) like production,
+    // so its value differs from the prototype's hand-set figure but not
+    // its width class (see plan Surprises).
+    base_state := DisplayState{
+        vim_mode = "NORMAL", model = "Opus 5", thinking_enabled = true,
+        cwd = "/home/nathanjones/Projects/portal-trees/queue-monitor-dashboard",
+        total_duration_ms = 5000,
+        used_pct = 35, ctx_size = 200000, input_tokens = 69287,
+        five_hour_pct = 21, seven_day_pct = 20,
+        five_hour_reset = now + 3900,    // "1h5m"
+        seven_day_reset = now + 300000,
+        burn_ok = true, burn_per_min = 2100, ttc_sec = 720, // ↑2.1k/m ⚠12m
+    }
+    base_gs := GitStatus{
+        valid = true, is_worktree = true,
+        branch = "queue-monitor-dashboard",
+        staged = 2, modified = 3, untracked = 1, stashes = 1, ahead = 4,
+    }
+    base_pr := PrStatus{
+        valid = true, number = 257, ci = .PASS, review = .REVIEW_REQUIRED,
+        url = "https://github.com/suu-itadm/portal/pull/257",
+    }
+
+    s := [5]DemoScenario{
+        {"typical worktree, PR awaiting review", base_state, base_gs, base_pr},
+        {"clean main checkout, no PR", base_state, base_gs, {}},
+        {"CI failing, approved", base_state, base_gs,
+            {valid = true, number = 9829, ci = .FAIL, failed = 2,
+             review = .APPROVED,
+             url = "https://github.com/suu-itadm/mysuu-portal/pull/9829"}},
+        {"context critical + quota over pace", base_state, base_gs, base_pr},
+        {"no git repo, insert mode", base_state, {}, {}},
+    }
+
+    // clean main checkout
+    s[1].gs.is_worktree = false
+    s[1].gs.branch = "main"
+    s[1].gs.staged = 0; s[1].gs.modified = 0; s[1].gs.untracked = 0
+    s[1].gs.stashes = 0; s[1].gs.ahead = 0
+    s[1].state.used_pct = 8; s[1].state.input_tokens = 16204
+    s[1].state.burn_ok = false
+
+    // context critical + quota over pace
+    s[3].state.used_pct = 93; s[3].state.input_tokens = 186_400
+    s[3].state.five_hour_pct = 61; s[3].state.seven_day_pct = 77
+    s[3].state.five_hour_reset = now + 2820 // "47m"
+    s[3].state.burn_per_min = 9400; s[3].state.ttc_sec = 120
+
+    // no git repo, insert mode
+    s[4].state.vim_mode = "INSERT"
+    s[4].state.cwd = "/home/nathanjones/llm-wiki"
+    s[4].state.used_pct = 44; s[4].state.input_tokens = 88_012
+
+    return s
+}
+
+demo_print_ruler :: proc(cols: int) {
+    fmt.printf("  %s", ANSI_FG_COMMENT)
+    for i in 0 ..< cols {
+        if i % 10 == 0 {
+            fmt.printf("%d", (i / 10) % 10)
+        } else {
+            fmt.printf("·")
+        }
+    }
+    fmt.printf("%s\n", ANSI_RESET)
+}
+
+demo_print_log :: proc(flog: ^FitLog) {
+    for i in 0 ..< flog.n {
+        if i > 0 do fmt.printf(", ")
+        if flog.actions[i] == .SHRINK {
+            fmt.printf("shrink %s->s%d", flog.names[i], flog.stages[i])
+        } else {
+            fmt.printf("drop %s", flog.names[i])
+        }
+    }
+    if flog.n == 0 do fmt.printf("-")
+}
+
+// Render every scenario at every width with a ruler, measured widths, and
+// the shrink/drop decision log. Exits non-zero if any line exceeds its
+// target width or overflows OutBuf.
+run_demo :: proc() -> int {
+    now := current_time_sec()
+    scenarios := demo_scenarios(now)
+    widths := [5]int{60, 80, 100, 140, 200}
+    failed := false
+
+    for &sc in scenarios {
+        fmt.printf("%s%s── %s %s\n", ANSI_BOLD, ANSI_FG_PURPLE, sc.title,
+            ANSI_RESET)
+        for cols in widths {
+            l1, l2: SegList
+            flog1, flog2: FitLog
+            build_line1(&l1, &sc.state, &sc.gs, &sc.pr)
+            build_line2(&l2, &sc.state)
+            fit_line(&l1, cols, &flog1)
+            fit_line(&l2, cols, &flog2)
+
+            b1, b2: OutBuf
+            render_line(&b1, &l1)
+            render_line(&b2, &l2)
+            r1 := string(b1.data[:b1.len])
+            r2 := string(b2.data[:b2.len])
+            w1 := display_width(r1)
+            w2 := display_width(r2)
+
+            fmt.printf("%s  cols=%d%s\n", ANSI_FG_COMMENT, cols, ANSI_RESET)
+            demo_print_ruler(cols)
+            fmt.printf("  %s  %s[%d]%s\n", r1, ANSI_FG_COMMENT, w1, ANSI_RESET)
+            fmt.printf("  %s  %s[%d]%s\n", r2, ANSI_FG_COMMENT, w2, ANSI_RESET)
+            fmt.printf("%s    L1: ", ANSI_FG_COMMENT)
+            demo_print_log(&flog1)
+            fmt.printf(" | L2: ")
+            demo_print_log(&flog2)
+            fmt.printf("%s\n", ANSI_RESET)
+
+            if w1 > cols || w2 > cols {
+                fmt.printf("%s    !! OVERFLOW w1=%d w2=%d cols=%d%s\n",
+                    ANSI_FG_RED, w1, w2, cols, ANSI_RESET)
+                failed = true
+            }
+            if b1.overflow || b2.overflow {
+                fmt.printf("%s    !! OUTBUF OVERFLOW%s\n",
+                    ANSI_FG_RED, ANSI_RESET)
+                failed = true
+            }
+            fmt.println()
+        }
+    }
+    if failed {
+        fmt.printf("%sDEMO FAILED%s\n", ANSI_FG_RED, ANSI_RESET)
+        return 1
+    }
+    fmt.printf("%sdemo ok: 5 scenarios x 5 widths, no overflow%s\n",
+        ANSI_FG_GREEN, ANSI_RESET)
+    return 0
+}
+
+/* -------------------------------------------------------------------------- */
 /* Main                                                                       */
 /* -------------------------------------------------------------------------- */
 
 main :: proc() {
+    for arg in os.args[1:] {
+        if arg == "--demo" {
+            os.exit(run_demo())
+        }
+    }
+
     timings: DebugTimings
     timings.t_start = time.tick_now()
     debug := posix.getenv("STATUSLINE_DEBUG") != nil

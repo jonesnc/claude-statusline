@@ -476,7 +476,7 @@ still sub-millisecond; `git status` clean; every Progress box below ticked.
 - [x] Milestone 3 — forward-looking metrics (quota projection, burn rate + TTC, worktree icon, untracked) — done 2026-07-31 16:09 MDT
 - [x] Milestone 4 — PR + CI status segment — done 2026-07-31 16:13 MDT (no existing producer found; see Surprises)
 - [x] Milestone 5 — OSC8 (gated; record outcome even if discarded) — done 2026-07-31 16:16 MDT, KEPT (see Surprises)
-- [ ] Milestone 6 — `--demo` mode, delete the prototype
+- [x] Milestone 6 — `--demo` mode, delete the prototype — done 2026-07-31 16:18 MDT
 
 ---
 
@@ -550,3 +550,10 @@ Record anything that contradicts this plan here, then stop with a clean tree.
   OSC8 ST-terminated, and OSC8 BEL-terminated — OSC8 measures zero-width, so
   the hyperlink cannot mis-measure the line. The PR number is wrapped in
   `\x1b]8;;<url>\x1b\\`; whether the terminal underlines it is cosmetic.
+- **Prototype BASE has two hand-set values the real derivation cannot
+  reproduce** (found in Milestone 6): (a) `five_proj=38` is inconsistent with
+  `five_pct=21` + `reset="1h5m"` — deriving from resets_at as 3.1 specifies
+  gives 27% (same cell width, so all [NN] figures still match); (b) scenario 4's
+  `five_proj=104` (">100") is unreachable from 61% at 84% elapsed — the derived
+  value is 72%, 3 cells narrower. `--demo` uses the derived values; every other
+  reference figure (81/79, 58/63, 83/79, degradation points) matches exactly.
