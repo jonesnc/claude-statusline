@@ -1166,8 +1166,59 @@ CachedState :: struct #packed {
     lines_removed:   i64,
     duration_ms:     i64,
     input_tokens:    i64,
+    // Ring buffer of (time, input_tokens) samples for the burn rate.
+    // Claude Code re-renders on events, not a clock, so Δt between samples
+    // swings 200ms..90s — the rate must come from a regression over a ~60s
+    // window, never from the last single delta.
+    burn_times:      [8]i64,
+    burn_tokens:     [8]i64,
+    burn_idx:        i64,
     cwd:             [256]u8,
     model:           [64]u8,
+}
+
+// Least-squares slope over the ring samples from the last 60s.
+// Needs >=3 usable samples and a positive rate (a /compact makes tokens
+// fall, which must suppress the segment, not show a negative rate).
+compute_burn :: proc(
+    cached: ^CachedState,
+    now: i64,
+    ctx_size: i64,
+    cur_tokens: i64,
+) -> (
+    rate_per_min: f64,
+    ttc_sec: i64,
+    ok: bool,
+) {
+    xs, ys: [8]f64
+    n := 0
+    for i in 0 ..< 8 {
+        t := cached.burn_times[i]
+        if t <= 0 || now - t > 60 || t > now do continue
+        xs[n] = f64(t - now) // negative offsets; only differences matter
+        ys[n] = f64(cached.burn_tokens[i])
+        n += 1
+    }
+    if n < 3 do return 0, 0, false
+
+    sx, sy, sxx, sxy: f64
+    for i in 0 ..< n {
+        sx += xs[i]; sy += ys[i]
+        sxx += xs[i] * xs[i]; sxy += xs[i] * ys[i]
+    }
+    fn := f64(n)
+    denom := fn * sxx - sx * sx
+    if denom <= 0 do return 0, 0, false
+    slope := (fn * sxy - sx * sy) / denom // tokens per second
+    if slope <= 0 do return 0, 0, false
+
+    rate_per_min = slope * 60.0
+    if ctx_size > 0 {
+        headroom := f64(ctx_size) * 0.8 - f64(cur_tokens)
+        if headroom < 0 do headroom = 0
+        ttc_sec = i64(headroom / slope)
+    }
+    return rate_per_min, ttc_sec, true
 }
 
 get_grandparent_pid :: proc() -> int {
@@ -2012,6 +2063,9 @@ DisplayState :: struct {
     used_pct:           i64,
     ctx_size:           i64,
     input_tokens:       i64,
+    burn_per_min:       f64,
+    ttc_sec:            i64,
+    burn_ok:            bool,
     five_hour_pct:      f64,
     seven_day_pct:      f64,
     seven_day_opus_pct: f64,
@@ -2140,6 +2194,26 @@ resolve_state :: proc(
         // context_window object can be null until the next API response).
         new_cache.input_tokens =
             json_in_tok > 0 ? json_in_tok : cached.input_tokens
+
+        // Burn-rate ring: carry samples forward, append this render's
+        // (time, tokens) unless it duplicates the newest sample.
+        new_cache.burn_times = cached.burn_times
+        new_cache.burn_tokens = cached.burn_tokens
+        new_cache.burn_idx = cached.burn_idx
+        if json_in_tok > 0 {
+            now_s := current_time_sec()
+            newest := int((cached.burn_idx + 7) % 8)
+            dup := cached.burn_times[newest] == now_s &&
+                cached.burn_tokens[newest] == json_in_tok
+            if !dup {
+                w := int(cached.burn_idx % 8)
+                new_cache.burn_times[w] = now_s
+                new_cache.burn_tokens[w] = json_in_tok
+                new_cache.burn_idx = cached.burn_idx + 1
+            }
+            state.burn_per_min, state.ttc_sec, state.burn_ok =
+                compute_burn(&new_cache, now_s, state.ctx_size, state.input_tokens)
+        }
         if len(json_cwd) > 0 {
             copy(
                 new_cache.cwd[:len(new_cache.cwd) - 1],
@@ -2646,6 +2720,29 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
         },
         n_stages = 3, priority = 100, droppable = false,
     })
+
+    // Burn rate + time-to-compact (until input hits 80% of the window)
+    if state.burn_ok && state.burn_per_min > 0 {
+        rate: string
+        if state.burn_per_min >= 1000 {
+            rate = fmt.tprintf("%.1fk/m", state.burn_per_min / 1000.0)
+        } else {
+            rate = fmt.tprintf("%.0f/m", state.burn_per_min)
+        }
+        ttc_buf: [16]u8
+        ttc := format_countdown(ttc_buf[:], max(state.ttc_sec, 60))
+        add_seg(l, Seg{
+            name = "burn", bg = ANSI_BG_DARK, fg = "",
+            stages = {
+                fmt.tprintf("%s↑%s %s%s%s", ANSI_FG_WHITE, rate,
+                    ANSI_FG_ORANGE, ICON_WARN,
+                    strings.clone(ttc, context.temp_allocator)),
+                fmt.tprintf("%s↑%s", ANSI_FG_WHITE, rate),
+                "",
+            },
+            n_stages = 2, priority = 30,
+        })
+    }
 
     // Context warning
     if state.used_pct >= 80 {
