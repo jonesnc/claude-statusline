@@ -56,6 +56,8 @@ SEP_ROUND   :: "\uE0B4"  //
 
 // Nerd Font icons
 ICON_BRANCH    :: "\uF126"   //  git branch
+ICON_WORKTREE  :: "\uF1E0"   //  share-alt (linked worktree)
+ICON_UNTRACKED :: "\uF128"   //  question (untracked files)
 ICON_FOLDER    :: "\uF07C"   //  folder open
 ICON_DOLLAR    :: "\uF155"   //  dollar
 ICON_CLOCK     :: "\uF017"   //  clock
@@ -961,10 +963,12 @@ format_tokens :: proc(buf: []u8, tokens: i64) -> string {
 
 GitStatus :: struct {
     valid:       bool,
+    is_worktree: bool,
     branch:      string,
     stashes:     i64,
     modified:    u32,
     staged:      u32,
+    untracked:   u32,
     ahead:       u32,
     behind:      u32,
     cache_state: CacheState,
@@ -1440,6 +1444,7 @@ GitCache :: struct #packed {
     index_mtime_nsec: i64,
     modified:         u32,
     staged:           u32,
+    untracked:        u32,
     ahead:            u32,
     behind:           u32,
     branch:           [64]u8,
@@ -1550,6 +1555,7 @@ write_git_cache :: proc(
     gitdir: string,
     modified: u32,
     staged: u32,
+    untracked: u32,
     ahead: u32,
     behind: u32,
 ) {
@@ -1569,6 +1575,7 @@ write_git_cache :: proc(
     cache.index_mtime_nsec = i64(st.st_mtim.tv_nsec)
     cache.modified = modified
     cache.staged = staged
+    cache.untracked = untracked
     cache.ahead = ahead
     cache.behind = behind
     copy(cache.repo_path[:], repo_path)
@@ -1597,12 +1604,13 @@ run_git_status :: proc(
 ) -> (
     modified: u32,
     staged: u32,
+    untracked: u32,
     ahead: u32,
     behind: u32,
 ) {
     pipe_fds: [2]posix.FD
     if posix.pipe(&pipe_fds) != .OK {
-        return 0, 0, 0, 0
+        return 0, 0, 0, 0, 0
     }
     pipe_read := pipe_fds[0]
     pipe_write := pipe_fds[1]
@@ -1611,7 +1619,7 @@ run_git_status :: proc(
     if pid < 0 {
         posix.close(pipe_read)
         posix.close(pipe_write)
-        return 0, 0, 0, 0
+        return 0, 0, 0, 0, 0
     }
 
     if pid == 0 {
@@ -1631,7 +1639,7 @@ run_git_status :: proc(
             "status",
             "--porcelain",
             "-b",
-            "-uno",
+            "-unormal",
             nil,
         }
         posix.execvp("git", raw_data(argv))
@@ -1712,6 +1720,10 @@ run_git_status :: proc(
             continue
         }
 
+        if line[0] == '?' && line[1] == '?' {
+            untracked += 1
+            continue
+        }
         if line[0] != ' ' && line[0] != '?' {
             staged += 1
         }
@@ -1720,7 +1732,7 @@ run_git_status :: proc(
         }
     }
 
-    return modified, staged, ahead, behind
+    return modified, staged, untracked, ahead, behind
 }
 
 get_git_status_cached :: proc(
@@ -1729,6 +1741,7 @@ get_git_status_cached :: proc(
 ) -> (
     modified: u32,
     staged: u32,
+    untracked: u32,
     ahead: u32,
     behind: u32,
     state: CacheState,
@@ -1737,37 +1750,38 @@ get_git_status_cached :: proc(
 
     switch cache_state {
     case .VALID:
-        return cache.modified, cache.staged,
+        return cache.modified, cache.staged, cache.untracked,
             cache.ahead, cache.behind, .VALID
     case .STALE:
         bg_pid := posix.fork()
         if bg_pid == 0 {
             if posix.fork() == 0 {
-                m, s, a, b := run_git_status(repo_path)
-                write_git_cache(repo_path, gitdir, m, s, a, b)
+                m, s, u, a, b := run_git_status(repo_path)
+                write_git_cache(repo_path, gitdir, m, s, u, a, b)
             }
             posix._exit(0)
         }
         if bg_pid > 0 {
             posix.waitpid(bg_pid, nil, {})
         }
-        return cache.modified, cache.staged,
+        return cache.modified, cache.staged, cache.untracked,
             cache.ahead, cache.behind, .STALE
     case .NONE:
-        modified, staged, ahead, behind =
+        modified, staged, untracked, ahead, behind =
             run_git_status(repo_path)
         write_git_cache(
             repo_path,
             gitdir,
             modified,
             staged,
+            untracked,
             ahead,
             behind,
         )
-        return modified, staged, ahead, behind, .NONE
+        return modified, staged, untracked, ahead, behind, .NONE
     }
 
-    return 0, 0, 0, 0, .NONE
+    return 0, 0, 0, 0, 0, .NONE
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2577,8 +2591,8 @@ build_line1 :: proc(l: ^SegList, state: ^DisplayState, gs: ^GitStatus) {
     add_seg(l, path_seg)
 
     if gs.valid {
-        icon := ICON_BRANCH
-        dirty := gs.staged > 0 || gs.modified > 0
+        icon: string = gs.is_worktree ? ICON_WORKTREE : ICON_BRANCH
+        dirty := gs.staged > 0 || gs.modified > 0 || gs.untracked > 0
         b := gs.branch
         s1: string
         if len(b) > 12 {
@@ -2611,6 +2625,9 @@ build_line1 :: proc(l: ^SegList, state: ^DisplayState, gs: ^GitStatus) {
         }
         if gs.modified > 0 {
             append(&bits, fmt.tprintf("%s%s%d", ANSI_FG_ORANGE, ICON_MODIFIED, gs.modified))
+        }
+        if gs.untracked > 0 {
+            append(&bits, fmt.tprintf("%s%s%d", ANSI_FG_CYAN, ICON_UNTRACKED, gs.untracked))
         }
         if gs.stashes > 0 {
             append(&bits, fmt.tprintf("%s%s%d", ANSI_FG_PURPLE, ICON_STASH, gs.stashes))
@@ -3042,9 +3059,11 @@ main :: proc() {
             if branch, ok := git_read_branch_fast(branch_buf[:], gp.gitdir);
                 ok {
                 gs.valid = true
+                gs.is_worktree = gp.is_worktree
                 gs.branch = branch
                 gs.stashes = git_read_stash_count(gp.commondir)
-                gs.modified, gs.staged, gs.ahead, gs.behind, gs.cache_state =
+                gs.modified, gs.staged, gs.untracked,
+                    gs.ahead, gs.behind, gs.cache_state =
                     get_git_status_cached(gp.root, gp.gitdir)
             }
         }
