@@ -20,6 +20,7 @@ import "core:strconv"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
+import "core:unicode/utf8"
 
 /* -------------------------------------------------------------------------- */
 /* ANSI Colors (Dracula Theme)                                                */
@@ -831,19 +832,6 @@ FRAC_BLOCKS :: [8]string{
 FILLED_BLOCK :: "\u25b0"  // filled rectangle
 EMPTY_BLOCK :: "\u25b1"  // empty (outlined) rectangle
 
-// Color zone for a given cell position (0-based) in a
-// 10-cell bar. Each cell = 10%.
-// 0-3: green (0-40%), 4-5: yellow (40-60%),
-// 6-7: orange (60-80%), 8-9: red (80-100%)
-zone_color :: proc(cell: int) -> string {
-    switch cell {
-    case 0, 1, 2, 3: return ANSI_FG_GREEN
-    case 4, 5:       return ANSI_FG_YELLOW
-    case 6, 7:       return ANSI_FG_ORANGE
-    case:            return ANSI_FG_RED
-    }
-}
-
 // Color for the percentage label (matches leading edge)
 pct_label_color :: proc(pct: i64) -> string {
     if pct >= 80 do return ANSI_FG_RED
@@ -857,11 +845,12 @@ make_context_bar :: proc(
     pct: i64,
     ctx_size: i64,
     input_tokens: i64,
+    width: int = 10,
 ) -> string {
     clamped := min(pct, 100)
-    WIDTH :: 10
+    WIDTH := width
     // Number of filled cells (rounded)
-    filled := int((clamped * WIDTH + 50) / 100)
+    filled := int((clamped * i64(WIDTH) + 50) / 100)
 
     pos := 0
 
@@ -885,7 +874,9 @@ make_context_bar :: proc(
     // Bar: WIDTH cells of filled / empty rectangles with color zones
     for cell in 0 ..< WIDTH {
         if cell < filled {
-            color := zone_color(cell)
+            // Color by the percentage this cell represents so 5- and
+            // 10-wide bars share one gradient.
+            color := pct_label_color(i64(cell * 100 / WIDTH + 5))
             copy(bar_buf[pos:], color)
             pos += len(color)
             copy(bar_buf[pos:], FILLED_BLOCK)
@@ -1763,15 +1754,24 @@ write_usage_cache :: proc(gppid: int, cache: UsageCache) {
         cache_path,
         context.temp_allocator,
     )
+    // Write to a temp file and rename so a concurrent reader never sees a
+    // truncated half-written cache (which read as {} and blanked the quota).
+    tmp_buf: [80]u8
+    tmp_path := fmt.bprintf(tmp_buf[:], "%s.tmp%d", cache_path, posix.getpid())
+    tmp_cstr := strings.clone_to_cstring(
+        tmp_path,
+        context.temp_allocator,
+    )
     fd := posix.open(
-        cache_cstr,
+        tmp_cstr,
         {.WRONLY, .CREAT, .TRUNC},
         {.IRUSR, .IWUSR},
     )
     if fd < 0 do return
-    defer posix.close(fd)
     c := cache
     posix.write(fd, transmute([^]u8)&c, size_of(UsageCache))
+    posix.close(fd)
+    posix.rename(tmp_cstr, cache_cstr)
 }
 
 get_usage_cache_path :: proc(path_buf: []u8, gppid: int) -> string {
@@ -1999,62 +1999,6 @@ read_usage_cache :: proc(gppid: int) -> UsageCache {
 /* Git Segment Builder                                                        */
 /* -------------------------------------------------------------------------- */
 
-truncate_branch :: proc(
-    trunc_buf: []u8,
-    branch: string,
-    max_len: int,
-) -> string {
-    if len(branch) <= max_len {
-        return branch
-    }
-    copy(trunc_buf[:], branch[:max_len - 3])
-    copy(trunc_buf[max_len - 3:], "...")
-    return string(trunc_buf[:max_len])
-}
-
-build_git_segment :: proc(
-    buf: ^OutBuf,
-    gs: ^GitStatus,
-) {
-    if !gs.valid do return
-
-    text_buf: [256]u8
-    trunc_buf: [64]u8
-    text := fmt.bprintf(text_buf[:], "%s %s", ICON_BRANCH, truncate_branch(trunc_buf[:], gs.branch, 20))
-
-    bg := gs.modified > 0 || gs.staged > 0 ? ANSI_BG_ORANGE : ANSI_BG_GREEN
-    segment(buf, bg, ANSI_FG_BLACK, text, false)
-
-    if gs.staged > 0 || gs.modified > 0 ||
-        gs.stashes > 0 || gs.ahead > 0 ||
-        gs.behind > 0 {
-        st_buf: [256]u8
-        pos := 0
-        if gs.ahead > 0 {
-            s := fmt.bprintf(st_buf[pos:], "%s\u2191%d ", ANSI_FG_GREEN, gs.ahead)
-            pos += len(s)
-        }
-        if gs.behind > 0 {
-            s := fmt.bprintf(st_buf[pos:], "%s\u2193%d ", ANSI_FG_RED, gs.behind)
-            pos += len(s)
-        }
-        if gs.staged > 0 {
-            s := fmt.bprintf(st_buf[pos:], "%s%s%d ", ANSI_FG_GREEN, ICON_STAGED, gs.staged)
-            pos += len(s)
-        }
-        if gs.modified > 0 {
-            s := fmt.bprintf(st_buf[pos:], "%s%s%d ", ANSI_FG_ORANGE, ICON_MODIFIED, gs.modified)
-            pos += len(s)
-        }
-        if gs.stashes > 0 {
-            s := fmt.bprintf(st_buf[pos:], "%s%s%d", ANSI_FG_PURPLE, ICON_STASH, gs.stashes)
-            pos += len(s)
-        }
-        for pos > 0 && st_buf[pos - 1] == ' ' do pos -= 1
-        segment(buf, ANSI_BG_DARK, "", string(st_buf[:pos]), false)
-    }
-}
-
 /* -------------------------------------------------------------------------- */
 /* Display State                                                              */
 /* -------------------------------------------------------------------------- */
@@ -2252,103 +2196,386 @@ rate_limit_color :: proc(pct: f64) -> string {
 /* -------------------------------------------------------------------------- */
 /* Statusline Builder                                                         */
 /* -------------------------------------------------------------------------- */
+/*
+Two-line width-adaptive layout (v6).
 
-build_statusline :: proc(
-    buf   : ^OutBuf,
-    state : ^DisplayState,
-    gs    : ^GitStatus,
-) {
+Line 1 = identity (model, path, branch, git counts, PR) — changes only when
+you move, so it is a stable visual anchor. Line 2 = budget (quota, context,
+burn) — all per-render churn is quarantined here. Each line degrades
+independently via a table-driven priority ladder: the lowest-priority segment
+sheds display stages first, then droppable segments are dropped outright.
+Authoritative spec: thoughts/shared/plans/statusline-v6-layout-prototype.py.
+*/
+
+// ---- display width (mirrors Bun.stringWidth(s, {ambiguousIsNarrow: true}))
+
+// East-Asian Wide/Fullwidth ranges -> 2 cells. Every glyph this statusline
+// currently uses is Narrow or Ambiguous (1 cell); this branch exists so a
+// future 2-cell glyph doesn't silently break the width math.
+is_wide_rune :: proc(r: rune) -> bool {
+    switch r {
+    case 0x1100 ..= 0x115F,   // Hangul Jamo
+         0x2E80 ..= 0x303E,   // CJK Radicals .. CJK Symbols
+         0x3041 ..= 0x33FF,   // Hiragana .. CJK Compat
+         0x3400 ..= 0x4DBF,   // CJK Ext A
+         0x4E00 ..= 0x9FFF,   // CJK Unified
+         0xA000 ..= 0xA4CF,   // Yi
+         0xAC00 ..= 0xD7A3,   // Hangul Syllables
+         0xF900 ..= 0xFAFF,   // CJK Compat Ideographs
+         0xFE30 ..= 0xFE4F,   // CJK Compat Forms
+         0xFF00 ..= 0xFF60,   // Fullwidth Forms
+         0xFFE0 ..= 0xFFE6,
+         0x1F300 ..= 0x1F64F, // Emoji (most render wide)
+         0x1F900 ..= 0x1F9FF,
+         0x20000 ..= 0x2FFFD, // CJK Ext B+
+         0x30000 ..= 0x3FFFD:
+        return true
+    }
+    return false
+}
+
+is_combining_rune :: proc(r: rune) -> bool {
+    switch r {
+    case 0x0300 ..= 0x036F,
+         0x1AB0 ..= 0x1AFF,
+         0x1DC0 ..= 0x1DFF,
+         0x20D0 ..= 0x20FF,
+         0xFE20 ..= 0xFE2F:
+        return true
+    }
+    return false
+}
+
+// Visible cell count: skip ANSI CSI (\x1b[...X) and OSC (\x1b]...(BEL|ESC\))
+// sequences, then count runes (2 for Wide/Fullwidth, 0 for combining marks).
+display_width :: proc(s: string) -> int {
+    w := 0
+    i := 0
+    for i < len(s) {
+        c := s[i]
+        if c == 0x1b {
+            if i + 1 < len(s) && s[i + 1] == '[' {
+                // CSI: params then one final byte in 0x40..0x7e
+                j := i + 2
+                for j < len(s) && !(s[j] >= 0x40 && s[j] <= 0x7e) do j += 1
+                i = j < len(s) ? j + 1 : len(s)
+                continue
+            }
+            if i + 1 < len(s) && s[i + 1] == ']' {
+                // OSC (e.g. OSC8 hyperlink): ends at BEL or ESC-backslash
+                j := i + 2
+                for j < len(s) {
+                    if s[j] == 0x07 { j += 1; break }
+                    if s[j] == 0x1b && j + 1 < len(s) && s[j + 1] == '\\' {
+                        j += 2
+                        break
+                    }
+                    j += 1
+                }
+                i = j
+                continue
+            }
+            i += 1
+            continue
+        }
+        r, size := utf8.decode_rune_in_string(s[i:])
+        if size <= 0 do size = 1
+        i += size
+        if is_combining_rune(r) do continue
+        w += is_wide_rune(r) ? 2 : 1
+    }
+    return w
+}
+
+// ---- segment table
+
+MAX_STAGES :: 3
+
+Seg :: struct {
+    name:      string,     // for the --demo decision log
+    bg, fg:    string,
+    stages:    [MAX_STAGES]string, // [0] richest -> narrowest
+    n_stages:  int,
+    priority:  int,        // LOWER sheds/drops FIRST
+    droppable: bool,
+    stage:     int,
+    dropped:   bool,
+}
+
+SegList :: struct {
+    segs: [12]Seg,
+    n:    int,
+}
+
+add_seg :: proc(l: ^SegList, s: Seg) {
+    if l.n < len(l.segs) {
+        l.segs[l.n] = s
+        l.n += 1
+    }
+}
+
+seg1 :: proc(name, bg, fg, text: string, priority: int, droppable := true) -> Seg {
+    return {name = name, bg = bg, fg = fg, stages = {text, "", ""},
+            n_stages = 1, priority = priority, droppable = droppable}
+}
+
+FitAction :: enum { SHRINK, DROP }
+
+FitLog :: struct {
+    actions: [64]FitAction,
+    names:   [64]string,
+    stages:  [64]int,
+    n:       int,
+}
+
+// Total visible width of the rendered line:
+//   Σ (display_width(stage text) + 2 padding spaces)
+// + (n_live - 1) junction cells (powerline sep or '|' divider)
+// + 1 end cap.
+// The junction and end-cap terms are LOAD-BEARING — omitting them
+// undercounts by ~5 cells and overflows with an empty decision log.
+line_total_width :: proc(l: ^SegList) -> int {
+    total := 0
+    n_live := 0
+    for i in 0 ..< l.n {
+        s := &l.segs[i]
+        if s.dropped do continue
+        n_live += 1
+        total += display_width(s.stages[s.stage]) + 2
+    }
+    if n_live == 0 do return 0
+    return total + (n_live - 1) + 1
+}
+
+// Priority ladder: shed the next stage of the lowest-priority segment that
+// still has one; when none has a stage left, drop the lowest-priority
+// droppable segment. Repeats until the line fits (or nothing can shrink).
+fit_line :: proc(l: ^SegList, cols: int, flog: ^FitLog = nil) {
+    for _ in 0 ..< 200 {
+        if line_total_width(l) <= cols do break
+
+        // Lowest-priority segment with a stage left to shed
+        best := -1
+        for i in 0 ..< l.n {
+            s := &l.segs[i]
+            if s.dropped || s.stage >= s.n_stages - 1 do continue
+            if best < 0 || s.priority < l.segs[best].priority do best = i
+        }
+        if best >= 0 {
+            l.segs[best].stage += 1
+            if flog != nil && flog.n < len(flog.actions) {
+                flog.actions[flog.n] = .SHRINK
+                flog.names[flog.n] = l.segs[best].name
+                flog.stages[flog.n] = l.segs[best].stage
+                flog.n += 1
+            }
+            continue
+        }
+
+        // Nothing left to shrink: drop the lowest-priority droppable segment
+        best = -1
+        for i in 0 ..< l.n {
+            s := &l.segs[i]
+            if s.dropped || !s.droppable do continue
+            if best < 0 || s.priority < l.segs[best].priority do best = i
+        }
+        if best < 0 do break
+        l.segs[best].dropped = true
+        if flog != nil && flog.n < len(flog.actions) {
+            flog.actions[flog.n] = .DROP
+            flog.names[flog.n] = l.segs[best].name
+            flog.stages[flog.n] = -1
+            flog.n += 1
+        }
+    }
+}
+
+render_line :: proc(buf: ^OutBuf, l: ^SegList) {
+    buf.prev_bg = ""
     first := true
-
-    // Vim mode (icon only, color indicates mode)
-    if len(state.vim_mode) > 0 {
-        vim_bg, vim_fg, vim_icon: string
-        is_insert := state.vim_mode == "INSERT"
-        if is_insert {
-            vim_bg = ANSI_BG_GREEN
-            vim_fg = ANSI_FG_BLACK
-            vim_icon = ICON_INSERT
-        } else {
-            vim_bg = ANSI_BG_DARK
-            vim_fg = ANSI_FG_WHITE
-            vim_icon = ICON_NORMAL
-        }
-        vim_buf: [64]u8
-        vim_text: string
-        if is_insert {
-            vim_text = fmt.bprintf(vim_buf[:], "%s%s", ANSI_BOLD, vim_icon)
-        } else {
-            vim_text = vim_icon
-        }
-        segment(buf, vim_bg, vim_fg, vim_text, first)
+    for i in 0 ..< l.n {
+        s := &l.segs[i]
+        if s.dropped do continue
+        segment(buf, s.bg, s.fg, s.stages[s.stage], first)
         first = false
     }
+    segment_end(buf)
+}
 
-    // Model (abbreviated, bold). A brain glyph trails the name when extended
-    // thinking is enabled for the session (thinking.enabled in stdin JSON).
-    model_buf: [128]u8
-    model_abbrev_buf: [32]u8
-    model_abbrev := abbreviate_model(model_abbrev_buf[:], state.model)
-    model_text: string
-    if state.thinking_enabled {
-        model_text = fmt.bprintf(
-            model_buf[:], "%s%s %s", ANSI_BOLD, model_abbrev, ICON_BRAIN,
-        )
-    } else {
-        model_text = fmt.bprintf(
-            model_buf[:], "%s%s", ANSI_BOLD, model_abbrev,
-        )
+// COLUMNS env var; fallback 120 when unset/unparseable — degrade as if
+// narrow rather than assume wide and let Claude Code truncate arbitrarily.
+get_columns :: proc() -> int {
+    cols_c := posix.getenv("COLUMNS")
+    if cols_c == nil do return 120
+    v, ok := strconv.parse_int(string(cols_c))
+    if !ok || v <= 0 do return 120
+    return v
+}
+
+// ---- line 1: identity
+
+// Last path component of a raw path.
+path_basename :: proc(path: string) -> string {
+    last := -1
+    for i in 0 ..< len(path) {
+        if path[i] == '/' do last = i
     }
-    segment(buf, ANSI_BG_PURPLE, ANSI_FG_BLACK, model_text, first)
-    first = false
+    return last >= 0 ? path[last + 1:] : path
+}
 
-    // Path
-    path_buf: [300]u8
+// Strip the last /component from an abbreviated path ("~/P/p/x" -> "~/P/p").
+path_parent :: proc(path: string) -> string {
+    last := -1
+    for i in 0 ..< len(path) {
+        if path[i] == '/' do last = i
+    }
+    return last > 0 ? path[:last] : path
+}
+
+// Byte-truncate at a rune boundary (branch names are ASCII in practice, but
+// never cut a UTF-8 sequence in half).
+trunc_runes :: proc(s: string, max_bytes: int) -> string {
+    if len(s) <= max_bytes do return s
+    end := max_bytes
+    for end > 0 && (s[end] & 0xC0) == 0x80 do end -= 1
+    return s[:end]
+}
+
+build_line1 :: proc(l: ^SegList, state: ^DisplayState, gs: ^GitStatus) {
+    // Vim mode (icon only; color carries the mode)
+    if len(state.vim_mode) > 0 {
+        is_insert := state.vim_mode == "INSERT"
+        if is_insert {
+            add_seg(l, seg1("vim", ANSI_BG_GREEN, ANSI_FG_BLACK,
+                fmt.tprintf("%s%s", ANSI_BOLD, ICON_INSERT), 20))
+        } else {
+            add_seg(l, seg1("vim", ANSI_BG_DARK, ANSI_FG_WHITE,
+                ICON_NORMAL, 20))
+        }
+    }
+
+    // Model: full display name, shrinks to abbreviated form
+    short_buf: [32]u8
+    short := abbreviate_model(short_buf[:], state.model)
+    brain := state.thinking_enabled ? fmt.tprintf(" %s", ICON_BRAIN) : ""
+    add_seg(l, Seg{
+        name = "model", bg = ANSI_BG_PURPLE, fg = ANSI_FG_BLACK,
+        stages = {
+            fmt.tprintf("%s%s%s", ANSI_BOLD, state.model, brain),
+            fmt.tprintf("%s%s%s", ANSI_BOLD, strings.clone(short, context.temp_allocator), brain),
+            "",
+        },
+        n_stages = 2, priority = 95, droppable = false,
+    })
+
+    // Path. When the basename equals the branch (worktrees named after their
+    // branch), elide it to '…' — the branch segment already carries the name
+    // and the path then contributes only parent context. This is the single
+    // largest win: line 1 drops from 103 to 81 cells.
     abbrev_buf: [256]u8
-    path_text := fmt.bprintf(path_buf[:], "%s %s", ICON_FOLDER, abbrev_path(abbrev_buf[:], state.cwd))
-    segment(buf, ANSI_BG_DARK, ANSI_FG_WHITE, path_text, false)
-
-    // Git
-    if gs.valid {
-        build_git_segment(buf, gs)
+    path_full := strings.clone(
+        abbrev_path(abbrev_buf[:], state.cwd), context.temp_allocator)
+    base := path_basename(state.cwd)
+    path_short := fmt.tprintf("~/…/%s", base)
+    dup := gs.valid && base == gs.branch
+    path_seg: Seg
+    if dup {
+        path_seg = Seg{
+            name = "path", bg = ANSI_BG_DARK, fg = ANSI_FG_WHITE,
+            stages = {
+                fmt.tprintf("%s %s/…", ICON_FOLDER, path_parent(path_full)),
+                fmt.tprintf("%s ~/…/…", ICON_FOLDER),
+                "",
+            },
+            n_stages = 2, priority = 75,
+        }
+    } else {
+        path_seg = Seg{
+            name = "path", bg = ANSI_BG_DARK, fg = ANSI_FG_WHITE,
+            stages = {
+                fmt.tprintf("%s %s", ICON_FOLDER, path_full),
+                fmt.tprintf("%s %s", ICON_FOLDER, path_short),
+                fmt.tprintf("%s %s", ICON_FOLDER, base),
+            },
+            n_stages = 3, priority = 75,
+        }
     }
+    add_seg(l, path_seg)
 
-    // Cost intentionally omitted: total_cost_usd is an API-equivalent figure,
-    // NOT a real charge on a flat subscription. Showing dollars on a Pro plan
-    // is misleading, so it's dropped in favor of the real ceiling — usage.
+    if gs.valid {
+        icon := ICON_BRANCH
+        dirty := gs.staged > 0 || gs.modified > 0
+        b := gs.branch
+        s1: string
+        if len(b) > 12 {
+            s1 = fmt.tprintf("%s %s…", icon, trunc_runes(b, 12))
+        } else {
+            s1 = fmt.tprintf("%s %s", icon, b)
+        }
+        add_seg(l, Seg{
+            name = "branch",
+            bg = dirty ? ANSI_BG_ORANGE : ANSI_BG_GREEN,
+            fg = ANSI_FG_BLACK,
+            stages = {
+                fmt.tprintf("%s %s", icon, b),
+                s1,
+                fmt.tprintf("%s %s…", icon, trunc_runes(b, 8)),
+            },
+            n_stages = 3, priority = 80,
+        })
 
-    // Usage quota — the REAL ceiling on a subscription, so show it whenever
-    // it's known (any successful fetch sets a reset timestamp), at any level.
-    // Opus weekly cap (Max plans) and a countdown to the soonest reset are
-    // appended when relevant.
+        // Dirty/sync counters, colored per kind
+        bits := make([dynamic]string, context.temp_allocator)
+        if gs.ahead > 0 {
+            append(&bits, fmt.tprintf("%s↑%d", ANSI_FG_GREEN, gs.ahead))
+        }
+        if gs.behind > 0 {
+            append(&bits, fmt.tprintf("%s↓%d", ANSI_FG_RED, gs.behind))
+        }
+        if gs.staged > 0 {
+            append(&bits, fmt.tprintf("%s%s%d", ANSI_FG_GREEN, ICON_STAGED, gs.staged))
+        }
+        if gs.modified > 0 {
+            append(&bits, fmt.tprintf("%s%s%d", ANSI_FG_ORANGE, ICON_MODIFIED, gs.modified))
+        }
+        if gs.stashes > 0 {
+            append(&bits, fmt.tprintf("%s%s%d", ANSI_FG_PURPLE, ICON_STASH, gs.stashes))
+        }
+        if len(bits) > 0 {
+            joined := strings.join(bits[:], " ", context.temp_allocator)
+            add_seg(l, seg1("gitstat", ANSI_BG_DARK, "", joined, 45))
+        }
+    }
+}
+
+// ---- line 2: budget
+
+build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
     if state.five_hour_reset > 0 || state.seven_day_reset > 0 {
-        // 5h and 7d share one color, driven by whichever window is hotter,
-        // so the pair reads as a single rate-limit risk indicator.
-        color_rl := rate_limit_color(max(state.five_hour_pct, state.seven_day_pct))
-        usage_buf: [256]u8
-        pos := 0
-        s := fmt.bprintf(
-            usage_buf[:],
-            "%s5h %s%s%d%% %s7d %s%s%d%%",
-            ANSI_FG_WHITE, ANSI_BOLD, color_rl, i64(state.five_hour_pct + 0.5),
-            ANSI_FG_WHITE, ANSI_BOLD, color_rl, i64(state.seven_day_pct + 0.5),
-        )
-        pos += len(s)
+        // 5h and 7d share one color, driven by whichever window is hotter
+        c5 := rate_limit_color(max(state.five_hour_pct, state.seven_day_pct))
+        five := i64(state.five_hour_pct + 0.5)
+        seven := i64(state.seven_day_pct + 0.5)
+        base := fmt.tprintf("%s5h %s%s%d%%", ANSI_FG_WHITE, ANSI_BOLD, c5, five)
+        add_seg(l, Seg{
+            name = "5h", bg = ANSI_BG_COMMENT, fg = "",
+            stages = {base, base, ""},
+            n_stages = 1, priority = 90, droppable = false,
+        })
+        add_seg(l, seg1("7d", ANSI_BG_COMMENT, "",
+            fmt.tprintf("%s7d %s%s%d%%", ANSI_FG_WHITE, ANSI_BOLD, c5, seven),
+            50))
 
-        // Opus weekly cap (only when it's actually meaningful)
+        // Opus weekly cap (Max plans) — only when it's meaningful
         if state.seven_day_opus_pct >= 50 {
-            color_op := usage_color(state.seven_day_opus_pct)
-            so := fmt.bprintf(
-                usage_buf[pos:],
-                " %sop %s%s%d%%",
-                ANSI_FG_WHITE, ANSI_BOLD, color_op,
-                i64(state.seven_day_opus_pct + 0.5),
-            )
-            pos += len(so)
+            add_seg(l, seg1("opus", ANSI_BG_COMMENT, "",
+                fmt.tprintf("%sop %s%s%d%%", ANSI_FG_WHITE, ANSI_BOLD,
+                    usage_color(state.seven_day_opus_pct),
+                    i64(state.seven_day_opus_pct + 0.5)),
+                45))
         }
 
-        // Countdown to the soonest relevant reset. Prefer the 5h window
-        // when it's the one driving the display; fall back to weekly.
+        // Countdown to the soonest relevant reset
         now := current_time_sec()
         reset_epoch: i64 = 0
         if state.five_hour_reset > now {
@@ -2361,61 +2588,74 @@ build_statusline :: proc(
         if reset_epoch > now {
             cd_buf: [16]u8
             cd := format_countdown(cd_buf[:], reset_epoch - now)
-            // "|" separates the usage totals from the reset countdown. Use
-            // FG_DARK, not FG_COMMENT — this segment's background IS
-            // ANSI_BG_COMMENT, so a comment-colored bar would be invisible.
-            sr := fmt.bprintf(
-                usage_buf[pos:],
-                " %s| %s%s%s",
-                ANSI_FG_DARK, ANSI_FG_WHITE, ICON_SYNC, cd,
-            )
-            pos += len(sr)
+            add_seg(l, seg1("reset", ANSI_BG_COMMENT, "",
+                fmt.tprintf("%s%s%s", ANSI_FG_WHITE, ICON_SYNC,
+                    strings.clone(cd, context.temp_allocator)),
+                40))
         }
-
-        segment(buf, ANSI_BG_COMMENT, "", string(usage_buf[:pos]), false)
     }
 
-    // Combined: duration | last update | tokens | context bar
     if state.total_duration_ms > 0 {
-        dur_buf: [512]u8
-        pos := 0
-        fdur_buf: [32]u8
-        s := fmt.bprintf(dur_buf[:], "%s%s %s", ANSI_FG_WHITE, ICON_CLOCK, format_duration(fdur_buf[:], state.total_duration_ms))
-        pos += len(s)
-
-        s5 := fmt.bprintf(dur_buf[pos:], " %s| ", ANSI_FG_COMMENT)
-        pos += len(s5)
-
-        // total_input_tokens is the real current context occupancy (input +
-        // cache read/write) as of Claude Code v2.1.132+, so show it exactly
-        // rather than deriving a coarse count from the integer percentage.
-        bar_storage: [512]u8
-        bar := make_context_bar(bar_storage[:], state.used_pct, state.ctx_size, state.input_tokens)
-        copy(dur_buf[pos:], bar)
-        pos += len(bar)
-
-        segment(buf, ANSI_BG_DARK, "", string(dur_buf[:pos]), false)
+        dur_buf: [32]u8
+        dur := format_duration(dur_buf[:], state.total_duration_ms)
+        add_seg(l, seg1("dur", ANSI_BG_DARK, "",
+            fmt.tprintf("%s%s %s", ANSI_FG_WHITE, ICON_CLOCK,
+                strings.clone(dur, context.temp_allocator)),
+            10))
     }
 
-    // Context limit warnings
+    // Context bar: 10-cell -> 5-cell -> bare percentage
+    bar10_buf: [512]u8
+    bar5_buf: [512]u8
+    bar10 := make_context_bar(bar10_buf[:], state.used_pct, state.ctx_size,
+        state.input_tokens, 10)
+    bar5 := make_context_bar(bar5_buf[:], state.used_pct, state.ctx_size,
+        state.input_tokens, 5)
+    add_seg(l, Seg{
+        name = "ctx", bg = ANSI_BG_DARK, fg = "",
+        stages = {
+            strings.clone(bar10, context.temp_allocator),
+            strings.clone(bar5, context.temp_allocator),
+            fmt.tprintf("%s%d%%", pct_label_color(min(state.used_pct, 100)),
+                min(state.used_pct, 100)),
+        },
+        n_stages = 3, priority = 100, droppable = false,
+    })
+
+    // Context warning
     if state.used_pct >= 80 {
-        warn_buf: [128]u8
-        warn_text: string
-        warn_bg: string
-        if state.used_pct >= 95 {
-            warn_text = fmt.bprintf(warn_buf[:], "%s%s CRITICAL COMPACT", ANSI_BOLD, ICON_WARN)
-            warn_bg = ANSI_BG_RED
-        } else if state.used_pct >= 90 {
-            warn_text = fmt.bprintf(warn_buf[:], "%s%s LOW CTX COMPACT", ANSI_BOLD, ICON_WARN)
-            warn_bg = ANSI_BG_RED
-        } else {
-            warn_text = fmt.bprintf(warn_buf[:], "%s CTX 80%%+", ICON_WARN)
-            warn_bg = ANSI_BG_YELLOW
-        }
-        segment(buf, warn_bg, ANSI_FG_BLACK, warn_text, false)
+        crit := state.used_pct >= 90
+        add_seg(l, Seg{
+            name = "warn",
+            bg = crit ? ANSI_BG_RED : ANSI_BG_YELLOW,
+            fg = ANSI_FG_BLACK,
+            stages = {
+                fmt.tprintf("%s%s %s", ANSI_BOLD, ICON_WARN,
+                    crit ? "COMPACT NOW" : "CTX 80%+"),
+                fmt.tprintf("%s%s", ANSI_BOLD, ICON_WARN),
+                "",
+            },
+            n_stages = 2, priority = 99, droppable = false,
+        })
     }
+}
 
-    segment_end(buf)
+build_statusline :: proc(
+    buf   : ^OutBuf,
+    state : ^DisplayState,
+    gs    : ^GitStatus,
+) {
+    cols := get_columns()
+
+    l1, l2: SegList
+    build_line1(&l1, state, gs)
+    build_line2(&l2, state)
+    fit_line(&l1, cols)
+    fit_line(&l2, cols)
+
+    render_line(buf, &l1)
+    out_char(buf, '\n')
+    render_line(buf, &l2)
 }
 
 /* -------------------------------------------------------------------------- */

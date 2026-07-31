@@ -472,7 +472,7 @@ still sub-millisecond; `git status` clean; every Progress box below ticked.
 ## Progress
 
 - [x] Milestone 1 — correctness (git root walk, cache key, OutBuf, static bufs, usage backoff, drop fake clock) — done 2026-07-31 15:58 MDT
-- [ ] Milestone 2 — layout engine (display_width, segment table, fit, COLUMNS, dedup, two-line emit)
+- [x] Milestone 2 — layout engine (display_width, segment table, fit, COLUMNS, dedup, two-line emit) — done 2026-07-31 16:05 MDT
 - [ ] Milestone 3 — forward-looking metrics (quota projection, burn rate + TTC, worktree icon, untracked)
 - [ ] Milestone 4 — PR + CI status segment
 - [ ] Milestone 5 — OSC8 (gated; record outcome even if discarded)
