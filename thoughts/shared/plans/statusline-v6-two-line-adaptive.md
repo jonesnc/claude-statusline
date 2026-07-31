@@ -473,8 +473,8 @@ still sub-millisecond; `git status` clean; every Progress box below ticked.
 
 - [x] Milestone 1 — correctness (git root walk, cache key, OutBuf, static bufs, usage backoff, drop fake clock) — done 2026-07-31 15:58 MDT
 - [x] Milestone 2 — layout engine (display_width, segment table, fit, COLUMNS, dedup, two-line emit) — done 2026-07-31 16:05 MDT
-- [ ] Milestone 3 — forward-looking metrics (quota projection, burn rate + TTC, worktree icon, untracked)
-- [ ] Milestone 4 — PR + CI status segment
+- [x] Milestone 3 — forward-looking metrics (quota projection, burn rate + TTC, worktree icon, untracked) — done 2026-07-31 16:09 MDT
+- [x] Milestone 4 — PR + CI status segment — done 2026-07-31 16:13 MDT (no existing producer found; see Surprises)
 - [ ] Milestone 5 — OSC8 (gated; record outcome even if discarded)
 - [ ] Milestone 6 — `--demo` mode, delete the prototype
 
@@ -534,4 +534,12 @@ we can fix if problem later"). Do not spend time on either:
 
 Record anything that contradicts this plan here, then stop with a clean tree.
 
-- (nothing yet)
+- **Milestone 4 producer hunt (2026-07-31):** no producer of
+  `~/.claude/gh-pr-status-cache.json` exists on this machine. Searched
+  `~/.claude/{hooks,commands,agents,skills,plugins,settings.json}`,
+  `~/Projects/claude-tools`, `~/Projects/mysuu-portal-loop`, `~/bin`,
+  `~/.local/bin`, `~/.config`, and the crontab — the only hits are this
+  plan and conversation transcripts. The file itself is keyed by full PR
+  URL (a single mysuu-portal entry from 12:53 today), not by repo+branch,
+  so it looks like a one-off written by some past ad-hoc session. Built
+  the plan's own double-fork `gh` fetcher instead.

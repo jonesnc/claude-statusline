@@ -2061,8 +2061,235 @@ read_usage_cache :: proc(gppid: int) -> UsageCache {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Git Segment Builder                                                        */
+/* PR + CI Status (background gh fetch, 120s TTL, negative caching)           */
 /* -------------------------------------------------------------------------- */
+
+PR_CACHE_TTL_S :: 120
+
+PrCi :: enum u8 { PASS, FAIL, PENDING, DRAFT }
+PrReview :: enum u8 { NONE, APPROVED, REVIEW_REQUIRED }
+
+// Unlike the git cache there is no local mtime to test staleness against —
+// freshness is pure TTL, which makes negative caching load-bearing. Failure
+// is NORMAL here (no PR for the branch, rate limit, expired auth), so a
+// failed fetch must still write an entry with a backoff timestamp; anything
+// else reproduces the usage-cache refork storm in a new place.
+PrCache :: struct #packed {
+    fetch_time_sec:       i64,
+    last_attempt_sec:     i64,
+    consecutive_failures: i64,
+    has_pr:               u8,
+    ci:                   PrCi,
+    review:               PrReview,
+    _pad:                 u8,
+    number:               i64,
+    failed:               i64,
+    url:                  [128]u8,
+}
+
+PrStatus :: struct {
+    valid:  bool,
+    number: i64,
+    failed: i64,
+    ci:     PrCi,
+    review: PrReview,
+    url:    string,
+}
+
+get_pr_cache_path :: proc(path_buf: []u8, gitdir: string, branch: string) -> string {
+    h := hash_path(gitdir)
+    // Fold the branch into the same FNV hash so each worktree+branch pair
+    // gets its own entry.
+    for c in branch {
+        h ~= u32(c)
+        h *= 16777619
+    }
+    return fmt.bprintf(path_buf, "/dev/shm/claude-pr-%08x", h)
+}
+
+count_substr :: proc(s: string, needle: string) -> i64 {
+    count: i64 = 0
+    rest := s
+    for {
+        idx := strings.index(rest, needle)
+        if idx < 0 do break
+        count += 1
+        rest = rest[idx + len(needle):]
+    }
+    return count
+}
+
+write_pr_cache :: proc(gitdir: string, branch: string, cache: PrCache) {
+    path_buf: [64]u8
+    cache_path := get_pr_cache_path(path_buf[:], gitdir, branch)
+    tmp_buf: [80]u8
+    tmp_path := fmt.bprintf(tmp_buf[:], "%s.tmp%d", cache_path, posix.getpid())
+    tmp_cstr := strings.clone_to_cstring(tmp_path, context.temp_allocator)
+    cache_cstr := strings.clone_to_cstring(cache_path, context.temp_allocator)
+    fd := posix.open(tmp_cstr, {.WRONLY, .CREAT, .TRUNC}, {.IRUSR, .IWUSR})
+    if fd < 0 do return
+    c := cache
+    posix.write(fd, transmute([^]u8)&c, size_of(PrCache))
+    posix.close(fd)
+    posix.rename(tmp_cstr, cache_cstr)
+}
+
+// Grandchild worker: run gh in the repo, parse, write the cache.
+// Never returns.
+fetch_pr_status_exit :: proc(
+    root: string,
+    gitdir: string,
+    branch: string,
+    prev: PrCache,
+) -> ! {
+    now := current_time_sec()
+    fail :: proc(gitdir, branch: string, prev: PrCache, now: i64) -> ! {
+        c := prev
+        c.last_attempt_sec = now
+        c.consecutive_failures += 1
+        // A definite "no PR" also lands here: cheap to retry after backoff,
+        // and indistinguishable from transient gh failures without exit
+        // codes we don't capture.
+        c.has_pr = 0
+        write_pr_cache(gitdir, branch, c)
+        posix._exit(1)
+    }
+
+    pipe_fds: [2]posix.FD
+    if posix.pipe(&pipe_fds) != .OK do fail(gitdir, branch, prev, now)
+
+    gh_pid := posix.fork()
+    if gh_pid < 0 do fail(gitdir, branch, prev, now)
+    if gh_pid == 0 {
+        posix.close(pipe_fds[0])
+        root_cstr := strings.clone_to_cstring(root, context.temp_allocator)
+        posix.chdir(root_cstr)
+        posix.dup2(pipe_fds[1], 1)
+        dev_null := posix.open("/dev/null", {.WRONLY})
+        if dev_null >= 0 do posix.dup2(dev_null, 2)
+        posix.close(pipe_fds[1])
+        argv := []cstring{
+            "gh", "pr", "view", "--json",
+            "number,state,isDraft,statusCheckRollup,reviewDecision,url",
+            nil,
+        }
+        posix.execvp("gh", raw_data(argv))
+        posix._exit(127)
+    }
+    posix.close(pipe_fds[1])
+
+    buf: [65536]u8
+    total := 0
+    for {
+        remaining := len(buf) - total - 1
+        if remaining <= 0 do break
+        n := posix.read(pipe_fds[0], raw_data(buf[total:]), uint(remaining))
+        if n <= 0 do break
+        total += int(n)
+    }
+    posix.close(pipe_fds[0])
+    posix.waitpid(gh_pid, nil, {})
+
+    resp := string(buf[:total])
+    num_idx := strings.index(resp, "\"number\":")
+    if num_idx < 0 do fail(gitdir, branch, prev, now)
+    pos := num_idx + len("\"number\":")
+    number := json_parse_i64_at(resp, &pos)
+    if number <= 0 do fail(gitdir, branch, prev, now)
+
+    passed := count_substr(resp, "\"conclusion\":\"SUCCESS\"")
+    failed := count_substr(resp, "\"conclusion\":\"FAILURE\"") +
+        count_substr(resp, "\"conclusion\":\"ERROR\"")
+    pending := count_substr(resp, "\"status\":\"IN_PROGRESS\"") +
+        count_substr(resp, "\"status\":\"QUEUED\"") +
+        count_substr(resp, "\"status\":\"PENDING\"")
+    _ = passed
+    is_draft := strings.index(resp, "\"isDraft\":true") >= 0
+
+    ci: PrCi = .PASS
+    if is_draft {
+        ci = .DRAFT
+    } else if failed > 0 {
+        ci = .FAIL
+    } else if pending > 0 {
+        ci = .PENDING
+    }
+
+    review: PrReview = .NONE
+    if strings.index(resp, "\"reviewDecision\":\"APPROVED\"") >= 0 {
+        review = .APPROVED
+    } else if strings.index(resp, "\"reviewDecision\":\"REVIEW_REQUIRED\"") >= 0 {
+        review = .REVIEW_REQUIRED
+    }
+
+    cache: PrCache
+    cache.fetch_time_sec = now
+    cache.last_attempt_sec = now
+    cache.consecutive_failures = 0
+    cache.has_pr = 1
+    cache.ci = ci
+    cache.review = review
+    cache.number = number
+    cache.failed = failed
+    url := json_get_string(resp, "url")
+    copy(cache.url[:len(cache.url) - 1], url)
+    write_pr_cache(gitdir, branch, cache)
+    posix._exit(0)
+}
+
+// Backoff for failed PR fetches: 120s doubling to a 15-minute cap.
+pr_backoff_s :: proc(failures: i64) -> i64 {
+    b: i64 = PR_CACHE_TTL_S
+    for _ in 0 ..< min(failures, 3) do b *= 2
+    return min(b, 900)
+}
+
+get_pr_status_cached :: proc(
+    root: string,
+    gitdir: string,
+    branch: string,
+    url_buf: []u8,
+) -> PrStatus {
+    path_buf: [64]u8
+    cache_path := get_pr_cache_path(path_buf[:], gitdir, branch)
+    cache_cstr := strings.clone_to_cstring(cache_path, context.temp_allocator)
+
+    cache: PrCache
+    have := false
+    fd := posix.open(cache_cstr, {})
+    if fd >= 0 {
+        n := posix.read(fd, transmute([^]u8)&cache, size_of(PrCache))
+        posix.close(fd)
+        have = n == size_of(PrCache)
+    }
+    if !have do cache = {}
+
+    now := current_time_sec()
+    ttl: i64 = PR_CACHE_TTL_S
+    if cache.consecutive_failures > 0 {
+        ttl = pr_backoff_s(cache.consecutive_failures)
+    }
+    if !have || now - cache.last_attempt_sec >= ttl {
+        // Stale (or missing): kick a detached refresh, render stale data now.
+        bg_pid := posix.fork()
+        if bg_pid == 0 {
+            if posix.fork() == 0 {
+                fetch_pr_status_exit(root, gitdir, branch, cache)
+            }
+            posix._exit(0)
+        }
+        if bg_pid > 0 do posix.waitpid(bg_pid, nil, {})
+    }
+
+    if !have || cache.has_pr == 0 do return {}
+    n := min(len(url_buf) - 1, len(cache.url))
+    copy(url_buf, cache.url[:n])
+    url := string(cstring(raw_data(url_buf)))
+    return {
+        valid = true, number = cache.number, failed = cache.failed,
+        ci = cache.ci, review = cache.review, url = url,
+    }
+}
 
 /* -------------------------------------------------------------------------- */
 /* Display State                                                              */
@@ -2529,7 +2756,7 @@ trunc_runes :: proc(s: string, max_bytes: int) -> string {
     return s[:end]
 }
 
-build_line1 :: proc(l: ^SegList, state: ^DisplayState, gs: ^GitStatus) {
+build_line1 :: proc(l: ^SegList, state: ^DisplayState, gs: ^GitStatus, pr: ^PrStatus) {
     // Vim mode (icon only; color carries the mode)
     if len(state.vim_mode) > 0 {
         is_insert := state.vim_mode == "INSERT"
@@ -2636,6 +2863,35 @@ build_line1 :: proc(l: ^SegList, state: ^DisplayState, gs: ^GitStatus) {
             joined := strings.join(bits[:], " ", context.temp_allocator)
             add_seg(l, seg1("gitstat", ANSI_BG_DARK, "", joined, 45))
         }
+    }
+
+    // PR + CI. Review state rides in the BACKGROUND color (green approved,
+    // orange review required, dark undecided) — zero cells. The PR title is
+    // deliberately omitted: the branch name to its left says the same thing.
+    if pr.valid {
+        glyph, gcol: string
+        switch pr.ci {
+        case .PASS:    glyph = ICON_STAGED; gcol = ANSI_FG_GREEN
+        case .FAIL:    glyph = "✗";         gcol = ANSI_FG_RED
+        case .PENDING: glyph = "●";         gcol = ANSI_FG_YELLOW
+        case .DRAFT:   glyph = "⊘";         gcol = ANSI_FG_COMMENT
+        }
+        cnt := pr.ci == .FAIL ? fmt.tprintf("%d", pr.failed) : ""
+        prbg, prfg: string
+        switch pr.review {
+        case .APPROVED:        prbg = ANSI_BG_GREEN;  prfg = ANSI_FG_BLACK
+        case .REVIEW_REQUIRED: prbg = ANSI_BG_ORANGE; prfg = ANSI_FG_BLACK
+        case .NONE:            prbg = ANSI_BG_DARK;   prfg = ANSI_FG_WHITE
+        }
+        add_seg(l, Seg{
+            name = "pr", bg = prbg, fg = prfg,
+            stages = {
+                fmt.tprintf("#%d %s%s%s", pr.number, gcol, glyph, cnt),
+                fmt.tprintf("#%d %s%s", pr.number, gcol, glyph),
+                fmt.tprintf("%s%s", gcol, glyph),
+            },
+            n_stages = 3, priority = 85,
+        })
     }
 }
 
@@ -2783,11 +3039,12 @@ build_statusline :: proc(
     buf   : ^OutBuf,
     state : ^DisplayState,
     gs    : ^GitStatus,
+    pr    : ^PrStatus,
 ) {
     cols := get_columns()
 
     l1, l2: SegList
-    build_line1(&l1, state, gs)
+    build_line1(&l1, state, gs, pr)
     build_line2(&l2, state)
     fit_line(&l1, cols)
     fit_line(&l2, cols)
@@ -3052,6 +3309,8 @@ main :: proc() {
     // (.git is a file) and subdirectories both work. Cache is keyed on the
     // resolved root, so every subdir of a repo shares one entry.
     gs: GitStatus
+    pr: PrStatus
+    pr_url_buf: [128]u8
     git_bufs: GitPathsBuf
     branch_buf: [128]u8
     if len(state.cwd) > 0 {
@@ -3065,6 +3324,8 @@ main :: proc() {
                 gs.modified, gs.staged, gs.untracked,
                     gs.ahead, gs.behind, gs.cache_state =
                     get_git_status_cached(gp.root, gp.gitdir)
+                pr = get_pr_status_cached(
+                    gp.root, gp.gitdir, gs.branch, pr_url_buf[:])
             }
         }
     }
@@ -3072,7 +3333,7 @@ main :: proc() {
 
     // Build and output
     buf: OutBuf
-    build_statusline(&buf, &state, &gs)
+    build_statusline(&buf, &state, &gs, &pr)
     if debug do timings.t_build = time.tick_now()
 
     // Timing suffix (only in debug mode)
