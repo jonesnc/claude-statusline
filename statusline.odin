@@ -72,22 +72,29 @@ ICON_BRAIN     :: "\U000F09D1"   // \uDB82\uDDD1 md-brain (extended thinking on)
 /* -------------------------------------------------------------------------- */
 
 OutBuf :: struct {
-    data:    [4096]u8,
-    len:     int,
-    prev_bg: string,
+    data:     [16384]u8,
+    len:      int,
+    prev_bg:  string,
+    overflow: bool,
 }
 
 out_str :: proc(buf: ^OutBuf, s: string) {
+    if buf.overflow do return
     if buf.len + len(s) < len(buf.data) {
         copy(buf.data[buf.len:], s)
         buf.len += len(s)
+    } else {
+        buf.overflow = true
     }
 }
 
 out_char :: proc(buf: ^OutBuf, c: u8) {
+    if buf.overflow do return
     if buf.len + 1 < len(buf.data) {
         buf.data[buf.len] = c
         buf.len += 1
+    } else {
+        buf.overflow = true
     }
 }
 
@@ -113,19 +120,20 @@ out_f64 :: proc(buf: ^OutBuf, val: f64, decimals: int) {
 /* Segment Builder                                                            */
 /* -------------------------------------------------------------------------- */
 
-bg_to_fg :: proc(bg: string) -> string {
+bg_to_fg :: proc(buf: []u8, bg: string) -> string {
     // All BG strings are \x1b[48;2;R;G;Bm — byte[2] is '4'
     // FG equivalent is \x1b[38;2;R;G;Bm — just flip to '3'
     if len(bg) < 4 do return ""
+    if len(bg) > len(buf) do return ""
 
-    @(static) fg_buf: [64]u8
-    if len(bg) >= len(fg_buf) do return ""
-
-    copy(fg_buf[:], bg)
-    fg_buf[2] = '3'
-    return string(fg_buf[:len(bg)])
+    copy(buf, bg)
+    buf[2] = '3'
+    return string(buf[:len(bg)])
 }
 
+// Truncation is segment-boundary only: if any part of a segment would
+// overflow the buffer, the whole segment is rolled back and every later
+// segment is skipped — a partial escape sequence renders as garbage.
 segment :: proc(
     buf: ^OutBuf,
     bg: string,
@@ -133,6 +141,9 @@ segment :: proc(
     text: string,
     first: bool,
 ) {
+    if buf.overflow do return
+    saved_len := buf.len
+
     if !first && len(buf.prev_bg) > 0 {
         if buf.prev_bg == bg {
             out_str(buf, bg)
@@ -140,8 +151,9 @@ segment :: proc(
             out_str(buf, "|")
             out_str(buf, ANSI_RESET)
         } else {
+            fg_buf: [64]u8
             out_str(buf, bg)
-            out_str(buf, bg_to_fg(buf.prev_bg))
+            out_str(buf, bg_to_fg(fg_buf[:], buf.prev_bg))
             out_str(buf, SEP_ROUND)
             out_str(buf, ANSI_RESET)
         }
@@ -154,15 +166,21 @@ segment :: proc(
     out_char(buf, ' ')
     out_str(buf, ANSI_RESET)
 
+    if buf.overflow {
+        buf.len = saved_len
+        return
+    }
     buf.prev_bg = bg
 }
 
 segment_end :: proc(buf: ^OutBuf) {
-    if len(buf.prev_bg) > 0 {
-        out_str(buf, bg_to_fg(buf.prev_bg))
-        out_str(buf, SEP_ROUND)
-        out_str(buf, ANSI_RESET)
-    }
+    if buf.overflow || len(buf.prev_bg) == 0 do return
+    saved_len := buf.len
+    fg_buf: [64]u8
+    out_str(buf, bg_to_fg(fg_buf[:], buf.prev_bg))
+    out_str(buf, SEP_ROUND)
+    out_str(buf, ANSI_RESET)
+    if buf.overflow do buf.len = saved_len
 }
 
 /* -------------------------------------------------------------------------- */
@@ -625,9 +643,8 @@ format_countdown :: proc(buf: []u8, secs: i64) -> string {
 /* Path Abbreviation (with issue number preservation)                         */
 /* -------------------------------------------------------------------------- */
 
-abbrev_path :: proc(path: string) -> string {
-    @(static) result_buf: [256]u8
-    @(static) working_buf: [512]u8
+abbrev_path :: proc(result_buf: []u8, path: string) -> string {
+    working_buf: [512]u8
 
     home := string(posix.getenv("HOME"))
     buf: string
@@ -748,9 +765,7 @@ abbrev_path :: proc(path: string) -> string {
 /* Model Abbreviation                                                         */
 /* -------------------------------------------------------------------------- */
 
-abbreviate_model :: proc(model: string) -> string {
-    @(static) abbrev_buf: [32]u8
-
+abbreviate_model :: proc(abbrev_buf: []u8, model: string) -> string {
     Family :: struct {
         name:   string,
         abbrev: string,
@@ -838,12 +853,11 @@ pct_label_color :: proc(pct: i64) -> string {
 }
 
 make_context_bar :: proc(
+    bar_buf: []u8,
     pct: i64,
     ctx_size: i64,
     input_tokens: i64,
 ) -> string {
-    @(static) bar_buf: [512]u8
-
     clamped := min(pct, 100)
     WIDTH :: 10
     // Number of filled cells (rounded)
@@ -902,9 +916,7 @@ make_context_bar :: proc(
 /* Duration Formatting                                                        */
 /* -------------------------------------------------------------------------- */
 
-format_duration :: proc(ms: i64) -> string {
-    @(static) dur_buf: [32]u8
-
+format_duration :: proc(dur_buf: []u8, ms: i64) -> string {
     if ms < 1000 {
         return fmt.bprintf(dur_buf[:], "%dms", ms)
     } else if ms < 60000 {
@@ -967,9 +979,122 @@ GitStatus :: struct {
     cache_state: CacheState,
 }
 
-git_read_stash_count :: proc(dir: string) -> i64 {
+// Resolved git locations for a working directory.
+// gitdir holds the per-worktree files (HEAD, index); commondir holds the
+// shared ones (logs/refs/stash, objects). For a plain checkout the two are
+// the same directory. Getting them backwards shows the WRONG branch.
+GitPaths :: struct {
+    root:        string, // worktree top level (dir containing .git)
+    gitdir:      string, // per-worktree: HEAD, index live here
+    commondir:   string, // shared: logs/refs/stash lives here
+    is_worktree: bool,
+}
+
+GitPathsBuf :: struct {
+    root:      [512]u8,
+    gitdir:    [512]u8,
+    commondir: [512]u8,
+}
+
+// Read a small text file into buf, trimmed of trailing whitespace.
+read_small_file :: proc(path: string, buf: []u8) -> (string, bool) {
+    path_cstr := strings.clone_to_cstring(path, context.temp_allocator)
+    fd := posix.open(path_cstr, {})
+    if fd < 0 do return "", false
+    defer posix.close(fd)
+    n := posix.read(fd, raw_data(buf), len(buf) - 1)
+    if n <= 0 do return "", false
+    return strings.trim_right_space(string(buf[:n])), true
+}
+
+// Join base + "/" + rel into out (rel may be absolute, then it wins).
+join_path :: proc(out: []u8, base: string, rel: string) -> string {
+    if len(rel) > 0 && rel[0] == '/' {
+        n := min(len(rel), len(out))
+        copy(out, rel[:n])
+        return string(out[:n])
+    }
+    return fmt.bprintf(out, "%s/%s", base, rel)
+}
+
+// Walk upward from start until a .git entry is found (dir OR file), then
+// resolve gitdir/commondir. Pure syscalls, no fork. Caps at 40 levels.
+resolve_git_paths :: proc(
+    start: string,
+    bufs: ^GitPathsBuf,
+) -> (
+    gp: GitPaths,
+    ok: bool,
+) {
+    if len(start) == 0 || start[0] != '/' do return {}, false
+
+    // Current candidate root lives in bufs.root.
+    n := min(len(start), len(bufs.root) - 8)
+    copy(bufs.root[:], start[:n])
+    root_len := n
+
+    probe_buf: [560]u8
+    st: posix.stat_t
+    found := false
+    is_file := false
+
+    for _ in 0 ..< 40 {
+        root := string(bufs.root[:root_len])
+        probe := fmt.bprintf(probe_buf[:], "%s/.git", root)
+        probe_cstr := strings.clone_to_cstring(probe, context.temp_allocator)
+        if posix.stat(probe_cstr, &st) == .OK {
+            found = true
+            is_file = !posix.S_ISDIR(st.st_mode)
+            break
+        }
+        if root_len <= 1 do break // reached "/"
+        // Strip last path component.
+        for root_len > 1 && bufs.root[root_len - 1] != '/' do root_len -= 1
+        if root_len > 1 do root_len -= 1 // drop the '/'
+    }
+    if !found do return {}, false
+
+    gp.root = string(bufs.root[:root_len])
+
+    if !is_file {
+        // Plain checkout: gitdir == commondir == <root>/.git
+        gp.gitdir = fmt.bprintf(bufs.gitdir[:], "%s/.git", gp.root)
+        gp.commondir = fmt.bprintf(bufs.commondir[:], "%s/.git", gp.root)
+        gp.is_worktree = false
+        return gp, true
+    }
+
+    // Worktree: .git is a file "gitdir: <path>" (path may be relative).
+    gitfile_buf: [512]u8
+    gitfile_path := fmt.bprintf(probe_buf[:], "%s/.git", gp.root)
+    content, rok := read_small_file(gitfile_path, gitfile_buf[:])
+    if !rok do return {}, false
+    prefix :: "gitdir: "
+    if !strings.has_prefix(content, prefix) do return {}, false
+    gd := content[len(prefix):]
+    if nl := strings.index(gd, "\n"); nl >= 0 do gd = gd[:nl]
+    gd = strings.trim_right_space(gd)
+    gp.gitdir = join_path(bufs.gitdir[:], gp.root, gd)
+    gp.is_worktree = true
+
+    // <gitdir>/commondir names the shared dir (usually relative "../..").
+    cd_file_buf: [560]u8
+    cd_path := fmt.bprintf(cd_file_buf[:], "%s/commondir", gp.gitdir)
+    cd_content_buf: [512]u8
+    if cd, cok := read_small_file(cd_path, cd_content_buf[:]); cok {
+        gp.commondir = join_path(bufs.commondir[:], gp.gitdir, cd)
+    } else {
+        cn := min(len(gp.gitdir), len(bufs.commondir))
+        copy(bufs.commondir[:], gp.gitdir[:cn])
+        gp.commondir = string(bufs.commondir[:cn])
+    }
+    return gp, true
+}
+
+// Stash log lives in the SHARED dir (commondir), one line per stash entry.
+git_read_stash_count :: proc(commondir: string) -> i64 {
     stash_path := strings.concatenate(
-        {dir, "/.git/logs/refs/stash"},
+        {commondir, "/logs/refs/stash"},
         context.temp_allocator,
     )
     stash_cstr := strings.clone_to_cstring(
@@ -994,16 +1119,16 @@ git_read_stash_count :: proc(dir: string) -> i64 {
     return count
 }
 
+// HEAD is PER-WORKTREE, so it is read from gitdir, never commondir.
 git_read_branch_fast :: proc(
-    dir: string,
+    branch_buf: []u8,
+    gitdir: string,
 ) -> (
     branch: string,
     ok: bool,
 ) {
-    @(static) branch_buf: [128]u8
-
     head_path := strings.concatenate(
-        {dir, "/.git/HEAD"},
+        {gitdir, "/HEAD"},
         context.temp_allocator,
     )
     head_cstr := strings.clone_to_cstring(
@@ -1049,7 +1174,6 @@ CachedState :: struct #packed {
     lines_added:     i64,
     lines_removed:   i64,
     duration_ms:     i64,
-    last_update_sec: i64,
     input_tokens:    i64,
     cwd:             [256]u8,
     model:           [64]u8,
@@ -1098,11 +1222,10 @@ get_grandparent_pid :: proc() -> int {
     return result
 }
 
-get_cache_path :: proc() -> string {
-    @(static) path_buf: [64]u8
+get_cache_path :: proc(path_buf: []u8) -> string {
     gppid := get_grandparent_pid()
     return fmt.bprintf(
-        path_buf[:],
+        path_buf,
         "%s%d",
         CACHE_PATH_PREFIX,
         gppid,
@@ -1110,7 +1233,8 @@ get_cache_path :: proc() -> string {
 }
 
 read_cached_state :: proc() -> CachedState {
-    cache_path := get_cache_path()
+    cache_path_buf: [64]u8
+    cache_path := get_cache_path(cache_path_buf[:])
     cache_cstr := strings.clone_to_cstring(
         cache_path,
         context.temp_allocator,
@@ -1118,6 +1242,13 @@ read_cached_state :: proc() -> CachedState {
     fd := posix.open(cache_cstr, {})
     if fd < 0 do return {}
     defer posix.close(fd)
+
+    // Reject files whose size doesn't match exactly — a SHRUNKEN struct
+    // would otherwise read cleanly from a stale larger file and interpret
+    // shifted bytes as plausible values.
+    st: posix.stat_t
+    if posix.fstat(fd, &st) != .OK do return {}
+    if i64(st.st_size) != size_of(CachedState) do return {}
 
     state: CachedState
     buf := transmute([^]u8)&state
@@ -1127,7 +1258,8 @@ read_cached_state :: proc() -> CachedState {
 }
 
 write_cached_state :: proc(state: CachedState) {
-    cache_path := get_cache_path()
+    cache_path_buf: [64]u8
+    cache_path := get_cache_path(cache_path_buf[:])
     cache_cstr := strings.clone_to_cstring(
         cache_path,
         context.temp_allocator,
@@ -1281,11 +1413,10 @@ hash_path :: proc(path: string) -> u32 {
     return h
 }
 
-get_git_cache_path :: proc(repo_path: string) -> string {
-    @(static) path_buf: [64]u8
+get_git_cache_path :: proc(path_buf: []u8, repo_path: string) -> string {
     h := hash_path(repo_path)
     return fmt.bprintf(
-        path_buf[:],
+        path_buf,
         "/dev/shm/claude-git-%08x",
         h,
     )
@@ -1314,11 +1445,13 @@ CacheState :: enum {
 
 read_git_cache :: proc(
     repo_path: string,
+    gitdir: string,
 ) -> (
     cache: GitCache,
     state: CacheState,
 ) {
-    cache_path := get_git_cache_path(repo_path)
+    cache_path_buf: [64]u8
+    cache_path := get_git_cache_path(cache_path_buf[:], repo_path)
     cache_cstr := strings.clone_to_cstring(
         cache_path,
         context.temp_allocator,
@@ -1346,8 +1479,9 @@ read_git_cache :: proc(
         return cache, .STALE
     }
 
+    // index is PER-WORKTREE — stat it in gitdir, not <root>/.git.
     index_path := strings.concatenate(
-        {repo_path, "/.git/index"},
+        {gitdir, "/index"},
         context.temp_allocator,
     )
     index_cstr := strings.clone_to_cstring(
@@ -1371,13 +1505,14 @@ read_git_cache :: proc(
 
 write_git_cache :: proc(
     repo_path: string,
+    gitdir: string,
     modified: u32,
     staged: u32,
     ahead: u32,
     behind: u32,
 ) {
     index_path := strings.concatenate(
-        {repo_path, "/.git/index"},
+        {gitdir, "/index"},
         context.temp_allocator,
     )
     index_cstr := strings.clone_to_cstring(
@@ -1396,7 +1531,8 @@ write_git_cache :: proc(
     cache.behind = behind
     copy(cache.repo_path[:], repo_path)
 
-    cache_path := get_git_cache_path(repo_path)
+    cache_path_buf: [64]u8
+    cache_path := get_git_cache_path(cache_path_buf[:], repo_path)
     cache_cstr := strings.clone_to_cstring(
         cache_path,
         context.temp_allocator,
@@ -1547,6 +1683,7 @@ run_git_status :: proc(
 
 get_git_status_cached :: proc(
     repo_path: string,
+    gitdir: string,
 ) -> (
     modified: u32,
     staged: u32,
@@ -1554,7 +1691,7 @@ get_git_status_cached :: proc(
     behind: u32,
     state: CacheState,
 ) {
-    cache, cache_state := read_git_cache(repo_path)
+    cache, cache_state := read_git_cache(repo_path, gitdir)
 
     switch cache_state {
     case .VALID:
@@ -1565,7 +1702,7 @@ get_git_status_cached :: proc(
         if bg_pid == 0 {
             if posix.fork() == 0 {
                 m, s, a, b := run_git_status(repo_path)
-                write_git_cache(repo_path, m, s, a, b)
+                write_git_cache(repo_path, gitdir, m, s, a, b)
             }
             posix._exit(0)
         }
@@ -1579,6 +1716,7 @@ get_git_status_cached :: proc(
             run_git_status(repo_path)
         write_git_cache(
             repo_path,
+            gitdir,
             modified,
             staged,
             ahead,
@@ -1598,26 +1736,64 @@ USAGE_CACHE_TTL_S :: 60
 USAGE_CACHE_PREFIX :: "/dev/shm/statusline-usage."
 
 UsageCache :: struct #packed {
-    fetch_time_sec:     i64,
-    five_hour_pct:      f64,
-    seven_day_pct:      f64,
-    seven_day_opus_pct: f64,
-    five_hour_reset:    i64,  // epoch sec, 0 if unknown
-    seven_day_reset:    i64,
-    opus_reset:         i64,
+    fetch_time_sec:       i64,
+    five_hour_pct:        f64,
+    seven_day_pct:        f64,
+    seven_day_opus_pct:   f64,
+    five_hour_reset:      i64,  // epoch sec, 0 if unknown
+    seven_day_reset:      i64,
+    opus_reset:           i64,
+    last_attempt_sec:     i64,  // when a fetch was last STARTED
+    consecutive_failures: i64,  // doubles the retry backoff, 60s..15m
 }
 
-get_usage_cache_path :: proc(gppid: int) -> string {
-    @(static) path_buf: [64]u8
+// Failed fetches also write the cache (data preserved, failure counter
+// bumped) so the backoff below is observable and curl is not forked on
+// every render while the OAuth endpoint is down (Bug 3).
+usage_backoff_s :: proc(failures: i64) -> i64 {
+    b: i64 = USAGE_CACHE_TTL_S
+    for _ in 0 ..< min(failures, 4) do b *= 2
+    return min(b, 900)
+}
+
+write_usage_cache :: proc(gppid: int, cache: UsageCache) {
+    path_buf: [64]u8
+    cache_path := get_usage_cache_path(path_buf[:], gppid)
+    cache_cstr := strings.clone_to_cstring(
+        cache_path,
+        context.temp_allocator,
+    )
+    fd := posix.open(
+        cache_cstr,
+        {.WRONLY, .CREAT, .TRUNC},
+        {.IRUSR, .IWUSR},
+    )
+    if fd < 0 do return
+    defer posix.close(fd)
+    c := cache
+    posix.write(fd, transmute([^]u8)&c, size_of(UsageCache))
+}
+
+get_usage_cache_path :: proc(path_buf: []u8, gppid: int) -> string {
     return fmt.bprintf(
-        path_buf[:],
+        path_buf,
         "%s%d",
         USAGE_CACHE_PREFIX,
         gppid,
     )
 }
 
-refresh_usage_cache :: proc(gppid: int) {
+// Write prev back with the failure counter bumped, then exit. Called from
+// the grandchild on any failure so the backoff timestamp always lands.
+usage_fail_exit :: proc(gppid: int, prev: UsageCache, now: i64) -> ! {
+    c := prev
+    c.last_attempt_sec = now
+    c.consecutive_failures += 1
+    write_usage_cache(gppid, c)
+    posix._exit(1)
+}
+
+refresh_usage_cache :: proc(gppid: int, prev: UsageCache) {
     first_fork := posix.fork()
     if first_fork < 0 do return
     if first_fork > 0 {
@@ -1634,8 +1810,9 @@ refresh_usage_cache :: proc(gppid: int) {
     }
 
     // Grandchild: read credentials, curl, parse, write
+    attempt_sec := current_time_sec()
     home := string(posix.getenv("HOME"))
-    if len(home) == 0 do posix._exit(1)
+    if len(home) == 0 do usage_fail_exit(gppid, prev, attempt_sec)
 
     cred_path_buf: [512]u8
     cred_path := fmt.bprintf(
@@ -1649,7 +1826,7 @@ refresh_usage_cache :: proc(gppid: int) {
     )
 
     cred_fd := posix.open(cred_cstr, {})
-    if cred_fd < 0 do posix._exit(1)
+    if cred_fd < 0 do usage_fail_exit(gppid, prev, attempt_sec)
 
     cred_buf: [4096]u8
     cred_len := posix.read(
@@ -1658,7 +1835,7 @@ refresh_usage_cache :: proc(gppid: int) {
         len(cred_buf) - 1,
     )
     posix.close(cred_fd)
-    if cred_len <= 0 do posix._exit(1)
+    if cred_len <= 0 do usage_fail_exit(gppid, prev, attempt_sec)
 
     cred_json := string(cred_buf[:cred_len])
 
@@ -1667,15 +1844,15 @@ refresh_usage_cache :: proc(gppid: int) {
         cred_json,
         "\"claudeAiOauth\"",
     )
-    if oauth_idx < 0 do posix._exit(1)
+    if oauth_idx < 0 do usage_fail_exit(gppid, prev, attempt_sec)
 
     oauth_rest := cred_json[oauth_idx:]
     brace_idx := strings.index(oauth_rest, "{")
-    if brace_idx < 0 do posix._exit(1)
+    if brace_idx < 0 do usage_fail_exit(gppid, prev, attempt_sec)
 
     oauth_obj := oauth_rest[brace_idx:]
     token := json_get_string(oauth_obj, "accessToken")
-    if len(token) == 0 do posix._exit(1)
+    if len(token) == 0 do usage_fail_exit(gppid, prev, attempt_sec)
 
     // Build Authorization header
     auth_buf: [2048]u8
@@ -1691,10 +1868,10 @@ refresh_usage_cache :: proc(gppid: int) {
 
     // Fork/exec curl
     pipe_fds: [2]posix.FD
-    if posix.pipe(&pipe_fds) != .OK do posix._exit(1)
+    if posix.pipe(&pipe_fds) != .OK do usage_fail_exit(gppid, prev, attempt_sec)
 
     curl_pid := posix.fork()
-    if curl_pid < 0 do posix._exit(1)
+    if curl_pid < 0 do usage_fail_exit(gppid, prev, attempt_sec)
 
     if curl_pid == 0 {
         posix.close(pipe_fds[0])
@@ -1758,7 +1935,12 @@ refresh_usage_cache :: proc(gppid: int) {
         json_find_object_str(response, "seven_day_opus", "resets_at"),
     )
 
-    // Write cache
+    // No usable data at all -> count as a failure so backoff kicks in.
+    if five_reset == 0 && seven_reset == 0 {
+        usage_fail_exit(gppid, prev, attempt_sec)
+    }
+
+    // Write cache (success resets the failure counter)
     cache: UsageCache
     cache.fetch_time_sec = current_time_sec()
     cache.five_hour_pct = five_pct
@@ -1767,40 +1949,24 @@ refresh_usage_cache :: proc(gppid: int) {
     cache.five_hour_reset = five_reset
     cache.seven_day_reset = seven_reset
     cache.opus_reset = opus_reset
-
-    cache_path := get_usage_cache_path(gppid)
-    cache_cstr := strings.clone_to_cstring(
-        cache_path,
-        context.temp_allocator,
-    )
-
-    cache_fd := posix.open(
-        cache_cstr,
-        {.WRONLY, .CREAT, .TRUNC},
-        {.IRUSR, .IWUSR},
-    )
-    if cache_fd >= 0 {
-        c := cache
-        posix.write(
-            cache_fd,
-            transmute([^]u8)&c,
-            size_of(UsageCache),
-        )
-        posix.close(cache_fd)
-    }
+    cache.last_attempt_sec = attempt_sec
+    cache.consecutive_failures = 0
+    write_usage_cache(gppid, cache)
     posix._exit(0)
 }
 
 read_usage_cache :: proc(gppid: int) -> UsageCache {
-    cache_path := get_usage_cache_path(gppid)
+    path_buf: [64]u8
+    cache_path := get_usage_cache_path(path_buf[:], gppid)
     cache_cstr := strings.clone_to_cstring(
         cache_path,
         context.temp_allocator,
     )
 
+    now := current_time_sec()
     fd := posix.open(cache_cstr, {})
     if fd < 0 {
-        refresh_usage_cache(gppid)
+        refresh_usage_cache(gppid, {})
         return {}
     }
 
@@ -1813,14 +1979,17 @@ read_usage_cache :: proc(gppid: int) -> UsageCache {
     posix.close(fd)
 
     if n != size_of(UsageCache) {
-        refresh_usage_cache(gppid)
+        refresh_usage_cache(gppid, {})
         return {}
     }
 
-    // Check TTL
-    now := current_time_sec()
+    // Refresh on TTL expiry, but back off while fetches keep failing —
+    // otherwise a broken OAuth endpoint forks curl on EVERY render.
     if now - cache.fetch_time_sec > USAGE_CACHE_TTL_S {
-        refresh_usage_cache(gppid)
+        backoff := usage_backoff_s(cache.consecutive_failures)
+        if now - cache.last_attempt_sec >= backoff {
+            refresh_usage_cache(gppid, cache)
+        }
     }
 
     return cache
@@ -1831,10 +2000,10 @@ read_usage_cache :: proc(gppid: int) -> UsageCache {
 /* -------------------------------------------------------------------------- */
 
 truncate_branch :: proc(
+    trunc_buf: []u8,
     branch: string,
     max_len: int,
 ) -> string {
-    @(static) trunc_buf: [64]u8
     if len(branch) <= max_len {
         return branch
     }
@@ -1850,7 +2019,8 @@ build_git_segment :: proc(
     if !gs.valid do return
 
     text_buf: [256]u8
-    text := fmt.bprintf(text_buf[:], "%s %s", ICON_BRANCH, truncate_branch(gs.branch, 20))
+    trunc_buf: [64]u8
+    text := fmt.bprintf(text_buf[:], "%s %s", ICON_BRANCH, truncate_branch(trunc_buf[:], gs.branch, 20))
 
     bg := gs.modified > 0 || gs.staged > 0 ? ANSI_BG_ORANGE : ANSI_BG_GREEN
     segment(buf, bg, ANSI_FG_BLACK, text, false)
@@ -1897,7 +2067,6 @@ DisplayState :: struct {
     total_duration_ms:  i64,
     used_pct:           i64,
     ctx_size:           i64,
-    last_update_sec:    i64,
     input_tokens:       i64,
     five_hour_pct:      f64,
     seven_day_pct:      f64,
@@ -2001,7 +2170,6 @@ resolve_state :: proc(
         }
         state.input_tokens       = json_in_tok > 0 ? json_in_tok : cached.input_tokens
         state.exceeds_200k       = f.exceeds_200k
-        state.last_update_sec    = current_time_sec()
 
         // Update cache
         new_cache: CachedState
@@ -2028,8 +2196,6 @@ resolve_state :: proc(
         // context_window object can be null until the next API response).
         new_cache.input_tokens =
             json_in_tok > 0 ? json_in_tok : cached.input_tokens
-        new_cache.last_update_sec =
-            state.last_update_sec
         if len(json_cwd) > 0 {
             copy(
                 new_cache.cwd[:len(new_cache.cwd) - 1],
@@ -2058,7 +2224,6 @@ resolve_state :: proc(
         state.used_pct          = cached.used_pct
         state.ctx_size          = cached.context_size
         state.input_tokens      = cached.input_tokens
-        state.last_update_sec   = cached.last_update_sec
     }
 
     return state
@@ -2067,29 +2232,6 @@ resolve_state :: proc(
 /* -------------------------------------------------------------------------- */
 /* Time Formatting                                                            */
 /* -------------------------------------------------------------------------- */
-
-format_time_12h :: proc(epoch_sec: i64) -> string {
-    @(static) time_buf: [16]u8
-
-    // Convert epoch to local time via localtime_r
-    // We use posix tm struct
-    t := posix.time_t(epoch_sec)
-    local: posix.tm
-    posix.localtime_r(&t, &local)
-
-    hour := int(local.tm_hour) % 12
-    if hour == 0 do hour = 12
-    ampm := int(local.tm_hour) < 12 ? " AM" : " PM"
-
-    return fmt.bprintf(
-        time_buf[:],
-        "%d:%02d:%02d%s",
-        hour,
-        int(local.tm_min),
-        int(local.tm_sec),
-        ampm,
-    )
-}
 
 usage_color :: proc(pct: f64) -> string {
     if pct >= 90 do return ANSI_FG_RED
@@ -2145,15 +2287,16 @@ build_statusline :: proc(
     // Model (abbreviated, bold). A brain glyph trails the name when extended
     // thinking is enabled for the session (thinking.enabled in stdin JSON).
     model_buf: [128]u8
+    model_abbrev_buf: [32]u8
+    model_abbrev := abbreviate_model(model_abbrev_buf[:], state.model)
     model_text: string
     if state.thinking_enabled {
         model_text = fmt.bprintf(
-            model_buf[:], "%s%s %s", ANSI_BOLD,
-            abbreviate_model(state.model), ICON_BRAIN,
+            model_buf[:], "%s%s %s", ANSI_BOLD, model_abbrev, ICON_BRAIN,
         )
     } else {
         model_text = fmt.bprintf(
-            model_buf[:], "%s%s", ANSI_BOLD, abbreviate_model(state.model),
+            model_buf[:], "%s%s", ANSI_BOLD, model_abbrev,
         )
     }
     segment(buf, ANSI_BG_PURPLE, ANSI_FG_BLACK, model_text, first)
@@ -2161,7 +2304,8 @@ build_statusline :: proc(
 
     // Path
     path_buf: [300]u8
-    path_text := fmt.bprintf(path_buf[:], "%s %s", ICON_FOLDER, abbrev_path(state.cwd))
+    abbrev_buf: [256]u8
+    path_text := fmt.bprintf(path_buf[:], "%s %s", ICON_FOLDER, abbrev_path(abbrev_buf[:], state.cwd))
     segment(buf, ANSI_BG_DARK, ANSI_FG_WHITE, path_text, false)
 
     // Git
@@ -2235,13 +2379,9 @@ build_statusline :: proc(
     if state.total_duration_ms > 0 {
         dur_buf: [512]u8
         pos := 0
-        s := fmt.bprintf(dur_buf[:], "%s%s %s", ANSI_FG_WHITE, ICON_CLOCK, format_duration(state.total_duration_ms))
+        fdur_buf: [32]u8
+        s := fmt.bprintf(dur_buf[:], "%s%s %s", ANSI_FG_WHITE, ICON_CLOCK, format_duration(fdur_buf[:], state.total_duration_ms))
         pos += len(s)
-
-        if state.last_update_sec > 0 {
-            s3 := fmt.bprintf(dur_buf[pos:], " %s| %s%s %s", ANSI_FG_COMMENT, ANSI_FG_WHITE, ICON_SYNC, format_time_12h(state.last_update_sec))
-            pos += len(s3)
-        }
 
         s5 := fmt.bprintf(dur_buf[pos:], " %s| ", ANSI_FG_COMMENT)
         pos += len(s5)
@@ -2249,7 +2389,8 @@ build_statusline :: proc(
         // total_input_tokens is the real current context occupancy (input +
         // cache read/write) as of Claude Code v2.1.132+, so show it exactly
         // rather than deriving a coarse count from the integer percentage.
-        bar := make_context_bar(state.used_pct, state.ctx_size, state.input_tokens)
+        bar_storage: [512]u8
+        bar := make_context_bar(bar_storage[:], state.used_pct, state.ctx_size, state.input_tokens)
         copy(dur_buf[pos:], bar)
         pos += len(bar)
 
@@ -2528,16 +2669,22 @@ main :: proc() {
     state.seven_day_opus_pct = usage.seven_day_opus_pct
     state.opus_reset = usage.opus_reset
 
-    // Git status
+    // Git status. Resolve the repo root by upward walk so worktrees
+    // (.git is a file) and subdirectories both work. Cache is keyed on the
+    // resolved root, so every subdir of a repo shares one entry.
     gs: GitStatus
+    git_bufs: GitPathsBuf
+    branch_buf: [128]u8
     if len(state.cwd) > 0 {
-        if branch, ok := git_read_branch_fast(state.cwd);
-            ok {
-            gs.valid = true
-            gs.branch = branch
-            gs.stashes = git_read_stash_count(state.cwd)
-            gs.modified, gs.staged, gs.ahead, gs.behind, gs.cache_state =
-                get_git_status_cached(state.cwd)
+        if gp, gok := resolve_git_paths(state.cwd, &git_bufs); gok {
+            if branch, ok := git_read_branch_fast(branch_buf[:], gp.gitdir);
+                ok {
+                gs.valid = true
+                gs.branch = branch
+                gs.stashes = git_read_stash_count(gp.commondir)
+                gs.modified, gs.staged, gs.ahead, gs.behind, gs.cache_state =
+                    get_git_status_cached(gp.root, gp.gitdir)
+            }
         }
     }
     if debug do timings.t_git = time.tick_now()
