@@ -2557,10 +2557,35 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
         five := i64(state.five_hour_pct + 0.5)
         seven := i64(state.seven_day_pct + 0.5)
         base := fmt.tprintf("%s5h %s%s%d%%", ANSI_FG_WHITE, ANSI_BOLD, c5, five)
+
+        // Projection: where the 5h window lands at the current pace. Window
+        // start is derivable (resets_at - 5h), no new input needed. Colored
+        // off the PROJECTION, not the level — it turns orange while there is
+        // still time to act. Suppressed below 10% elapsed (30s into a window
+        // one message projects to 400%). 5h only; 7d moves too slowly.
+        rich := base
+        if state.five_hour_reset > 0 {
+            now_p := current_time_sec()
+            start := state.five_hour_reset - 18000
+            elapsed_frac := f64(now_p - start) / 18000.0
+            if elapsed_frac >= 0.10 && elapsed_frac <= 1.0 {
+                proj := state.five_hour_pct / elapsed_frac
+                pc := rate_limit_color(proj)
+                v: string
+                if proj > 100 {
+                    v = ">100"
+                } else {
+                    v = fmt.tprintf("%d", i64(proj + 0.5))
+                }
+                rich = fmt.tprintf("%s%s→%s%s%s%%", base, ANSI_FG_DARK,
+                    pc, ANSI_BOLD, v)
+            }
+        }
+        n_5h := rich == base ? 1 : 2
         add_seg(l, Seg{
             name = "5h", bg = ANSI_BG_COMMENT, fg = "",
-            stages = {base, base, ""},
-            n_stages = 1, priority = 90, droppable = false,
+            stages = {rich, base, ""},
+            n_stages = n_5h, priority = 90, droppable = false,
         })
         add_seg(l, seg1("7d", ANSI_BG_COMMENT, "",
             fmt.tprintf("%s7d %s%s%d%%", ANSI_FG_WHITE, ANSI_BOLD, c5, seven),
