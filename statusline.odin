@@ -769,24 +769,28 @@ abbrev_path :: proc(result_buf: []u8, path: string) -> string {
 /* Model Abbreviation                                                         */
 /* -------------------------------------------------------------------------- */
 
+// "Opus 5 (1M context)" -> "Op5", "Sonnet 5" -> "Sonn5", "Haiku 4.5" -> "Haik4.5".
+//
+// The previous version required a digit.digit version and so silently stopped
+// abbreviating the moment models were named "Opus 5" instead of "Opus 4.6" —
+// it fell through to copy-as-is and spent 19 cells on "Opus 5 (1M context)".
+// Now a bare major version matches, and any trailing parenthetical is dropped.
 abbreviate_model :: proc(abbrev_buf: []u8, model: string) -> string {
     Family :: struct {
         name:   string,
         abbrev: string,
     }
-    families := [3]Family{
+    families := [4]Family{
         {"Opus", "Op"},
-        {"Sonnet", "So"},
-        {"Haiku", "Ha"},
+        {"Sonnet", "Sonn"},
+        {"Haiku", "Haik"},
+        {"Fable", "Fabl"},
     }
 
-    // Find version number (digit.digit)
+    // First digit run, with optional .minor — accepts "5" as well as "4.5".
     version_start := -1
-    for i in 0 ..< len(model) - 2 {
-        if model[i] >= '0' && model[i] <= '9' &&
-            model[i + 1] == '.' &&
-            model[i + 2] >= '0' &&
-            model[i + 2] <= '9' {
+    for i in 0 ..< len(model) {
+        if model[i] >= '0' && model[i] <= '9' {
             version_start = i
             break
         }
@@ -805,9 +809,8 @@ abbreviate_model :: proc(abbrev_buf: []u8, model: string) -> string {
         pos := 0
         copy(abbrev_buf[:], abbrev)
         pos = len(abbrev)
-        // Copy version digits and dots
         i := version_start
-        for i < len(model) &&
+        for i < len(model) && pos < len(abbrev_buf) &&
             ((model[i] >= '0' && model[i] <= '9') ||
                     model[i] == '.') {
             abbrev_buf[pos] = model[i]
@@ -2737,14 +2740,81 @@ render_line :: proc(buf: ^OutBuf, l: ^SegList) {
     segment_end(buf)
 }
 
-// COLUMNS env var; fallback 120 when unset/unparseable — degrade as if
-// narrow rather than assume wide and let Claude Code truncate arbitrarily.
+/* -------------------------------------------------------------------------- */
+/* Terminal width                                                             */
+/* -------------------------------------------------------------------------- */
+
+// core:sys/posix exposes neither ioctl nor winsize, so bind them directly.
+Winsize :: struct {
+    ws_row:    u16,
+    ws_col:    u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+TIOCGWINSZ :: 0x5413  // Linux
+
+foreign import libc "system:c"
+foreign libc {
+    // Explicit rawptr, NOT `#c_vararg ..any`: an Odin `any` is a 16-byte fat
+    // pointer (data + typeid), so a variadic binding passes two words where C
+    // expects one and the ioctl silently reads garbage as its argument.
+    ioctl :: proc(fd: posix.FD, request: uint, arg: rawptr) -> i32 ---
+}
+
+// Measure the terminal width from the kernel, for when COLUMNS is missing.
+//
+// Our own fds are useless: stdout and stdin are pipes (Claude Code captures
+// them) and stderr is captured too — all three return ENOTTY, verified by
+// probing the real statusline. /dev/tty is equally useless: Claude Code setsids,
+// so there is no controlling terminal (tty_nr=0) and the open fails with ENXIO.
+//
+// What does work is going through the Claude Code process itself. Its fds still
+// point at the real pty, so resolve /proc/<pid>/fd/N to a /dev/pts/* path, open
+// that, and ioctl it. Verified against a live session: returns 196, matching
+// COLUMNS=196 exactly.
+//
+// Read-only is the empty flag set in Odin's posix (there is no RDONLY).
+// NOCTTY because we must never acquire the pty as a controlling terminal as a
+// side effect of measuring it. Returns 0 when the width cannot be determined.
+ioctl_columns :: proc() -> int {
+    ws: Winsize
+    pid := get_grandparent_pid()
+
+    link_buf: [256]u8
+    path_buf: [64]u8
+    for fd in ([]int{1, 2, 0}) {
+        p := fmt.bprintf(path_buf[:], "/proc/%d/fd/%d", pid, fd)
+        p_cstr := strings.clone_to_cstring(p, context.temp_allocator)
+        n := posix.readlink(p_cstr, raw_data(&link_buf), len(link_buf) - 1)
+        if n <= 0 do continue
+        target := string(link_buf[:n])
+        // Only pty paths are worth opening; a socket or file cannot answer, and
+        // opening an arbitrary target for its side effects would be reckless.
+        if !strings.has_prefix(target, "/dev/pts/") do continue
+
+        t_cstr := strings.clone_to_cstring(target, context.temp_allocator)
+        tfd := posix.open(t_cstr, {.NOCTTY})
+        if tfd < 0 do continue
+        ok := ioctl(tfd, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0
+        posix.close(tfd)
+        if ok do return int(ws.ws_col)
+    }
+    return 0
+}
+
+// Width resolution, most trustworthy first: COLUMNS (what Claude Code itself
+// sets and therefore what it measures against), then a live kernel query, then
+// 120 — degrade as if narrow rather than assume wide and let Claude Code
+// truncate arbitrarily.
 get_columns :: proc() -> int {
     cols_c := posix.getenv("COLUMNS")
-    if cols_c == nil do return 120
-    v, ok := strconv.parse_int(string(cols_c))
-    if !ok || v <= 0 do return 120
-    return v
+    if cols_c != nil {
+        if v, ok := strconv.parse_int(string(cols_c)); ok && v > 0 {
+            return v
+        }
+    }
+    if v := ioctl_columns(); v > 0 do return v
+    return 120
 }
 
 // ---- line 1: identity
@@ -2789,15 +2859,19 @@ build_line1 :: proc(l: ^SegList, state: ^DisplayState, gs: ^GitStatus, pr: ^PrSt
         }
     }
 
-    // Model: full display name, shrinks to abbreviated form
+    // Model: ALWAYS abbreviated. The full display name was never worth 19 cells
+    // ("Opus 5 (1M context)") when the model is the one thing you already know —
+    // so the abbreviation is now the primary form, not a shrink stage. The brain
+    // glyph still trails it when extended thinking is on.
     short_buf: [32]u8
-    short := abbreviate_model(short_buf[:], state.model)
+    short := strings.clone(
+        abbreviate_model(short_buf[:], state.model), context.temp_allocator)
     brain := state.thinking_enabled ? fmt.tprintf(" %s", ICON_BRAIN) : ""
     add_seg(l, Seg{
         name = "model", bg = ANSI_BG_PURPLE, fg = ANSI_FG_BLACK,
         stages = {
-            fmt.tprintf("%s%s%s", ANSI_BOLD, state.model, brain),
-            fmt.tprintf("%s%s%s", ANSI_BOLD, strings.clone(short, context.temp_allocator), brain),
+            fmt.tprintf("%s%s%s", ANSI_BOLD, short, brain),
+            fmt.tprintf("%s%s", ANSI_BOLD, short),  // drop the brain glyph
             "",
         },
         n_stages = 2, priority = 95, droppable = false,
@@ -2936,13 +3010,47 @@ build_line1 :: proc(l: ^SegList, state: ^DisplayState, gs: ^GitStatus, pr: ^PrSt
 
 // ---- line 2: budget
 
+// Left-pad with SPACES to a fixed field width. Odin's "%3d" zero-pads ("005%"),
+// which is uglier than the sliding it was meant to cure -- so pad explicitly.
+// Fixed-width fields matter here because the budget group is right-aligned:
+// any field that changes width shifts everything to its LEFT.
+padl :: proc(v: string, width: int) -> string {
+    if len(v) >= width do return v
+    b := make([]u8, width, context.temp_allocator)
+    pad := width - len(v)
+    for i in 0 ..< pad do b[i] = ' '
+    copy(b[pad:], v)
+    return string(b)
+}
+
 build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
+    // Context bar FIRST. This group is right-aligned, so segment order
+    // runs right-to-left visually from the screen edge -- emitting ctx
+    // first puts it at the group's far LEFT, furthest from the edge.
+    // Context bar: 10-cell -> 5-cell -> bare percentage
+    bar10_buf: [512]u8
+    bar5_buf: [512]u8
+    bar10 := make_context_bar(bar10_buf[:], state.used_pct, state.ctx_size,
+        state.input_tokens, 10)
+    bar5 := make_context_bar(bar5_buf[:], state.used_pct, state.ctx_size,
+        state.input_tokens, 5)
+    add_seg(l, Seg{
+        name = "ctx", bg = ANSI_BG_DARK, fg = "",
+        stages = {
+            strings.clone(bar10, context.temp_allocator),
+            strings.clone(bar5, context.temp_allocator),
+            fmt.tprintf("%s%s%%", pct_label_color(min(state.used_pct, 100)),
+                padl(fmt.tprintf("%d", min(state.used_pct, 100)), 3)),
+        },
+        n_stages = 3, priority = 100, droppable = false,
+    })
+
     if state.five_hour_reset > 0 || state.seven_day_reset > 0 {
         // 5h and 7d share one color, driven by whichever window is hotter
         c5 := rate_limit_color(max(state.five_hour_pct, state.seven_day_pct))
         five := i64(state.five_hour_pct + 0.5)
         seven := i64(state.seven_day_pct + 0.5)
-        base := fmt.tprintf("%s5h %s%s%d%%", ANSI_FG_WHITE, ANSI_BOLD, c5, five)
+        base := fmt.tprintf("%s5h %s%s%s%%", ANSI_FG_WHITE, ANSI_BOLD, c5, padl(fmt.tprintf("%d", five), 3))
 
         // Projection: where the 5h window lands at the current pace. Window
         // start is derivable (resets_at - 5h), no new input needed. Colored
@@ -2964,7 +3072,7 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
                 if proj > 999 {
                     v = ">999"
                 } else {
-                    v = fmt.tprintf("%d", i64(proj + 0.5))
+                    v = padl(fmt.tprintf("%d", i64(proj + 0.5)), 3)
                 }
                 rich = fmt.tprintf("%s%s→%s%s%s%%", base, ANSI_FG_DARK,
                     pc, ANSI_BOLD, v)
@@ -2977,7 +3085,7 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
             n_stages = n_5h, priority = 90, droppable = false,
         })
         add_seg(l, seg1("7d", ANSI_BG_COMMENT, "",
-            fmt.tprintf("%s7d %s%s%d%%", ANSI_FG_WHITE, ANSI_BOLD, c5, seven),
+            fmt.tprintf("%s7d %s%s%s%%", ANSI_FG_WHITE, ANSI_BOLD, c5, padl(fmt.tprintf("%d", seven), 3)),
             50))
 
         // Opus weekly cap (Max plans) — only when it's meaningful
@@ -3018,31 +3126,13 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
             10))
     }
 
-    // Context bar: 10-cell -> 5-cell -> bare percentage
-    bar10_buf: [512]u8
-    bar5_buf: [512]u8
-    bar10 := make_context_bar(bar10_buf[:], state.used_pct, state.ctx_size,
-        state.input_tokens, 10)
-    bar5 := make_context_bar(bar5_buf[:], state.used_pct, state.ctx_size,
-        state.input_tokens, 5)
-    add_seg(l, Seg{
-        name = "ctx", bg = ANSI_BG_DARK, fg = "",
-        stages = {
-            strings.clone(bar10, context.temp_allocator),
-            strings.clone(bar5, context.temp_allocator),
-            fmt.tprintf("%s%d%%", pct_label_color(min(state.used_pct, 100)),
-                min(state.used_pct, 100)),
-        },
-        n_stages = 3, priority = 100, droppable = false,
-    })
-
     // Burn rate + time-to-compact (until input hits 80% of the window)
     if state.burn_ok && state.burn_per_min > 0 {
         rate: string
         if state.burn_per_min >= 1000 {
-            rate = fmt.tprintf("%.1fk/m", state.burn_per_min / 1000.0)
+            rate = padl(fmt.tprintf("%.1fk/m", state.burn_per_min / 1000.0), 7)
         } else {
-            rate = fmt.tprintf("%.0f/m", state.burn_per_min)
+            rate = padl(fmt.tprintf("%.0f/m", state.burn_per_min), 7)
         }
         ttc_buf: [16]u8
         ttc := format_countdown(ttc_buf[:], max(state.ttc_sec, 60))
@@ -3080,6 +3170,68 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
     }
 }
 
+// Width of a SegList once rendered, without committing it to the output.
+measure_line :: proc(l: ^SegList) -> int {
+    tmp: OutBuf
+    render_line(&tmp, l)
+    return display_width(string(tmp.data[:tmp.len]))
+}
+
+// Shrink two groups against ONE shared budget, always sacrificing the
+// lowest-priority available action across both. Without this the groups would
+// each fit `cols` individually and still overflow when placed on one line.
+fit_pair :: proc(a: ^SegList, b: ^SegList, budget: int) {
+    for _ in 0 ..< 64 {
+        if measure_line(a) + measure_line(b) <= budget do return
+        // Ask each group for its cheapest single step, take the cheaper one.
+        pa := lowest_action_priority(a)
+        pb := lowest_action_priority(b)
+        if pa < 0 && pb < 0 do return
+        target := (pb < 0) || (pa >= 0 && pa <= pb) ? a : b
+        step_once(target)
+    }
+}
+
+// Priority of the next action this group would take, or -1 if it has none.
+lowest_action_priority :: proc(l: ^SegList) -> int {
+    best := -1
+    for i in 0 ..< l.n {
+        s := &l.segs[i]
+        if s.dropped do continue
+        has_shrink := s.stage < s.n_stages - 1
+        if !has_shrink && !s.droppable do continue
+        // A drop is a bigger loss than a shrink, so rank it later.
+        p := has_shrink ? s.priority : s.priority + 1000
+        if best < 0 || p < best do best = p
+    }
+    return best
+}
+
+// Apply exactly one shrink-or-drop, matching fit_line's ordering.
+step_once :: proc(l: ^SegList) {
+    best := -1
+    for i in 0 ..< l.n {
+        s := &l.segs[i]
+        if s.dropped || s.stage >= s.n_stages - 1 do continue
+        if best < 0 || s.priority < l.segs[best].priority do best = i
+    }
+    if best >= 0 {
+        l.segs[best].stage += 1
+        return
+    }
+    best = -1
+    for i in 0 ..< l.n {
+        s := &l.segs[i]
+        if s.dropped || !s.droppable do continue
+        if best < 0 || s.priority < l.segs[best].priority do best = i
+    }
+    if best >= 0 do l.segs[best].dropped = true
+}
+
+// Left-facing round cap, so the floating right-hand group reads as a detached
+// group rather than a severed one.
+SEP_ROUND_L :: ""
+
 build_statusline :: proc(
     buf   : ^OutBuf,
     state : ^DisplayState,
@@ -3091,11 +3243,36 @@ build_statusline :: proc(
     l1, l2: SegList
     build_line1(&l1, state, gs, pr)
     build_line2(&l2, state)
-    fit_line(&l1, cols)
-    fit_line(&l2, cols)
+
+    // One cell for the left cap on the right-hand group, plus one reserved
+    // slack cell. Right-alignment is unforgiving: a single uncounted cell and
+    // Claude Code truncates the RIGHT edge, which is exactly where quota and
+    // context live. Left-aligned the same error is invisible.
+    CAP_W :: 1
+    SLACK :: 1
+    budget := cols - CAP_W - SLACK
+    if budget < 20 do budget = 20
+
+    fit_pair(&l1, &l2, budget)
+
+    w1 := measure_line(&l1)
+    w2 := measure_line(&l2)
+    gap := budget - w1 - w2
+    if gap < 1 do gap = 1
 
     render_line(buf, &l1)
-    out_char(buf, '\n')
+    for _ in 0 ..< gap do out_char(buf, ' ')
+
+    // Cap is drawn in the FG matching the first surviving segment's background,
+    // over the terminal default background.
+    for i in 0 ..< l2.n {
+        if l2.segs[i].dropped do continue
+        cap_buf: [64]u8
+        out_str(buf, bg_to_fg(cap_buf[:], l2.segs[i].bg))
+        out_str(buf, SEP_ROUND_L)
+        out_str(buf, ANSI_RESET)
+        break
+    }
     render_line(buf, &l2)
 }
 
@@ -3129,7 +3306,7 @@ write_debug_log :: proc(
     debug_buf: [512]u8
     debug_str := fmt.bprintf(
         debug_buf[:],
-        "cleanup=%dus read=%dus(%s) parse=%dus git=%dus(%s) build=%dus total=%dus cols=%s lines=%s\n",
+        "cleanup=%dus read=%dus(%s) parse=%dus git=%dus(%s) build=%dus total=%dus cols=%s lines=%s ioctl=%d resolved=%d\n",
         i64(time.duration_microseconds(
             time.tick_diff(
                 timings.t_start,
@@ -3167,6 +3344,8 @@ write_debug_log :: proc(
         )),
         cols_s,
         lines_s,
+        ioctl_columns(),
+        get_columns(),
     )
 
     uid := posix.getuid()
@@ -3541,33 +3720,10 @@ main :: proc() {
     build_statusline(&buf, &state, &gs, &pr)
     if debug do timings.t_build = time.tick_now()
 
-    // Timing suffix (only in debug mode)
-    if debug {
-        t_now := time.tick_now()
-        total_us := i64(time.duration_microseconds(
-            time.tick_diff(timings.t_start, t_now),
-        ))
-        timing_buf: [64]u8
-        timing_str: string
-        if total_us >= 1000 {
-            timing_str = fmt.bprintf(
-                timing_buf[:],
-                "  %s%.1fms%s",
-                ANSI_FG_COMMENT,
-                f64(total_us) / 1000.0,
-                ANSI_RESET,
-            )
-        } else {
-            timing_str = fmt.bprintf(
-                timing_buf[:],
-                "  %s%dus%s",
-                ANSI_FG_COMMENT,
-                total_us,
-                ANSI_RESET,
-            )
-        }
-        out_str(&buf, timing_str)
-    }
+    // No visible timing suffix. Timings still go to the debug log
+    // (write_debug_log below) -- rendering them INTO the statusline meant the
+    // measurement changed the thing being measured, and it shifted the line
+    // width by 6-8 cells, which now matters for width-aware layout.
 
     posix.write(1, raw_data(&buf.data), uint(buf.len))
 
