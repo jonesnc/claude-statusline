@@ -3173,12 +3173,13 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
 
         // Seconds until the 5h window hits 100% at the observed pace.
         // pct_per_sec = level / elapsed; remaining = (100 - level) / rate.
-        // Meaningless before ~10% elapsed, same guard as the projection.
         full_secs: i64 = 0
         if state.five_hour_reset > 0 && state.five_hour_pct > 0 {
             w_start := state.five_hour_reset - 18000
             elapsed := now - w_start
-            if elapsed > 1800 && state.five_hour_pct < 100 {
+            // 300s, not 1800s: the old half-hour guard meant the field simply
+            // did not exist for the first 30 minutes of every window.
+            if elapsed > 300 && state.five_hour_pct < 100 {
                 rate := state.five_hour_pct / f64(elapsed) // % per second
                 if rate > 0 {
                     full_secs = i64((100.0 - state.five_hour_pct) / rate)
@@ -3186,17 +3187,30 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
             }
         }
 
-        cd_buf: [16]u8
-        if full_secs > 0 && (reset_epoch == 0 || full_secs < reset_epoch - now) {
-            // The cap arrives before the reset: this is the deadline that
-            // matters, so flag it rather than counting down to a reset you
-            // will not reach with quota to spare.
-            cd := format_countdown(cd_buf[:], full_secs)
-            add_seg(l, seg1("reset", ANSI_BG_COMMENT, "",
-                fmt.tprintf("%s%s%s%s", eta_color(full_secs), ICON_HOURGLASS,
-                    ANSI_BOLD, strings.clone(cd, context.temp_allocator)),
-                40))
-        } else if reset_epoch > now {
+        // Quota-cap ETA: ALWAYS rendered, as its own field. It used to appear
+        // only when it beat the reset, which meant it was invisible during
+        // normal low usage -- exactly when you want it as a pace baseline. An
+        // em dash marks "not yet computable" rather than dropping the field,
+        // since a gauge that vanishes reads as "nothing to report".
+        if state.five_hour_reset > 0 {
+            eta_buf: [16]u8
+            eta_txt: string
+            if full_secs > 0 {
+                e := format_countdown(eta_buf[:], full_secs)
+                eta_txt = fmt.tprintf("%s%s%s%s", eta_color(full_secs),
+                    ICON_HOURGLASS, ANSI_BOLD,
+                    strings.clone(e, context.temp_allocator))
+            } else {
+                eta_txt = fmt.tprintf("%s%s%s\u2014", ANSI_FG_WHITE,
+                    ICON_HOURGLASS, ANSI_FG_COMMENT)
+            }
+            add_seg(l, seg1("eta", ANSI_BG_COMMENT, "", eta_txt, 44))
+        }
+
+        // Window reset countdown. Neutral white: a reset arriving soon is
+        // relief, not risk, so it never joins the urgency ramp.
+        if reset_epoch > now {
+            cd_buf: [16]u8
             cd := format_countdown(cd_buf[:], reset_epoch - now)
             add_seg(l, seg1("reset", ANSI_BG_COMMENT, "",
                 fmt.tprintf("%s%s%s", ANSI_FG_WHITE, ICON_RESET,
