@@ -842,11 +842,6 @@ abbreviate_model :: proc(abbrev_buf: []u8, model: string) -> string {
 /* Context Bar (Compact block style)                                          */
 /* -------------------------------------------------------------------------- */
 
-// Fractional block characters: ▏▎▍▌▋▊▉█ (1/8 to 8/8)
-FRAC_BLOCKS :: [8]string{
-    "\u258F", "\u258E", "\u258D", "\u258C",
-    "\u258B", "\u258A", "\u2589", "\u2588",
-}
 FILLED_BLOCK :: "\u25b0"  // filled rectangle
 EMPTY_BLOCK :: "\u25b1"  // empty (outlined) rectangle
 
@@ -1349,6 +1344,9 @@ write_cached_state :: proc(state: CachedState) {
 }
 
 CLEANUP_INTERVAL_S :: 300
+// Hash-keyed cache files (claude-git-*, claude-pr-*) have no PID to test for
+// liveness, so they are reaped on age alone.
+SHM_MAX_AGE_S :: 86400
 
 cleanup_stale_caches :: proc() {
     sentinel_cstr: cstring = "/dev/shm/statusline-cleanup"
@@ -1380,6 +1378,23 @@ cleanup_stale_caches :: proc() {
         name := string(cstring(&entry.d_name[0]))
 
         // Clean both cache and usage files
+        // Hash-keyed caches carry no PID, so liveness cannot be tested --
+        // reap them on age alone. Without this they accumulate one file per
+        // repo-and-branch ever visited, forever.
+        if strings.has_prefix(name, "claude-git-") ||
+            strings.has_prefix(name, "claude-pr-") {
+            path_buf2: [64]u8
+            pth := fmt.bprintf(path_buf2[:], "%s/%s", SHM_DIR, name)
+            pth_cstr := strings.clone_to_cstring(pth, context.temp_allocator)
+            st2: posix.stat_t
+            if posix.stat(pth_cstr, &st2) == .OK {
+                if now_ms / 1000 - i64(st2.st_mtim.tv_sec) > SHM_MAX_AGE_S {
+                    posix.unlink(pth_cstr)
+                }
+            }
+            continue
+        }
+
         pid_str: string
         if strings.has_prefix(
             name,
@@ -2769,6 +2784,7 @@ Winsize :: struct {
     ws_ypixel: u16,
 }
 TIOCGWINSZ :: 0x5413  // Linux
+MAX_COLUMNS :: 500
 
 foreign import libc "system:c"
 foreign libc {
@@ -2827,10 +2843,12 @@ get_columns :: proc() -> int {
     cols_c := posix.getenv("COLUMNS")
     if cols_c != nil {
         if v, ok := strconv.parse_int(string(cols_c)); ok && v > 0 {
-            return v
+            // Clamp: an absurd COLUMNS filled OutBuf with gap padding and
+            // silently truncated, mid-escape-sequence.
+            return min(v, MAX_COLUMNS)
         }
     }
-    if v := ioctl_columns(); v > 0 do return v
+    if v := ioctl_columns(); v > 0 do return min(v, MAX_COLUMNS)
     return 120
 }
 
@@ -3271,7 +3289,17 @@ build_statusline :: proc(
     gs    : ^GitStatus,
     pr    : ^PrStatus,
 ) {
-    cols := get_columns()
+    build_statusline_cols(buf, state, gs, pr, get_columns())
+}
+
+// Same renderer with the width injected so --demo drives the real code path.
+build_statusline_cols :: proc(
+    buf   : ^OutBuf,
+    state : ^DisplayState,
+    gs    : ^GitStatus,
+    pr    : ^PrStatus,
+    cols  : int,
+) {
 
     l1, l2: SegList
     build_line1(&l1, state, gs, pr)
@@ -3634,56 +3662,46 @@ demo_print_log :: proc(flog: ^FitLog) {
 run_demo :: proc() -> int {
     now := current_time_sec()
     scenarios := demo_scenarios(now)
-    widths := [5]int{60, 80, 100, 140, 200}
+    // Nathan's real logged COLUMNS values, plus 80 as a stress floor. The old
+    // list (60/140/200) tested widths that never occur on this machine.
+    widths := [6]int{225, 196, 193, 159, 132, 80}
     failed := false
 
     for &sc in scenarios {
-        fmt.printf("%s%s── %s %s\n", ANSI_BOLD, ANSI_FG_PURPLE, sc.title,
-            ANSI_RESET)
+        fmt.printf("%s%s\u2500\u2500 %s %s\n", ANSI_BOLD, ANSI_FG_PURPLE,
+            sc.title, ANSI_RESET)
         for cols in widths {
-            l1, l2: SegList
-            flog1, flog2: FitLog
-            build_line1(&l1, &sc.state, &sc.gs, &sc.pr)
-            build_line2(&l2, &sc.state)
-            fit_line(&l1, cols, &flog1)
-            fit_line(&l2, cols, &flog2)
-
-            b1, b2: OutBuf
-            render_line(&b1, &l1)
-            render_line(&b2, &l2)
-            r1 := string(b1.data[:b1.len])
-            r2 := string(b2.data[:b2.len])
-            w1 := display_width(r1)
-            w2 := display_width(r2)
+            // Drive the SHIPPING path. The previous demo fitted each group
+            // against the full width independently and printed two lines: it
+            // passed while never touching the gap arithmetic, the cap cell or
+            // fit_pair -- which is exactly where both of this layout's real
+            // bugs lived.
+            buf: OutBuf
+            build_statusline_cols(&buf, &sc.state, &sc.gs, &sc.pr, cols)
+            line := string(buf.data[:buf.len])
+            w := display_width(line)
 
             fmt.printf("%s  cols=%d%s\n", ANSI_FG_COMMENT, cols, ANSI_RESET)
             demo_print_ruler(cols)
-            fmt.printf("  %s  %s[%d]%s\n", r1, ANSI_FG_COMMENT, w1, ANSI_RESET)
-            fmt.printf("  %s  %s[%d]%s\n", r2, ANSI_FG_COMMENT, w2, ANSI_RESET)
-            fmt.printf("%s    L1: ", ANSI_FG_COMMENT)
-            demo_print_log(&flog1)
-            fmt.printf(" | L2: ")
-            demo_print_log(&flog2)
-            fmt.printf("%s\n", ANSI_RESET)
-
-            if w1 > cols || w2 > cols {
-                fmt.printf("%s    !! OVERFLOW w1=%d w2=%d cols=%d%s\n",
-                    ANSI_FG_RED, w1, w2, cols, ANSI_RESET)
+            fmt.printf("  %s  %s[%d]%s\n", line, ANSI_FG_COMMENT, w, ANSI_RESET)
+            if w > cols {
+                fmt.printf("%s    !! OVERFLOW w=%d cols=%d%s\n", ANSI_FG_RED,
+                    w, cols, ANSI_RESET)
                 failed = true
             }
-            if b1.overflow || b2.overflow {
-                fmt.printf("%s    !! OUTBUF OVERFLOW%s\n",
-                    ANSI_FG_RED, ANSI_RESET)
+            if buf.overflow {
+                fmt.printf("%s    !! OUTBUF TRUNCATED%s\n", ANSI_FG_RED,
+                    ANSI_RESET)
                 failed = true
             }
-            fmt.println()
+            fmt.printf("\n")
         }
     }
     if failed {
-        fmt.printf("%sDEMO FAILED%s\n", ANSI_FG_RED, ANSI_RESET)
+        fmt.printf("%sdemo FAILED%s\n", ANSI_FG_RED, ANSI_RESET)
         return 1
     }
-    fmt.printf("%sdemo ok: 5 scenarios x 5 widths, no overflow%s\n",
+    fmt.printf("%sdemo ok: 5 scenarios x 6 widths, no overflow%s\n",
         ANSI_FG_GREEN, ANSI_RESET)
     return 0
 }

@@ -2,6 +2,35 @@
 
 ## Purpose & Big Picture
 
+> **SUPERSEDED IN PART, 2026-08-03.** All six Milestones below shipped as
+> written, but the two-line layout they describe was then replaced by a
+> **single line**: identity flush left, budget flush right, separated by
+> whitespace. Read the Milestones as history; read this box for the current
+> shape. What changed and why:
+>
+> - **One line, not two.** Viable because the width model turned out exact.
+>   `fit_pair` shrinks both groups against one shared budget -- fitting each
+>   against the full width independently overflows on a single line.
+> - **Terminal width is measured, not just read.** `COLUMNS` first, then a
+>   live kernel query: our own fds are captured (ENOTTY) and there is no
+>   controlling terminal (setsid -> /dev/tty is ENXIO), but the Claude Code
+>   process still holds the pty, so resolve `/proc/<pid>/fd/N` to `/dev/pts/*`
+>   and ioctl that. Clamped to `MAX_COLUMNS`.
+> - **Three edge cells are reserved.** Claude Code truncates before `COLUMNS`;
+>   it reserves columns v2.1.170 did not. The right group also renders flat
+>   against the screen edge rather than capped, and carries a left-facing cap.
+> - **Quota shows one number per window.** The level is the figure; the 5h
+>   projection drives its colour and only appears as a number at >=105%.
+> - **Pacing always renders**, with an em dash when no rate is known yet.
+>   Icons replaced the words: database, flame, compress.
+> - **Path/branch dedup compares the branch LEAF**, not the whole ref --
+>   `feat/x` vs a directory named `x` never matched by equality.
+> - **`--demo` drives `build_statusline_cols`**, the shipping path, at the
+>   real logged widths (225/196/193/159/132/80). The original version fitted
+>   each group separately and printed two lines, so it passed while never
+>   touching the gap arithmetic, the cap cell, or `fit_pair` -- where both of
+>   this layout's real bugs lived.
+
 `statusline.odin` renders Claude Code's statusline as a single powerline-styled
 line. It is fast (~200µs on a cache hit) and correct about most things, but it
 has three structural problems this plan fixes:
