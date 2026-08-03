@@ -138,6 +138,15 @@ bg_to_fg :: proc(buf: []u8, bg: string) -> string {
 // Truncation is segment-boundary only: if any part of a segment would
 // overflow the buffer, the whole segment is rolled back and every later
 // segment is skipped — a partial escape sequence renders as garbage.
+// Divider colour for two adjacent segments sharing a background. FG_COMMENT is
+// the obvious choice and it is invisible on BG_COMMENT -- literally the same
+// colour -- which silently erased the separator between the quota figures and
+// the reset countdown. Pick something that contrasts with the actual background.
+divider_color :: proc(bg: string) -> string {
+    if bg == ANSI_BG_COMMENT do return ANSI_FG_DARK
+    return ANSI_FG_COMMENT
+}
+
 segment :: proc(
     buf: ^OutBuf,
     bg: string,
@@ -151,7 +160,7 @@ segment :: proc(
     if !first && len(buf.prev_bg) > 0 {
         if buf.prev_bg == bg {
             out_str(buf, bg)
-            out_str(buf, ANSI_FG_COMMENT)
+            out_str(buf, divider_color(bg))
             out_str(buf, "|")
             out_str(buf, ANSI_RESET)
         } else {
@@ -3046,47 +3055,58 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
     })
 
     if state.five_hour_reset > 0 || state.seven_day_reset > 0 {
-        // 5h and 7d share one color, driven by whichever window is hotter
-        c5 := rate_limit_color(max(state.five_hour_pct, state.seven_day_pct))
+        // ONE number per window: the level. A bare level cannot answer "will I
+        // get capped" -- 23% is fine at minute five and alarming at hour four --
+        // but showing the projection as a second percentage read as two
+        // unexplained figures. So the level is the number and the PROJECTION
+        // drives its colour: green while on pace to finish under the cap,
+        // escalating by how badly it would overshoot.
         five := i64(state.five_hour_pct + 0.5)
         seven := i64(state.seven_day_pct + 0.5)
-        base := fmt.tprintf("%s5h %s%s%s%%", ANSI_FG_WHITE, ANSI_BOLD, c5, padl(fmt.tprintf("%d", five), 3))
 
-        // Projection: where the 5h window lands at the current pace. Window
-        // start is derivable (resets_at - 5h), no new input needed. Colored
-        // off the PROJECTION, not the level — it turns orange while there is
-        // still time to act. Suppressed below 10% elapsed (30s into a window
-        // one message projects to 400%). 5h only; 7d moves too slowly.
-        rich := base
+        // Projection: where the 5h window lands at the current pace. It drives
+        // the colour ALWAYS, but only appears as a number when it is actually
+        // saying something -- on pace, the level alone is the whole story and a
+        // second percentage was just noise. Overshooting, the magnitude matters:
+        // 110% and 400% call for very different responses.
+        c5 := rate_limit_color(state.five_hour_pct)
+        proj_txt := ""
         if state.five_hour_reset > 0 {
-            now_p := current_time_sec()
             start := state.five_hour_reset - 18000
-            elapsed_frac := f64(now_p - start) / 18000.0
+            elapsed_frac := f64(current_time_sec() - start) / 18000.0
+            // Below 10% elapsed the projection explodes (30s in, one message
+            // projects to 400%), so fall back to colouring by level.
             if elapsed_frac >= 0.10 && elapsed_frac <= 1.0 {
                 proj := state.five_hour_pct / elapsed_frac
-                pc := projection_color(proj)
-                v: string
-                // Show the real overshoot. Clamping at ">100" hid exactly the
-                // information that now drives severity — 110% and 400% are very
-                // different situations. Same 4-char worst case either way.
-                if proj > 999 {
-                    v = ">999"
-                } else {
-                    v = padl(fmt.tprintf("%d", i64(proj + 0.5)), 3)
+                c5 = projection_color(proj)
+                // 105 is projection_color's first escalation: show the number
+                // exactly when the colour stops being green.
+                if proj >= 105 {
+                    v := proj > 999 ? "999" : fmt.tprintf("%d", i64(proj + 0.5))
+                    proj_txt = fmt.tprintf("%s\u2192%s%s%s%%", ANSI_FG_DARK, ANSI_BOLD, c5, v)
                 }
-                rich = fmt.tprintf("%s%s→%s%s%s%%", base, ANSI_FG_DARK,
-                    pc, ANSI_BOLD, v)
             }
         }
-        n_5h := rich == base ? 1 : 2
+        c7 := rate_limit_color(state.seven_day_pct)
+
+        // 5h and 7d live in ONE segment. As two segments they paid for a "|"
+        // divider plus a padding space on each side of it -- 4 cells of gap for
+        // two numbers that read as a pair. Colours still differ per window;
+        // they are inline escapes, not a property of the segment.
         add_seg(l, Seg{
-            name = "5h", bg = ANSI_BG_COMMENT, fg = "",
-            stages = {rich, base, ""},
-            n_stages = n_5h, priority = 90, droppable = false,
+            name = "quota", bg = ANSI_BG_COMMENT, fg = "",
+            stages = {
+                fmt.tprintf("%s5h %s%s%d%%%s %s7d %s%s%d%%",
+                    ANSI_FG_WHITE, ANSI_BOLD, c5, five,
+                    proj_txt,
+                    ANSI_FG_WHITE, ANSI_BOLD, c7, seven),
+                // Shrink: drop 7d, keep 5h (the window you can actually hit).
+                fmt.tprintf("%s5h %s%s%d%%%s", ANSI_FG_WHITE, ANSI_BOLD, c5,
+                    five, proj_txt),
+                "",
+            },
+            n_stages = 2, priority = 90, droppable = false,
         })
-        add_seg(l, seg1("7d", ANSI_BG_COMMENT, "",
-            fmt.tprintf("%s7d %s%s%s%%", ANSI_FG_WHITE, ANSI_BOLD, c5, padl(fmt.tprintf("%d", seven), 3)),
-            50))
 
         // Opus weekly cap (Max plans) — only when it's meaningful
         if state.seven_day_opus_pct >= 50 {
@@ -3249,7 +3269,13 @@ build_statusline :: proc(
     // Claude Code truncates the RIGHT edge, which is exactly where quota and
     // context live. Left-aligned the same error is invisible.
     CAP_W :: 1
-    SLACK :: 1
+    // Claude Code truncates a few cells before COLUMNS -- it reserves edge
+    // columns that v2.1.170 did not (that era's note in this repo says zero).
+    // Deduced, not guessed: 13 Ambiguous glyphs are on a typical line, so if CC
+    // were miscounting them as 2 cells the overflow would be ~12 and most of the
+    // right end would vanish. Observed loss is 1-3 cells, i.e. a small constant.
+    // The gap absorbs this for free at any realistic width.
+    SLACK :: 3
     budget := cols - CAP_W - SLACK
     if budget < 20 do budget = 20
 
