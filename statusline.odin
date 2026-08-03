@@ -3143,7 +3143,11 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
                 45))
         }
 
-        // Countdown to the soonest relevant reset
+        // ONE countdown: time until you stop being able to work. That is
+        // either the 5h quota running out or the window resetting, whichever
+        // lands first, and the icon says which. Compaction used to own this
+        // field; it is an inconvenience (auto-compact keeps you going) whereas
+        // the quota is a wall, so the wall wins the space.
         now := current_time_sec()
         reset_epoch: i64 = 0
         if state.five_hour_reset > now {
@@ -3153,8 +3157,33 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
         } else if state.seven_day_reset > now {
             reset_epoch = state.seven_day_reset
         }
-        if reset_epoch > now {
-            cd_buf: [16]u8
+
+        // Seconds until the 5h window hits 100% at the observed pace.
+        // pct_per_sec = level / elapsed; remaining = (100 - level) / rate.
+        // Meaningless before ~10% elapsed, same guard as the projection.
+        full_secs: i64 = 0
+        if state.five_hour_reset > 0 && state.five_hour_pct > 0 {
+            w_start := state.five_hour_reset - 18000
+            elapsed := now - w_start
+            if elapsed > 1800 && state.five_hour_pct < 100 {
+                rate := state.five_hour_pct / f64(elapsed) // % per second
+                if rate > 0 {
+                    full_secs = i64((100.0 - state.five_hour_pct) / rate)
+                }
+            }
+        }
+
+        cd_buf: [16]u8
+        if full_secs > 0 && (reset_epoch == 0 || full_secs < reset_epoch - now) {
+            // The cap arrives before the reset: this is the deadline that
+            // matters, so flag it rather than counting down to a reset you
+            // will not reach with quota to spare.
+            cd := format_countdown(cd_buf[:], full_secs)
+            add_seg(l, seg1("reset", ANSI_BG_COMMENT, "",
+                fmt.tprintf("%s%s%s", ANSI_FG_ORANGE, ICON_WARN,
+                    strings.clone(cd, context.temp_allocator)),
+                40))
+        } else if reset_epoch > now {
             cd := format_countdown(cd_buf[:], reset_epoch - now)
             add_seg(l, seg1("reset", ANSI_BG_COMMENT, "",
                 fmt.tprintf("%s%s%s", ANSI_FG_WHITE, ICON_SYNC,
@@ -3180,18 +3209,14 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
         } else {
             rate = fmt.tprintf("%.0f", state.burn_per_min)
         }
-        ttc_buf: [16]u8
-        ttc := format_countdown(ttc_buf[:], max(state.ttc_sec, 60))
         add_seg(l, Seg{
             name = "burn", bg = ANSI_BG_DARK, fg = "",
             stages = {
-                fmt.tprintf("%s%s %s/m %s%s%s", ANSI_FG_WHITE, ICON_BURN, rate,
-                    ANSI_FG_ORANGE, ICON_COMPACT,
-                    strings.clone(ttc, context.temp_allocator)),
                 fmt.tprintf("%s%s %s/m", ANSI_FG_WHITE, ICON_BURN, rate),
                 "",
+                "",
             },
-            n_stages = 2, priority = 55,
+            n_stages = 1, priority = 55,
         })
     } else {
         // No usable rate yet. Still show the field so its absence never reads
