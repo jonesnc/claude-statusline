@@ -1202,6 +1202,11 @@ CachedState :: struct #packed {
 // Least-squares slope over the ring samples from the last 60s.
 // Needs >=3 usable samples and a positive rate (a /compact makes tokens
 // fall, which must suppress the segment, not show a negative rate).
+// Sample window for the burn-rate regression. Was 60s, which required three
+// renders inside one minute -- Claude Code renders roughly per turn, so the
+// segment almost never qualified during real work.
+BURN_WINDOW_S :: 900
+
 compute_burn :: proc(
     cached: ^CachedState,
     now: i64,
@@ -1216,12 +1221,12 @@ compute_burn :: proc(
     n := 0
     for i in 0 ..< 8 {
         t := cached.burn_times[i]
-        if t <= 0 || now - t > 60 || t > now do continue
+        if t <= 0 || now - t > BURN_WINDOW_S || t > now do continue
         xs[n] = f64(t - now) // negative offsets; only differences matter
         ys[n] = f64(cached.burn_tokens[i])
         n += 1
     }
-    if n < 3 do return 0, 0, false
+    if n < 2 do return 0, 0, false
 
     sx, sy, sxx, sxy: f64
     for i in 0 ..< n {
@@ -3150,23 +3155,28 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
     if state.burn_ok && state.burn_per_min > 0 {
         rate: string
         if state.burn_per_min >= 1000 {
-            rate = padl(fmt.tprintf("%.1fk/m", state.burn_per_min / 1000.0), 7)
+            rate = fmt.tprintf("%.1fk", state.burn_per_min / 1000.0)
         } else {
-            rate = padl(fmt.tprintf("%.0f/m", state.burn_per_min), 7)
+            rate = fmt.tprintf("%.0f", state.burn_per_min)
         }
         ttc_buf: [16]u8
         ttc := format_countdown(ttc_buf[:], max(state.ttc_sec, 60))
         add_seg(l, Seg{
             name = "burn", bg = ANSI_BG_DARK, fg = "",
             stages = {
-                fmt.tprintf("%s↑%s %s%s%s", ANSI_FG_WHITE, rate,
-                    ANSI_FG_ORANGE, ICON_WARN,
+                fmt.tprintf("%s\u2191%s/m %sto compact %s%s", ANSI_FG_WHITE, rate,
+                    ANSI_FG_COMMENT, ANSI_FG_ORANGE,
                     strings.clone(ttc, context.temp_allocator)),
-                fmt.tprintf("%s↑%s", ANSI_FG_WHITE, rate),
+                fmt.tprintf("%s\u2191%s/m", ANSI_FG_WHITE, rate),
                 "",
             },
-            n_stages = 2, priority = 30,
+            n_stages = 2, priority = 55,
         })
+    } else {
+        // No usable rate yet. Still show the field so its absence never reads
+        // as "nothing to report" -- em dash means unknown, not zero.
+        add_seg(l, seg1("burn", ANSI_BG_DARK, "",
+            fmt.tprintf("%s\u2191%s\u2014/m", ANSI_FG_WHITE, ANSI_FG_COMMENT), 55))
     }
 
     // Context warning. Deliberately later than the bar's own color ramp: the
