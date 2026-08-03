@@ -68,6 +68,8 @@ ICON_NORMAL    :: "\uE7C5"   //  vim logo (normal mode)
 ICON_STAGED    :: "\uF00C"   //  checkmark (staged)
 ICON_MODIFIED  :: "\uF040"   //  pencil (modified)
 ICON_WARN      :: "\uF071"   //  warning triangle
+ICON_RESET     :: "\uF021"   //  circular arrow — window resets
+ICON_HOURGLASS :: "\uF253"   //  hourglass draining — quota runs out
 ICON_SYNC      :: "\uF0EC"   //  exchange (last send/receive)
 ICON_BRAIN     :: "\U000F09D1"
 ICON_TOKENS    :: "\uF1C0"   //  database — context window occupancy
@@ -141,6 +143,17 @@ bg_to_fg :: proc(buf: []u8, bg: string) -> string {
 // Truncation is segment-boundary only: if any part of a segment would
 // overflow the buffer, the whole segment is rolled back and every later
 // segment is skipped — a partial escape sequence renders as garbage.
+// Colour for a deadline, on the same green->yellow->orange->red ramp the
+// context bar uses -- except keyed on time remaining rather than fill. Applied
+// to the quota-cap ETA only: a reset landing soon is RELIEF, not risk, so
+// colouring it by urgency would invert its meaning.
+eta_color :: proc(secs: i64) -> string {
+    if secs <= 900   do return ANSI_FG_RED      // under 15m
+    if secs <= 3600  do return ANSI_FG_ORANGE   // under 1h
+    if secs <= 10800 do return ANSI_FG_YELLOW   // under 3h
+    return ANSI_FG_GREEN
+}
+
 // Divider colour for two adjacent segments sharing a background. FG_COMMENT is
 // the obvious choice and it is invisible on BG_COMMENT -- literally the same
 // colour -- which silently erased the separator between the quota figures and
@@ -3180,13 +3193,13 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
             // will not reach with quota to spare.
             cd := format_countdown(cd_buf[:], full_secs)
             add_seg(l, seg1("reset", ANSI_BG_COMMENT, "",
-                fmt.tprintf("%s%s%s", ANSI_FG_ORANGE, ICON_WARN,
-                    strings.clone(cd, context.temp_allocator)),
+                fmt.tprintf("%s%s%s%s", eta_color(full_secs), ICON_HOURGLASS,
+                    ANSI_BOLD, strings.clone(cd, context.temp_allocator)),
                 40))
         } else if reset_epoch > now {
             cd := format_countdown(cd_buf[:], reset_epoch - now)
             add_seg(l, seg1("reset", ANSI_BG_COMMENT, "",
-                fmt.tprintf("%s%s%s", ANSI_FG_WHITE, ICON_SYNC,
+                fmt.tprintf("%s%s%s", ANSI_FG_WHITE, ICON_RESET,
                     strings.clone(cd, context.temp_allocator)),
                 40))
         }
