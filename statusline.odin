@@ -69,7 +69,10 @@ ICON_STAGED    :: "\uF00C"   //  checkmark (staged)
 ICON_MODIFIED  :: "\uF040"   //  pencil (modified)
 ICON_WARN      :: "\uF071"   //  warning triangle
 ICON_SYNC      :: "\uF0EC"   //  exchange (last send/receive)
-ICON_BRAIN     :: "\U000F09D1"   // \uDB82\uDDD1 md-brain (extended thinking on)
+ICON_BRAIN     :: "\U000F09D1"
+ICON_TOKENS    :: "\uF1C0"   //  database — context window occupancy
+ICON_BURN      :: "\uF06D"   //  flame — token burn rate
+ICON_COMPACT   :: "\uF066"   //  compress — countdown to compaction   // \uDB82\uDDD1 md-brain (extended thinking on)
 
 /* -------------------------------------------------------------------------- */
 /* Output Buffer                                                              */
@@ -887,7 +890,7 @@ make_context_bar :: proc(
             bar_buf[pos] = ' '
             pos += 1
         }
-        s := fmt.bprintf(bar_buf[pos:], "%s%s ", ANSI_FG_WHITE, tok)
+        s := fmt.bprintf(bar_buf[pos:], "%s%s %s ", ANSI_FG_WHITE, ICON_TOKENS, tok)
         pos += len(s)
     }
 
@@ -2742,7 +2745,7 @@ fit_line :: proc(l: ^SegList, cols: int, flog: ^FitLog = nil) {
     }
 }
 
-render_line :: proc(buf: ^OutBuf, l: ^SegList) {
+render_line :: proc(buf: ^OutBuf, l: ^SegList, cap_end := true) {
     buf.prev_bg = ""
     first := true
     for i in 0 ..< l.n {
@@ -2751,7 +2754,7 @@ render_line :: proc(buf: ^OutBuf, l: ^SegList) {
         segment(buf, s.bg, s.fg, s.stages[s.stage], first)
         first = false
     }
-    segment_end(buf)
+    if cap_end do segment_end(buf)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -3164,10 +3167,10 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
         add_seg(l, Seg{
             name = "burn", bg = ANSI_BG_DARK, fg = "",
             stages = {
-                fmt.tprintf("%s\u2191%s/m %sto compact %s%s", ANSI_FG_WHITE, rate,
-                    ANSI_FG_COMMENT, ANSI_FG_ORANGE,
+                fmt.tprintf("%s%s %s/m %s%s%s", ANSI_FG_WHITE, ICON_BURN, rate,
+                    ANSI_FG_ORANGE, ICON_COMPACT,
                     strings.clone(ttc, context.temp_allocator)),
-                fmt.tprintf("%s\u2191%s/m", ANSI_FG_WHITE, rate),
+                fmt.tprintf("%s%s %s/m", ANSI_FG_WHITE, ICON_BURN, rate),
                 "",
             },
             n_stages = 2, priority = 55,
@@ -3176,7 +3179,7 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
         // No usable rate yet. Still show the field so its absence never reads
         // as "nothing to report" -- em dash means unknown, not zero.
         add_seg(l, seg1("burn", ANSI_BG_DARK, "",
-            fmt.tprintf("%s\u2191%s\u2014/m", ANSI_FG_WHITE, ANSI_FG_COMMENT), 55))
+            fmt.tprintf("%s%s %s\u2014/m", ANSI_FG_WHITE, ICON_BURN, ANSI_FG_COMMENT), 55))
     }
 
     // Context warning. Deliberately later than the bar's own color ramp: the
@@ -3201,9 +3204,9 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
 }
 
 // Width of a SegList once rendered, without committing it to the output.
-measure_line :: proc(l: ^SegList) -> int {
+measure_line :: proc(l: ^SegList, cap_end := true) -> int {
     tmp: OutBuf
-    render_line(&tmp, l)
+    render_line(&tmp, l, cap_end)
     return display_width(string(tmp.data[:tmp.len]))
 }
 
@@ -3212,7 +3215,7 @@ measure_line :: proc(l: ^SegList) -> int {
 // each fit `cols` individually and still overflow when placed on one line.
 fit_pair :: proc(a: ^SegList, b: ^SegList, budget: int) {
     for _ in 0 ..< 64 {
-        if measure_line(a) + measure_line(b) <= budget do return
+        if measure_line(a) + measure_line(b, false) <= budget do return
         // Ask each group for its cheapest single step, take the cheaper one.
         pa := lowest_action_priority(a)
         pb := lowest_action_priority(b)
@@ -3292,7 +3295,7 @@ build_statusline :: proc(
     fit_pair(&l1, &l2, budget)
 
     w1 := measure_line(&l1)
-    w2 := measure_line(&l2)
+    w2 := measure_line(&l2, false)
     gap := budget - w1 - w2
     if gap < 1 do gap = 1
 
@@ -3309,7 +3312,7 @@ build_statusline :: proc(
         out_str(buf, ANSI_RESET)
         break
     }
-    render_line(buf, &l2)
+    render_line(buf, &l2, false)
 }
 
 /* -------------------------------------------------------------------------- */
