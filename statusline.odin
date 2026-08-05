@@ -1,16 +1,17 @@
-// Claude Code Statusline - Odin Version (v5)
+// Claude Code Statusline - Odin Version (v6)
 //
 // A fast statusline for Claude Code written in Odin.
-// Full port of the C version with compact layout.
+// Full port of the C version with a width-adaptive single-line layout.
 //
 // Build: odin build . -o:speed -out:statusline_odin
 // Usage: Set in ~/.claude/settings.json statusLine.command
 //
 // Shared state files:
 //   /dev/shm/statusline-cache.<gppid>   - Per-session cached state
-//   /dev/shm/statusline-usage.<gppid>   - Per-session usage quota cache
-//   /dev/shm/statusline-cleanup         - Sentinel for cleanup interval
+//   /dev/shm/statusline-usage-shared    - Account-wide usage quota cache
+//   /dev/shm/statusline-cleanup.<uid>   - Sentinel for cleanup interval
 //   /dev/shm/claude-git-<hash>          - Per-repo git status cache
+//   /dev/shm/claude-pr-<hash>           - Per-worktree+branch PR/CI cache
 //   /tmp/statusline-<uid>/<pid>.log     - Debug timing logs
 
 package main
@@ -68,14 +69,11 @@ ICON_NORMAL    :: "\uE7C5"   //  vim logo (normal mode)
 ICON_STAGED    :: "\uF00C"   //  checkmark (staged)
 ICON_MODIFIED  :: "\uF040"   //  pencil (modified)
 ICON_WARN      :: "\uF071"   //  warning triangle
-// Material Design, not Font Awesome's U+F021: the FA refresh glyph is drawn
-// thin and renders noticeably smaller than its neighbours. MD glyphs sit on a
-// uniform grid, so this matches the weight of the icons around it.
+// Material Design, not Font Awesome's U+F021: the FA refresh glyph renders
+// noticeably smaller than its neighbours. This one is near-square and close to
+// cap height, so neither dimension squeezes it -- see the aspect-ratio note on
+// ICON_QUOTA_ETA below for why that, not stroke weight, is what matters.
 ICON_RESET     :: "\U000F0450"   //  circular arrow — window resets
-// Material Design timer-sand, not Font Awesome's U+F253 hourglass. This sits
-// directly beside ICON_RESET (also MD): mixing an FA glyph, drawn thin and
-// small, with an MD one left the two adjacent countdowns indistinguishable, so
-// the quota ETA was on screen but unreadable as such.
 // md-battery-alert. Chosen on measured font metrics, after hourglass, gauge and
 // speedometer all read too small.
 //
@@ -91,11 +89,9 @@ ICON_RESET     :: "\U000F0450"   //  circular arrow — window resets
 // height-bound: it renders large and it responds to adjust-icon-height. The
 // metaphor -- charge running out -- also fits a depleting quota.
 ICON_QUOTA_ETA :: "\U000F0083"  // md-battery-alert
-ICON_SYNC      :: "\uF0EC"   //  exchange (last send/receive)
-ICON_BRAIN     :: "\U000F09D1"
+ICON_BRAIN     :: "\U000F09D1"   // md-brain (extended thinking on)
 ICON_TOKENS    :: "\uF1C0"   //  database — context window occupancy
 ICON_BURN      :: "\uF06D"   //  flame — token burn rate
-ICON_COMPACT   :: "\uF066"   //  compress — countdown to compaction   // \uDB82\uDDD1 md-brain (extended thinking on)
 
 /* -------------------------------------------------------------------------- */
 /* Output Buffer                                                              */
@@ -161,9 +157,6 @@ bg_to_fg :: proc(buf: []u8, bg: string) -> string {
     return string(buf[:len(bg)])
 }
 
-// Truncation is segment-boundary only: if any part of a segment would
-// overflow the buffer, the whole segment is rolled back and every later
-// segment is skipped — a partial escape sequence renders as garbage.
 // Colour for a deadline, on the same green->yellow->orange->red ramp the
 // context bar uses -- except keyed on time remaining rather than fill. Applied
 // to the quota-cap ETA only: a reset landing soon is RELIEF, not risk, so
@@ -187,6 +180,9 @@ divider_color :: proc(bg: string) -> string {
     return ANSI_FG_COMMENT
 }
 
+// Truncation is segment-boundary only: if any part of a segment would
+// overflow the buffer, the whole segment is rolled back and every later
+// segment is skipped — a partial escape sequence renders as garbage.
 segment :: proc(
     buf: ^OutBuf,
     bg: string,
@@ -1228,8 +1224,8 @@ CachedState :: struct #packed {
     input_tokens:    i64,
     // Ring buffer of (time, input_tokens) samples for the burn rate.
     // Claude Code re-renders on events, not a clock, so Δt between samples
-    // swings 200ms..90s — the rate must come from a regression over a ~60s
-    // window, never from the last single delta.
+    // swings 200ms..90s — the rate must come from a regression over the
+    // BURN_WINDOW_S window, never from the last single delta.
     burn_times:      [8]i64,
     burn_tokens:     [8]i64,
     burn_idx:        i64,
@@ -1237,22 +1233,19 @@ CachedState :: struct #packed {
     model:           [64]u8,
 }
 
-// Least-squares slope over the ring samples from the last 60s.
-// Needs >=3 usable samples and a positive rate (a /compact makes tokens
-// fall, which must suppress the segment, not show a negative rate).
 // Sample window for the burn-rate regression. Was 60s, which required three
 // renders inside one minute -- Claude Code renders roughly per turn, so the
 // segment almost never qualified during real work.
 BURN_WINDOW_S :: 900
 
+// Least-squares slope over the ring samples inside BURN_WINDOW_S. Needs >=2
+// usable samples and a positive rate (a /compact makes tokens fall, which must
+// suppress the segment, not show a negative rate).
 compute_burn :: proc(
     cached: ^CachedState,
     now: i64,
-    ctx_size: i64,
-    cur_tokens: i64,
 ) -> (
     rate_per_min: f64,
-    ttc_sec: i64,
     ok: bool,
 ) {
     xs, ys: [8]f64
@@ -1264,7 +1257,7 @@ compute_burn :: proc(
         ys[n] = f64(cached.burn_tokens[i])
         n += 1
     }
-    if n < 2 do return 0, 0, false
+    if n < 2 do return 0, false
 
     sx, sy, sxx, sxy: f64
     for i in 0 ..< n {
@@ -1273,17 +1266,11 @@ compute_burn :: proc(
     }
     fn := f64(n)
     denom := fn * sxx - sx * sx
-    if denom <= 0 do return 0, 0, false
+    if denom <= 0 do return 0, false
     slope := (fn * sxy - sx * sy) / denom // tokens per second
-    if slope <= 0 do return 0, 0, false
+    if slope <= 0 do return 0, false
 
-    rate_per_min = slope * 60.0
-    if ctx_size > 0 {
-        headroom := f64(ctx_size) * 0.8 - f64(cur_tokens)
-        if headroom < 0 do headroom = 0
-        ttc_sec = i64(headroom / slope)
-    }
-    return rate_per_min, ttc_sec, true
+    return slope * 60.0, true
 }
 
 get_grandparent_pid :: proc() -> int {
@@ -1389,7 +1376,22 @@ CLEANUP_INTERVAL_S :: 300
 SHM_MAX_AGE_S :: 86400
 
 cleanup_stale_caches :: proc() {
-    sentinel_cstr: cstring = "/dev/shm/statusline-cleanup"
+    // Per-UID sentinel. A single shared path is worse than no sentinel on a
+    // multi-user box: /dev/shm is sticky-bit world-writable, so the FIRST user
+    // to create it owns it and everyone else's open(WRONLY) fails with EACCES.
+    // Their stamp never lands, so they either skip cleanup entirely while the
+    // owner's stamp is fresh, or run the full double-scandir on EVERY render
+    // once it goes stale. Observed live: brandonpitts owned the file, mode 664.
+    sentinel_buf: [64]u8
+    sentinel_path := fmt.bprintf(
+        sentinel_buf[:],
+        "/dev/shm/statusline-cleanup.%d",
+        posix.getuid(),
+    )
+    sentinel_cstr := strings.clone_to_cstring(
+        sentinel_path,
+        context.temp_allocator,
+    )
     st: posix.stat_t
     now_ms := current_time_ms()
     if posix.stat(sentinel_cstr, &st) == .OK {
@@ -1398,10 +1400,11 @@ cleanup_stale_caches :: proc() {
             return
         }
     }
+    // Owner-only: the path is per-UID now, so nothing else needs to write it.
     sentinel_fd := posix.open(
         sentinel_cstr,
         {.WRONLY, .CREAT, .TRUNC},
-        {.IRUSR, .IWUSR, .IRGRP, .IWGRP, .IROTH, .IWOTH},
+        {.IRUSR, .IWUSR},
     )
     if sentinel_fd >= 0 do posix.close(sentinel_fd)
 
@@ -1445,6 +1448,9 @@ cleanup_stale_caches :: proc() {
             name,
             "statusline-usage.",
         ) {
+            // Migration only: the usage cache is account-wide and shared now
+            // (USAGE_CACHE_SHARED), so these per-session files are no longer
+            // created. Kept to sweep up ones left by an older build.
             pid_str = name[len("statusline-usage."):]
         } else {
             continue
@@ -1870,9 +1876,10 @@ get_git_status_cached :: proc(
 /* -------------------------------------------------------------------------- */
 
 USAGE_CACHE_TTL_S :: 60
-USAGE_CACHE_PREFIX :: "/dev/shm/statusline-usage."
-// Shared, session-independent quota cache. A new session inherits it instantly
-// instead of rendering a blank quota for its first minute.
+// ONE shared, session-independent quota cache -- not one per session. Quota is
+// account-wide, so keying it by grandparent PID meant every new or RESUMED
+// session (a resume is a new process) started with an empty cache and rendered
+// no quota at all until a background OAuth fetch finished.
 USAGE_CACHE_SHARED :: "/dev/shm/statusline-usage-shared"
 
 UsageCache :: struct #packed {
@@ -1896,9 +1903,8 @@ usage_backoff_s :: proc(failures: i64) -> i64 {
     return min(b, 900)
 }
 
-write_usage_cache :: proc(gppid: int, cache: UsageCache) {
-    path_buf: [64]u8
-    cache_path := get_usage_cache_path(path_buf[:], gppid)
+write_usage_cache :: proc(cache: UsageCache) {
+    cache_path := USAGE_CACHE_SHARED
     cache_cstr := strings.clone_to_cstring(
         cache_path,
         context.temp_allocator,
@@ -1923,25 +1929,17 @@ write_usage_cache :: proc(gppid: int, cache: UsageCache) {
     posix.rename(tmp_cstr, cache_cstr)
 }
 
-// One SHARED usage cache, not one per session. Quota is account-wide, so
-// keying it by grandparent PID meant every new session started with an empty
-// cache and rendered no quota at all until a background OAuth fetch finished.
-// The gppid argument is kept so callers need not change.
-get_usage_cache_path :: proc(path_buf: []u8, gppid: int) -> string {
-    return fmt.bprintf(path_buf, "%s", USAGE_CACHE_SHARED)
-}
-
 // Write prev back with the failure counter bumped, then exit. Called from
 // the grandchild on any failure so the backoff timestamp always lands.
-usage_fail_exit :: proc(gppid: int, prev: UsageCache, now: i64) -> ! {
+usage_fail_exit :: proc(prev: UsageCache, now: i64) -> ! {
     c := prev
     c.last_attempt_sec = now
     c.consecutive_failures += 1
-    write_usage_cache(gppid, c)
+    write_usage_cache(c)
     posix._exit(1)
 }
 
-refresh_usage_cache :: proc(gppid: int, prev: UsageCache) {
+refresh_usage_cache :: proc(prev: UsageCache) {
     first_fork := posix.fork()
     if first_fork < 0 do return
     if first_fork > 0 {
@@ -1960,7 +1958,7 @@ refresh_usage_cache :: proc(gppid: int, prev: UsageCache) {
     // Grandchild: read credentials, curl, parse, write
     attempt_sec := current_time_sec()
     home := string(posix.getenv("HOME"))
-    if len(home) == 0 do usage_fail_exit(gppid, prev, attempt_sec)
+    if len(home) == 0 do usage_fail_exit(prev, attempt_sec)
 
     cred_path_buf: [512]u8
     cred_path := fmt.bprintf(
@@ -1974,7 +1972,7 @@ refresh_usage_cache :: proc(gppid: int, prev: UsageCache) {
     )
 
     cred_fd := posix.open(cred_cstr, {})
-    if cred_fd < 0 do usage_fail_exit(gppid, prev, attempt_sec)
+    if cred_fd < 0 do usage_fail_exit(prev, attempt_sec)
 
     cred_buf: [4096]u8
     cred_len := posix.read(
@@ -1983,7 +1981,7 @@ refresh_usage_cache :: proc(gppid: int, prev: UsageCache) {
         len(cred_buf) - 1,
     )
     posix.close(cred_fd)
-    if cred_len <= 0 do usage_fail_exit(gppid, prev, attempt_sec)
+    if cred_len <= 0 do usage_fail_exit(prev, attempt_sec)
 
     cred_json := string(cred_buf[:cred_len])
 
@@ -1992,15 +1990,15 @@ refresh_usage_cache :: proc(gppid: int, prev: UsageCache) {
         cred_json,
         "\"claudeAiOauth\"",
     )
-    if oauth_idx < 0 do usage_fail_exit(gppid, prev, attempt_sec)
+    if oauth_idx < 0 do usage_fail_exit(prev, attempt_sec)
 
     oauth_rest := cred_json[oauth_idx:]
     brace_idx := strings.index(oauth_rest, "{")
-    if brace_idx < 0 do usage_fail_exit(gppid, prev, attempt_sec)
+    if brace_idx < 0 do usage_fail_exit(prev, attempt_sec)
 
     oauth_obj := oauth_rest[brace_idx:]
     token := json_get_string(oauth_obj, "accessToken")
-    if len(token) == 0 do usage_fail_exit(gppid, prev, attempt_sec)
+    if len(token) == 0 do usage_fail_exit(prev, attempt_sec)
 
     // Build Authorization header
     auth_buf: [2048]u8
@@ -2016,10 +2014,10 @@ refresh_usage_cache :: proc(gppid: int, prev: UsageCache) {
 
     // Fork/exec curl
     pipe_fds: [2]posix.FD
-    if posix.pipe(&pipe_fds) != .OK do usage_fail_exit(gppid, prev, attempt_sec)
+    if posix.pipe(&pipe_fds) != .OK do usage_fail_exit(prev, attempt_sec)
 
     curl_pid := posix.fork()
-    if curl_pid < 0 do usage_fail_exit(gppid, prev, attempt_sec)
+    if curl_pid < 0 do usage_fail_exit(prev, attempt_sec)
 
     if curl_pid == 0 {
         posix.close(pipe_fds[0])
@@ -2085,7 +2083,7 @@ refresh_usage_cache :: proc(gppid: int, prev: UsageCache) {
 
     // No usable data at all -> count as a failure so backoff kicks in.
     if five_reset == 0 && seven_reset == 0 {
-        usage_fail_exit(gppid, prev, attempt_sec)
+        usage_fail_exit(prev, attempt_sec)
     }
 
     // Write cache (success resets the failure counter)
@@ -2099,13 +2097,12 @@ refresh_usage_cache :: proc(gppid: int, prev: UsageCache) {
     cache.opus_reset = opus_reset
     cache.last_attempt_sec = attempt_sec
     cache.consecutive_failures = 0
-    write_usage_cache(gppid, cache)
+    write_usage_cache(cache)
     posix._exit(0)
 }
 
-read_usage_cache :: proc(gppid: int) -> UsageCache {
-    path_buf: [64]u8
-    cache_path := get_usage_cache_path(path_buf[:], gppid)
+read_usage_cache :: proc() -> UsageCache {
+    cache_path := USAGE_CACHE_SHARED
     cache_cstr := strings.clone_to_cstring(
         cache_path,
         context.temp_allocator,
@@ -2114,7 +2111,7 @@ read_usage_cache :: proc(gppid: int) -> UsageCache {
     now := current_time_sec()
     fd := posix.open(cache_cstr, {})
     if fd < 0 {
-        refresh_usage_cache(gppid, {})
+        refresh_usage_cache({})
         return {}
     }
 
@@ -2127,7 +2124,7 @@ read_usage_cache :: proc(gppid: int) -> UsageCache {
     posix.close(fd)
 
     if n != size_of(UsageCache) {
-        refresh_usage_cache(gppid, {})
+        refresh_usage_cache({})
         return {}
     }
 
@@ -2136,7 +2133,7 @@ read_usage_cache :: proc(gppid: int) -> UsageCache {
     if now - cache.fetch_time_sec > USAGE_CACHE_TTL_S {
         backoff := usage_backoff_s(cache.consecutive_failures)
         if now - cache.last_attempt_sec >= backoff {
-            refresh_usage_cache(gppid, cache)
+            refresh_usage_cache(cache)
         }
     }
 
@@ -2388,7 +2385,6 @@ DisplayState :: struct {
     ctx_size:           i64,
     input_tokens:       i64,
     burn_per_min:       f64,
-    ttc_sec:            i64,
     burn_ok:            bool,
     five_hour_pct:      f64,
     seven_day_pct:      f64,
@@ -2535,8 +2531,8 @@ resolve_state :: proc(
                 new_cache.burn_tokens[w] = json_in_tok
                 new_cache.burn_idx = cached.burn_idx + 1
             }
-            state.burn_per_min, state.ttc_sec, state.burn_ok =
-                compute_burn(&new_cache, now_s, state.ctx_size, state.input_tokens)
+            state.burn_per_min, state.burn_ok =
+                compute_burn(&new_cache, now_s)
         }
         if len(json_cwd) > 0 {
             copy(
@@ -2609,14 +2605,24 @@ rate_limit_color :: proc(pct: f64) -> string {
 /* Statusline Builder                                                         */
 /* -------------------------------------------------------------------------- */
 /*
-Two-line width-adaptive layout (v6).
+Single-line width-adaptive layout (v6).
 
-Line 1 = identity (model, path, branch, git counts, PR) — changes only when
-you move, so it is a stable visual anchor. Line 2 = budget (quota, context,
-burn) — all per-render churn is quarantined here. Each line degrades
-independently via a table-driven priority ladder: the lowest-priority segment
-sheds display stages first, then droppable segments are dropped outright.
-Authoritative spec: thoughts/shared/plans/statusline-v6-layout-prototype.py.
+ONE line, two groups. The identity group (model, path, branch, git counts, PR)
+is flush LEFT and changes only when you move, so it is a stable visual anchor.
+The budget group (context, quota, reset, burn, quota ETA) is flush RIGHT and
+quarantines all per-render churn. A run of spaces separates them, so the right
+group floats against the terminal edge and gets a left-facing cap.
+
+The groups are still built as two SegLists, but they are NOT fitted
+independently -- see fit_pair. They share ONE budget, and each shrink-or-drop
+step is taken by whichever group offers the cheapest one, via a table-driven
+priority ladder (lowest priority sheds display stages first, then droppable
+segments are dropped outright).
+
+The design was planned as two physical lines; the pivot to one line came after
+measuring that every glyph here is 1 cell wide, not 2. See the SUPERSEDED note
+in thoughts/shared/plans/statusline-v6-two-line-adaptive.md. Layout changes
+must be verified with --demo, which drives this exact code path.
 */
 
 // ---- display width (mirrors Bun.stringWidth(s, {ambiguousIsNarrow: true}))
@@ -2731,75 +2737,27 @@ seg1 :: proc(name, bg, fg, text: string, priority: int, droppable := true) -> Se
             n_stages = 1, priority = priority, droppable = droppable}
 }
 
+// Record of what the fitter sacrificed, for --demo. Which segment gave up what
+// at which width is the only way to tell a correct fit from a lucky one.
 FitAction :: enum { SHRINK, DROP }
 
 FitLog :: struct {
     actions: [64]FitAction,
     names:   [64]string,
     stages:  [64]int,
+    group:   [64]int,       // 0 = identity (left), 1 = budget (right)
     n:       int,
 }
 
-// Total visible width of the rendered line:
-//   Σ (display_width(stage text) + 2 padding spaces)
-// + (n_live - 1) junction cells (powerline sep or '|' divider)
-// + 1 end cap.
-// The junction and end-cap terms are LOAD-BEARING — omitting them
-// undercounts by ~5 cells and overflows with an empty decision log.
-line_total_width :: proc(l: ^SegList) -> int {
-    total := 0
-    n_live := 0
-    for i in 0 ..< l.n {
-        s := &l.segs[i]
-        if s.dropped do continue
-        n_live += 1
-        total += display_width(s.stages[s.stage]) + 2
-    }
-    if n_live == 0 do return 0
-    return total + (n_live - 1) + 1
-}
-
-// Priority ladder: shed the next stage of the lowest-priority segment that
-// still has one; when none has a stage left, drop the lowest-priority
-// droppable segment. Repeats until the line fits (or nothing can shrink).
-fit_line :: proc(l: ^SegList, cols: int, flog: ^FitLog = nil) {
-    for _ in 0 ..< 200 {
-        if line_total_width(l) <= cols do break
-
-        // Lowest-priority segment with a stage left to shed
-        best := -1
-        for i in 0 ..< l.n {
-            s := &l.segs[i]
-            if s.dropped || s.stage >= s.n_stages - 1 do continue
-            if best < 0 || s.priority < l.segs[best].priority do best = i
-        }
-        if best >= 0 {
-            l.segs[best].stage += 1
-            if flog != nil && flog.n < len(flog.actions) {
-                flog.actions[flog.n] = .SHRINK
-                flog.names[flog.n] = l.segs[best].name
-                flog.stages[flog.n] = l.segs[best].stage
-                flog.n += 1
-            }
-            continue
-        }
-
-        // Nothing left to shrink: drop the lowest-priority droppable segment
-        best = -1
-        for i in 0 ..< l.n {
-            s := &l.segs[i]
-            if s.dropped || !s.droppable do continue
-            if best < 0 || s.priority < l.segs[best].priority do best = i
-        }
-        if best < 0 do break
-        l.segs[best].dropped = true
-        if flog != nil && flog.n < len(flog.actions) {
-            flog.actions[flog.n] = .DROP
-            flog.names[flog.n] = l.segs[best].name
-            flog.stages[flog.n] = -1
-            flog.n += 1
-        }
-    }
+fitlog_add :: proc(
+    flog: ^FitLog, group: int, action: FitAction, name: string, stage: int,
+) {
+    if flog == nil || flog.n >= len(flog.actions) do return
+    flog.actions[flog.n] = action
+    flog.names[flog.n] = name
+    flog.stages[flog.n] = stage
+    flog.group[flog.n] = group
+    flog.n += 1
 }
 
 render_line :: proc(buf: ^OutBuf, l: ^SegList, cap_end := true) {
@@ -3251,7 +3209,9 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
             10))
     }
 
-    // Burn rate + time-to-compact (until input hits 80% of the window)
+    // Token burn rate. Paired time-to-compact used to live here; the quota-cap
+    // ETA replaced it, since auto-compact is an inconvenience and the quota is
+    // a wall.
     if state.burn_ok && state.burn_per_min > 0 {
         rate: string
         if state.burn_per_min >= 1000 {
@@ -3326,15 +3286,15 @@ measure_line :: proc(l: ^SegList, cap_end := true) -> int {
 // Shrink two groups against ONE shared budget, always sacrificing the
 // lowest-priority available action across both. Without this the groups would
 // each fit `cols` individually and still overflow when placed on one line.
-fit_pair :: proc(a: ^SegList, b: ^SegList, budget: int) {
+fit_pair :: proc(a: ^SegList, b: ^SegList, budget: int, flog: ^FitLog = nil) {
     for _ in 0 ..< 64 {
         if measure_line(a) + measure_line(b, false) <= budget do return
         // Ask each group for its cheapest single step, take the cheaper one.
         pa := lowest_action_priority(a)
         pb := lowest_action_priority(b)
         if pa < 0 && pb < 0 do return
-        target := (pb < 0) || (pa >= 0 && pa <= pb) ? a : b
-        step_once(target)
+        pick_a := (pb < 0) || (pa >= 0 && pa <= pb)
+        step_once(pick_a ? a : b, pick_a ? 0 : 1, flog)
     }
 }
 
@@ -3353,8 +3313,11 @@ lowest_action_priority :: proc(l: ^SegList) -> int {
     return best
 }
 
-// Apply exactly one shrink-or-drop, matching fit_line's ordering.
-step_once :: proc(l: ^SegList) {
+// Apply exactly one shrink-or-drop: shed the next stage of the lowest-priority
+// segment that still has one, and only when none does, drop the lowest-priority
+// droppable segment. A shrink is always preferred over a drop -- which is why
+// lowest_action_priority ranks drops 1000 higher.
+step_once :: proc(l: ^SegList, group: int, flog: ^FitLog = nil) {
     best := -1
     for i in 0 ..< l.n {
         s := &l.segs[i]
@@ -3363,6 +3326,7 @@ step_once :: proc(l: ^SegList) {
     }
     if best >= 0 {
         l.segs[best].stage += 1
+        fitlog_add(flog, group, .SHRINK, l.segs[best].name, l.segs[best].stage)
         return
     }
     best = -1
@@ -3371,7 +3335,10 @@ step_once :: proc(l: ^SegList) {
         if s.dropped || !s.droppable do continue
         if best < 0 || s.priority < l.segs[best].priority do best = i
     }
-    if best >= 0 do l.segs[best].dropped = true
+    if best >= 0 {
+        l.segs[best].dropped = true
+        fitlog_add(flog, group, .DROP, l.segs[best].name, -1)
+    }
 }
 
 // Left-facing round cap, so the floating right-hand group reads as a detached
@@ -3388,12 +3355,14 @@ build_statusline :: proc(
 }
 
 // Same renderer with the width injected so --demo drives the real code path.
+// flog is demo-only: production passes nil and pays nothing for it.
 build_statusline_cols :: proc(
     buf   : ^OutBuf,
     state : ^DisplayState,
     gs    : ^GitStatus,
     pr    : ^PrStatus,
     cols  : int,
+    flog  : ^FitLog = nil,
 ) {
 
     l1, l2: SegList
@@ -3415,7 +3384,7 @@ build_statusline_cols :: proc(
     budget := cols - CAP_W - SLACK
     if budget < 20 do budget = 20
 
-    fit_pair(&l1, &l2, budget)
+    fit_pair(&l1, &l2, budget, flog)
 
     w1 := measure_line(&l1)
     w2 := measure_line(&l2, false)
@@ -3682,7 +3651,7 @@ demo_scenarios :: proc(now: i64) -> [5]DemoScenario {
         five_hour_pct = 21, seven_day_pct = 20,
         five_hour_reset = now + 3900,    // "1h5m"
         seven_day_reset = now + 300000,
-        burn_ok = true, burn_per_min = 2100, ttc_sec = 720, // ↑2.1k/m ⚠12m
+        burn_ok = true, burn_per_min = 2100,
     }
     base_gs := GitStatus{
         valid = true, is_worktree = true,
@@ -3717,7 +3686,7 @@ demo_scenarios :: proc(now: i64) -> [5]DemoScenario {
     s[3].state.used_pct = 93; s[3].state.input_tokens = 186_400
     s[3].state.five_hour_pct = 61; s[3].state.seven_day_pct = 77
     s[3].state.five_hour_reset = now + 2820 // "47m"
-    s[3].state.burn_per_min = 9400; s[3].state.ttc_sec = 120
+    s[3].state.burn_per_min = 9400
 
     // no git repo, insert mode
     s[4].state.vim_mode = "INSERT"
@@ -3740,15 +3709,18 @@ demo_print_ruler :: proc(cols: int) {
 }
 
 demo_print_log :: proc(flog: ^FitLog) {
+    fmt.printf("  %sfit: ", ANSI_FG_COMMENT)
     for i in 0 ..< flog.n {
         if i > 0 do fmt.printf(", ")
+        side := flog.group[i] == 0 ? "L" : "R"
         if flog.actions[i] == .SHRINK {
-            fmt.printf("shrink %s->s%d", flog.names[i], flog.stages[i])
+            fmt.printf("%s:shrink %s->s%d", side, flog.names[i], flog.stages[i])
         } else {
-            fmt.printf("drop %s", flog.names[i])
+            fmt.printf("%s:drop %s", side, flog.names[i])
         }
     }
-    if flog.n == 0 do fmt.printf("-")
+    if flog.n == 0 do fmt.printf("nothing sacrificed")
+    fmt.printf("%s\n", ANSI_RESET)
 }
 
 // Render every scenario at every width with a ruler, measured widths, and
@@ -3772,13 +3744,15 @@ run_demo :: proc() -> int {
             // fit_pair -- which is exactly where both of this layout's real
             // bugs lived.
             buf: OutBuf
-            build_statusline_cols(&buf, &sc.state, &sc.gs, &sc.pr, cols)
+            flog: FitLog
+            build_statusline_cols(&buf, &sc.state, &sc.gs, &sc.pr, cols, &flog)
             line := string(buf.data[:buf.len])
             w := display_width(line)
 
             fmt.printf("%s  cols=%d%s\n", ANSI_FG_COMMENT, cols, ANSI_RESET)
             demo_print_ruler(cols)
             fmt.printf("  %s  %s[%d]%s\n", line, ANSI_FG_COMMENT, w, ANSI_RESET)
+            demo_print_log(&flog)
             if w > cols {
                 fmt.printf("%s    !! OVERFLOW w=%d cols=%d%s\n", ANSI_FG_RED,
                     w, cols, ANSI_RESET)
@@ -3830,8 +3804,7 @@ main :: proc() {
     // primary source. The background OAuth fetch cache fills in only when
     // the JSON had none (stdin timeout / older Claude Code), and is the
     // sole source for the opus weekly window, which the JSON lacks.
-    gppid := get_grandparent_pid()
-    usage := read_usage_cache(gppid)
+    usage := read_usage_cache()
     if state.five_hour_reset == 0 && state.seven_day_reset == 0 {
         state.five_hour_pct = usage.five_hour_pct
         state.seven_day_pct = usage.seven_day_pct
