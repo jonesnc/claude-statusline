@@ -72,7 +72,25 @@ ICON_WARN      :: "\uF071"   //  warning triangle
 // thin and renders noticeably smaller than its neighbours. MD glyphs sit on a
 // uniform grid, so this matches the weight of the icons around it.
 ICON_RESET     :: "\U000F0450"   //  circular arrow — window resets
-ICON_HOURGLASS :: "\uF253"   //  hourglass draining — quota runs out
+// Material Design timer-sand, not Font Awesome's U+F253 hourglass. This sits
+// directly beside ICON_RESET (also MD): mixing an FA glyph, drawn thin and
+// small, with an MD one left the two adjacent countdowns indistinguishable, so
+// the quota ETA was on screen but unreadable as such.
+// md-battery-alert. Chosen on measured font metrics, after hourglass, gauge and
+// speedometer all read too small.
+//
+// The cause is NOT stroke density or icon family -- both theories were tested
+// and disproved (fa-hourglass is the tallest glyph in the set yet reads small;
+// md-brain has the thinnest stroke yet reads fine). Ghostty scales each icon to
+// fit the cell, and whether HEIGHT or WIDTH binds depends on the glyph's aspect
+// ratio: wide glyphs get squeezed no matter how tall they are, and
+// adjust-icon-height cannot rescue them because it only raises the height
+// ceiling. md-speedometer is a wide dial, hence width-bound, hence small.
+//
+// This glyph is tall (130.4% of cap height) and NARROW (49.6% width), so it is
+// height-bound: it renders large and it responds to adjust-icon-height. The
+// metaphor -- charge running out -- also fits a depleting quota.
+ICON_QUOTA_ETA :: "\U000F0083"  // md-battery-alert
 ICON_SYNC      :: "\uF0EC"   //  exchange (last send/receive)
 ICON_BRAIN     :: "\U000F09D1"
 ICON_TOKENS    :: "\uF1C0"   //  database — context window occupancy
@@ -154,7 +172,10 @@ eta_color :: proc(secs: i64) -> string {
     if secs <= 900   do return ANSI_FG_RED      // under 15m
     if secs <= 3600  do return ANSI_FG_ORANGE   // under 1h
     if secs <= 10800 do return ANSI_FG_YELLOW   // under 3h
-    return ANSI_FG_GREEN
+    // White, not green, when it is far off. Green reads as an active
+    // reassurance and made the field compete for attention with the alarms;
+    // white is neutral so colour arriving at all means something.
+    return ANSI_FG_WHITE
 }
 
 // Divider colour for two adjacent segments sharing a background. FG_COMMENT is
@@ -858,6 +879,9 @@ abbreviate_model :: proc(abbrev_buf: []u8, model: string) -> string {
 /* Context Bar (Compact block style)                                          */
 /* -------------------------------------------------------------------------- */
 
+// DO NOT change these to block characters (\u2588 / \u2591 / \u2593). Tried on 2026-08-03 and
+// rejected outright: "NO NO NO never use bars, keep the boxes". The boxes are
+// the intended look for this bar.
 FILLED_BLOCK :: "\u25b0"  // filled rectangle
 EMPTY_BLOCK :: "\u25b1"  // empty (outlined) rectangle
 
@@ -1847,6 +1871,9 @@ get_git_status_cached :: proc(
 
 USAGE_CACHE_TTL_S :: 60
 USAGE_CACHE_PREFIX :: "/dev/shm/statusline-usage."
+// Shared, session-independent quota cache. A new session inherits it instantly
+// instead of rendering a blank quota for its first minute.
+USAGE_CACHE_SHARED :: "/dev/shm/statusline-usage-shared"
 
 UsageCache :: struct #packed {
     fetch_time_sec:       i64,
@@ -1896,13 +1923,12 @@ write_usage_cache :: proc(gppid: int, cache: UsageCache) {
     posix.rename(tmp_cstr, cache_cstr)
 }
 
+// One SHARED usage cache, not one per session. Quota is account-wide, so
+// keying it by grandparent PID meant every new session started with an empty
+// cache and rendered no quota at all until a background OAuth fetch finished.
+// The gppid argument is kept so callers need not change.
 get_usage_cache_path :: proc(path_buf: []u8, gppid: int) -> string {
-    return fmt.bprintf(
-        path_buf,
-        "%s%d",
-        USAGE_CACHE_PREFIX,
-        gppid,
-    )
+    return fmt.bprintf(path_buf, "%s", USAGE_CACHE_SHARED)
 }
 
 // Write prev back with the failure counter bumped, then exit. Called from
@@ -3080,6 +3106,10 @@ padl :: proc(v: string, width: int) -> string {
 }
 
 build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
+    // Quota-cap ETA is computed with the other quota figures but emitted LAST,
+    // at the far right of the line, so it is not lost among them.
+    eta_secs: i64 = 0
+    eta_available := false
     // Context bar FIRST. This group is right-aligned, so segment order
     // runs right-to-left visually from the screen edge -- emitting ctx
     // first puts it at the group's far LEFT, furthest from the edge.
@@ -3112,26 +3142,19 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
         seven := i64(state.seven_day_pct + 0.5)
 
         // Projection: where the 5h window lands at the current pace. It drives
-        // the colour ALWAYS, but only appears as a number when it is actually
-        // saying something -- on pace, the level alone is the whole story and a
-        // second percentage was just noise. Overshooting, the magnitude matters:
-        // 110% and 400% call for very different responses.
+        // the level's COLOUR and is never shown as a number. It used to appear
+        // as "19%\u2192114%" once it passed 105, but the far-right ETA now carries
+        // the same warning in a strictly more useful unit -- "cap in 20m" beats
+        // "you would end at 114%" -- so the second percentage was pure
+        // duplication, and it read as two unexplained figures again.
         c5 := rate_limit_color(state.five_hour_pct)
-        proj_txt := ""
         if state.five_hour_reset > 0 {
             start := state.five_hour_reset - 18000
             elapsed_frac := f64(current_time_sec() - start) / 18000.0
             // Below 10% elapsed the projection explodes (30s in, one message
             // projects to 400%), so fall back to colouring by level.
             if elapsed_frac >= 0.10 && elapsed_frac <= 1.0 {
-                proj := state.five_hour_pct / elapsed_frac
-                c5 = projection_color(proj)
-                // 105 is projection_color's first escalation: show the number
-                // exactly when the colour stops being green.
-                if proj >= 105 {
-                    v := proj > 999 ? "999" : fmt.tprintf("%d", i64(proj + 0.5))
-                    proj_txt = fmt.tprintf("%s\u2192%s%s%s%%", ANSI_FG_DARK, ANSI_BOLD, c5, v)
-                }
+                c5 = projection_color(state.five_hour_pct / elapsed_frac)
             }
         }
         c7 := rate_limit_color(state.seven_day_pct)
@@ -3143,13 +3166,13 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
         add_seg(l, Seg{
             name = "quota", bg = ANSI_BG_COMMENT, fg = "",
             stages = {
-                fmt.tprintf("%s5h %s%s%d%%%s %s7d %s%s%d%%",
+                fmt.tprintf("%s5h %s%s%d%% %s7d %s%s%d%%",
                     ANSI_FG_WHITE, ANSI_BOLD, c5, five,
-                    proj_txt,
+
                     ANSI_FG_WHITE, ANSI_BOLD, c7, seven),
                 // Shrink: drop 7d, keep 5h (the window you can actually hit).
-                fmt.tprintf("%s5h %s%s%d%%%s", ANSI_FG_WHITE, ANSI_BOLD, c5,
-                    five, proj_txt),
+                fmt.tprintf("%s5h %s%s%d%%", ANSI_FG_WHITE, ANSI_BOLD, c5,
+                    five),
                 "",
             },
             n_stages = 2, priority = 90, droppable = false,
@@ -3200,20 +3223,12 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
         // normal low usage -- exactly when you want it as a pace baseline. An
         // em dash marks "not yet computable" rather than dropping the field,
         // since a gauge that vanishes reads as "nothing to report".
-        if state.five_hour_reset > 0 {
-            eta_buf: [16]u8
-            eta_txt: string
-            if full_secs > 0 {
-                e := format_countdown(eta_buf[:], full_secs)
-                eta_txt = fmt.tprintf("%s%s%s%s", eta_color(full_secs),
-                    ICON_HOURGLASS, ANSI_BOLD,
-                    strings.clone(e, context.temp_allocator))
-            } else {
-                eta_txt = fmt.tprintf("%s%s%s\u2014", ANSI_FG_WHITE,
-                    ICON_HOURGLASS, ANSI_FG_COMMENT)
-            }
-            add_seg(l, seg1("eta", ANSI_BG_COMMENT, "", eta_txt, 44))
-        }
+        // Hand the ETA to the end of the line rather than emitting it here --
+        // see the tail of this proc. Sandwiching it between the quota figures
+        // and the reset countdown put three similar-looking fields in a row and
+        // it went unnoticed for days.
+        eta_secs = full_secs
+        eta_available = state.five_hour_reset > 0
 
         // Window reset countdown. Neutral white: a reset arriving soon is
         // relief, not risk, so it never joins the urgency ramp.
@@ -3258,6 +3273,26 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
         // as "nothing to report" -- em dash means unknown, not zero.
         add_seg(l, seg1("burn", ANSI_BG_DARK, "",
             fmt.tprintf("%s%s %s\u2014/m", ANSI_FG_WHITE, ICON_BURN, ANSI_FG_COMMENT), 55))
+    }
+
+    // Quota-cap ETA, emitted LAST so it owns the far right of the line. It sat
+    // between the quota levels and the reset countdown, and three similar
+    // fields in a row meant it read as part of them.
+    if eta_available {
+        eta_buf: [16]u8
+        eta_txt: string
+        if eta_secs > 0 {
+            e := format_countdown(eta_buf[:], eta_secs)
+            // Normal weight. Bold made this field shout even while white and
+            // far from the cap; the colour ramp alone carries the urgency.
+            eta_txt = fmt.tprintf("%s%s%s", eta_color(eta_secs),
+                ICON_QUOTA_ETA,
+                strings.clone(e, context.temp_allocator))
+        } else {
+            eta_txt = fmt.tprintf("%s%s%s\u2014", ANSI_FG_WHITE,
+                ICON_QUOTA_ETA, ANSI_FG_COMMENT)
+        }
+        add_seg(l, seg1("eta", ANSI_BG_DARK, "", eta_txt, 44))
     }
 
     // Context warning. Deliberately later than the bar's own color ramp: the
