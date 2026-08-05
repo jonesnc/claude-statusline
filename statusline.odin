@@ -897,7 +897,6 @@ pct_label_color :: proc(pct: i64) -> string {
 make_context_bar :: proc(
     bar_buf: []u8,
     pct: i64,
-    ctx_size: i64,
     input_tokens: i64,
     width: int = 10,
 ) -> string {
@@ -908,19 +907,16 @@ make_context_bar :: proc(
 
     pos := 0
 
-    // Token count (bright white), right-aligned to the width of the full
-    // context window (the largest value it can reach) so the bar after it
-    // never shifts horizontally as the count grows or shrinks.
+    // Token count (bright white), no padding: it just grows with the number.
+    // It used to be right-aligned to the width of the full context window so
+    // the bar could not shift as the count changed. That mattered when the
+    // budget group was its own LEFT-aligned line. The group is flush right now,
+    // so everything to the right of this field is already pinned to the screen
+    // edge -- widening it only eats into the gap, and the reserved blanks were
+    // pure dead space.
     if input_tokens > 0 {
         tok_buf: [16]u8
         tok := format_tokens(tok_buf[:], input_tokens)
-        width_buf: [16]u8
-        full := format_tokens(width_buf[:], ctx_size)
-        field := ctx_size > 0 ? len(full) : len(tok)
-        for _ in len(tok) ..< field {
-            bar_buf[pos] = ' '
-            pos += 1
-        }
         s := fmt.bprintf(bar_buf[pos:], "%s%s %s ", ANSI_FG_WHITE, ICON_TOKENS, tok)
         pos += len(s)
     }
@@ -3049,19 +3045,12 @@ build_line1 :: proc(l: ^SegList, state: ^DisplayState, gs: ^GitStatus, pr: ^PrSt
 }
 
 // ---- line 2: budget
-
-// Left-pad with SPACES to a fixed field width. Odin's "%3d" zero-pads ("005%"),
-// which is uglier than the sliding it was meant to cure -- so pad explicitly.
-// Fixed-width fields matter here because the budget group is right-aligned:
-// any field that changes width shifts everything to its LEFT.
-padl :: proc(v: string, width: int) -> string {
-    if len(v) >= width do return v
-    b := make([]u8, width, context.temp_allocator)
-    pad := width - len(v)
-    for i in 0 ..< pad do b[i] = ' '
-    copy(b[pad:], v)
-    return string(b)
-}
+//
+// No field in this group is padded to a fixed width. Reserving blanks so a
+// value cannot shift was worth it when this was a separate LEFT-aligned line;
+// flush right, every field to the RIGHT of a growing one is already pinned to
+// the screen edge, and only the gap absorbs the change. Padding here just
+// burns cells.
 
 build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
     // Quota-cap ETA is computed with the other quota figures but emitted LAST,
@@ -3074,17 +3063,16 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
     // Context bar: 10-cell -> 5-cell -> bare percentage
     bar10_buf: [512]u8
     bar5_buf: [512]u8
-    bar10 := make_context_bar(bar10_buf[:], state.used_pct, state.ctx_size,
-        state.input_tokens, 10)
-    bar5 := make_context_bar(bar5_buf[:], state.used_pct, state.ctx_size,
-        state.input_tokens, 5)
+    bar10 := make_context_bar(bar10_buf[:], state.used_pct, state.input_tokens, 10)
+    bar5 := make_context_bar(bar5_buf[:], state.used_pct, state.input_tokens, 5)
     add_seg(l, Seg{
         name = "ctx", bg = ANSI_BG_DARK, fg = "",
         stages = {
             strings.clone(bar10, context.temp_allocator),
             strings.clone(bar5, context.temp_allocator),
-            fmt.tprintf("%s%s%%", pct_label_color(min(state.used_pct, 100)),
-                padl(fmt.tprintf("%d", min(state.used_pct, 100)), 3)),
+            // Unpadded, same reasoning as the token count above.
+            fmt.tprintf("%s%d%%", pct_label_color(min(state.used_pct, 100)),
+                min(state.used_pct, 100)),
         },
         n_stages = 3, priority = 100, droppable = false,
     })
