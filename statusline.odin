@@ -68,7 +68,10 @@ ICON_NORMAL    :: "\uE7C5"   //  vim logo (normal mode)
 ICON_STAGED    :: "\uF00C"   //  checkmark (staged)
 ICON_MODIFIED  :: "\uF040"   //  pencil (modified)
 ICON_WARN      :: "\uF071"   //  warning triangle
-ICON_RESET     :: "\uF021"   //  circular arrow — window resets
+// Material Design, not Font Awesome's U+F021: the FA refresh glyph is drawn
+// thin and renders noticeably smaller than its neighbours. MD glyphs sit on a
+// uniform grid, so this matches the weight of the icons around it.
+ICON_RESET     :: "\U000F0450"   //  circular arrow — window resets
 ICON_HOURGLASS :: "\uF253"   //  hourglass draining — quota runs out
 ICON_SYNC      :: "\uF0EC"   //  exchange (last send/receive)
 ICON_BRAIN     :: "\U000F09D1"
@@ -2984,7 +2987,12 @@ build_line1 :: proc(l: ^SegList, state: ^DisplayState, gs: ^GitStatus, pr: ^PrSt
             stages = {
                 fmt.tprintf("%s %s", icon, b),
                 s1,
-                fmt.tprintf("%s %s…", icon, trunc_runes(b, 8)),
+                // Ellipsis only when something was actually cut: this stage
+                // used to render short names as "main…", claiming truncation
+                // that never happened.
+                trunc_runes(b, 8) != b \
+                    ? fmt.tprintf("%s %s…", icon, trunc_runes(b, 8)) \
+                    : fmt.tprintf("%s %s", icon, b),
             },
             n_stages = 3, priority = 80,
         })
