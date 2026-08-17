@@ -4,6 +4,24 @@ A fast, width-adaptive statusline for [Claude Code](https://claude.com/claude-co
 
 One line, right-sized to your terminal: model, path, git branch + dirty counts, PR/CI state, context bar, quota levels, burn rate, and a quota-cap ETA. Everything is cached in `/dev/shm` and refreshed in detached background processes, so a render is ~200µs on a cache hit and never blocks your prompt.
 
+Narrow terminals never wrap. Segments shrink through predefined stages and the lowest-priority ones drop out entirely. `./statusline_odin --demo` renders each scenario at six widths with a column ruler, the measured width in brackets, and a `fit:` log naming every shrink and drop it applied — the screenshots below are that output.
+
+**Dirty worktree, PR awaiting review.** Orange branch = uncommitted work; orange PR background = review required. By 132 cols the path, branch and PR have all shrunk; by 80 the duration, reset countdown and ETA are gone.
+
+![--demo: dirty worktree with a PR awaiting review, six widths](docs/screenshots/demo-worktree-pr-awaiting-review.png)
+
+**Clean `main`, no PR.** Green branch, no counters, no PR segment — nothing to report, so nothing takes up space, and the full path survives all the way down to 132 cols.
+
+![--demo: clean main checkout with no PR, six widths](docs/screenshots/demo-clean-main-no-pr.png)
+
+**Context critical, quota over pace.** The bar goes red at 93% and the `CTX HIGH` banner appears; 5h sits at 61% but is colored by *projection*, and the battery ETA says the cap arrives in 2h41m. At 132 cols the banner keeps its slot as a bare icon rather than dropping — it's marked non-droppable.
+
+![--demo: context critical with quota over pace, six widths](docs/screenshots/demo-context-critical-quota-over-pace.png)
+
+**No git repo, vim insert mode.** Outside a repo the branch, counters and PR segments simply don't exist; the green pencil at far left is vim insert mode.
+
+![--demo: no git repo, vim insert mode, six widths](docs/screenshots/demo-no-git-repo-insert-mode.png)
+
 > This repo also contains a legacy C implementation (`statusline.c`, `Makefile.c-legacy`). It is no longer the one being developed — everything below is the Odin workflow.
 
 ## Requirements
@@ -91,6 +109,7 @@ Segments are priority-ranked. When the terminal is narrow they shrink through
 predefined stages (full → abbreviated → icon-only) and low-priority ones drop
 entirely, so the line never wraps.
 
+- **vim mode** — icon only, when Claude Code's vim mode is on; color carries the mode
 - **model** — abbreviated name, plus a brain glyph when extended thinking is on
 - **path** — abbreviated cwd; elided to `…` when the directory name duplicates the branch
 - **branch** — green when clean, orange when dirty; worktrees get their own icon
