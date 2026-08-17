@@ -4,28 +4,6 @@ A fast, width-adaptive statusline for [Claude Code](https://claude.com/claude-co
 
 One line, right-sized to your terminal: model, path, git branch + dirty counts, PR/CI state, context bar, quota levels, burn rate, and a quota-cap ETA. Everything is cached in `/dev/shm` and refreshed in detached background processes, so a render is ~200µs on a cache hit and never blocks your prompt.
 
-Narrow terminals never wrap. Segments shrink through predefined stages and the lowest-priority ones drop out entirely. `./statusline_odin --demo` renders all five scenarios at six widths with a column ruler, the measured width in brackets, and a `fit:` log naming every shrink and drop it applied — the screenshots below are that output.
-
-**Dirty worktree, PR awaiting review.** Orange branch = uncommitted work; orange PR background = review required. By 132 cols the path, branch and PR have all shrunk; by 80 the duration, reset countdown and ETA are gone.
-
-![--demo: dirty worktree with a PR awaiting review, six widths](docs/screenshots/demo-worktree-pr-awaiting-review.png)
-
-**CI failing, approved.** Review state and CI state are independent and shown independently: green background says approved, the red `✗2` says two checks failed. At 132 cols the PR number goes and the bare red ✗ stays — the failure survives longer than the identity, because it's the part that needs acting on.
-
-![--demo: failing CI on an approved PR, six widths](docs/screenshots/demo-ci-failing-approved.png)
-
-**Clean `main`, no PR.** Green branch, no counters, no PR segment — nothing to report, so nothing takes up space, and the full path survives all the way down to 132 cols.
-
-![--demo: clean main checkout with no PR, six widths](docs/screenshots/demo-clean-main-no-pr.png)
-
-**Context critical, quota over pace.** The bar goes red at 93% and the `CTX HIGH` banner appears; 5h sits at 61% but is colored by *projection*, and the battery ETA says the cap arrives in 2h41m. At 132 cols the banner keeps its slot as a bare icon rather than dropping — it's marked non-droppable.
-
-![--demo: context critical with quota over pace, six widths](docs/screenshots/demo-context-critical-quota-over-pace.png)
-
-**No git repo, vim insert mode.** Outside a repo the branch, counters and PR segments simply don't exist; the green pencil at far left is vim insert mode.
-
-![--demo: no git repo, vim insert mode, six widths](docs/screenshots/demo-no-git-repo-insert-mode.png)
-
 > This repo also contains a legacy C implementation (`statusline.c`, `Makefile.c-legacy`). It is no longer the one being developed — everything below is the Odin workflow.
 
 ## Requirements
@@ -94,9 +72,17 @@ make install-odin ODIN_ROOT=/path/to/odin
 
 ## Auto-update
 
-Source installs only. `make install-odin` writes the repo path to `~/.claude/statusline-src`. Once every 24h the statusline detaches a background process that runs `git pull --ff-only` and `make install-odin` in that directory, so a `git push` to your own copy propagates on its own. A downloaded binary has no pointer file, so it never updates itself.
+**Option B only.** `make install-odin` writes the repo path to `~/.claude/statusline-src`; that pointer file is the whole trigger. Once every 24h the statusline detaches a background process that runs `git pull --ff-only` followed by `make install-odin` in that directory. Option A leaves no pointer file, so a downloaded binary never updates itself — re-run the `curl` instead.
 
-To disable it, delete the pointer file:
+Since Option B clones this repo directly, that means **you track `main` automatically**: my pushes land in your statusline within a day, without you doing anything.
+
+What happens once you start customizing:
+
+- **Committed local changes.** `git pull --ff-only` refuses to fast-forward a diverged branch and fails — but the failure is ignored and `make install-odin` runs anyway, so your build is reinstalled from your tree. You keep your version and simply stop receiving mine. Merge or rebase by hand when you want to catch up.
+- **Uncommitted edits.** Same outcome if the pull can't apply cleanly; otherwise it fast-forwards under you and rebuilds with your working-tree changes included.
+- **Want both.** Fork on GitHub, point `origin` at your fork, and merge upstream on your own schedule — auto-update then follows your fork.
+
+To turn it off entirely, delete the pointer file. The statusline keeps working; it just stops rebuilding itself:
 
 ```sh
 rm ~/.claude/statusline-src
@@ -121,6 +107,30 @@ Compare C vs Odin output side by side:
 ```sh
 make bench
 ```
+
+## What it looks like
+
+Narrow terminals never wrap. Segments shrink through predefined stages and the lowest-priority ones drop out entirely. `./statusline_odin --demo` renders all five scenarios at six widths with a column ruler, the measured width in brackets, and a `fit:` log naming every shrink and drop it applied — the screenshots below are that output.
+
+**Dirty worktree, PR awaiting review.** Orange branch = uncommitted work; orange PR background = review required. By 132 cols the path, branch and PR have all shrunk; by 80 the duration, reset countdown and ETA are gone.
+
+![--demo: dirty worktree with a PR awaiting review, six widths](docs/screenshots/demo-worktree-pr-awaiting-review.png)
+
+**CI failing, approved.** Review state and CI state are independent and shown independently: green background says approved, the red `✗2` says two checks failed. At 132 cols the PR number goes and the bare red ✗ stays — the failure survives longer than the identity, because it's the part that needs acting on.
+
+![--demo: failing CI on an approved PR, six widths](docs/screenshots/demo-ci-failing-approved.png)
+
+**Clean `main`, no PR.** Green branch, no counters, no PR segment — nothing to report, so nothing takes up space, and the full path survives all the way down to 132 cols.
+
+![--demo: clean main checkout with no PR, six widths](docs/screenshots/demo-clean-main-no-pr.png)
+
+**Context critical, quota over pace.** The bar goes red at 93% and the `CTX HIGH` banner appears; 5h sits at 61% but is colored by *projection*, and the battery ETA says the cap arrives in 2h41m. At 132 cols the banner keeps its slot as a bare icon rather than dropping — it's marked non-droppable.
+
+![--demo: context critical with quota over pace, six widths](docs/screenshots/demo-context-critical-quota-over-pace.png)
+
+**No git repo, vim insert mode.** Outside a repo the branch, counters and PR segments simply don't exist; the green pencil at far left is vim insert mode.
+
+![--demo: no git repo, vim insert mode, six widths](docs/screenshots/demo-no-git-repo-insert-mode.png)
 
 ## What's on the line
 
