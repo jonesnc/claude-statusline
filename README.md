@@ -32,7 +32,7 @@ Narrow terminals never wrap. Segments shrink through predefined stages and the l
 
 | Thing | Why | Notes |
 |---|---|---|
-| [Odin compiler](https://odin-lang.org/docs/install/) | builds the binary | `odin` must be on `PATH` |
+| [Odin compiler](https://odin-lang.org/docs/install/) | builds the binary | source install only; `odin` must be on `PATH`, and there is no system-wide install on the ITADM box |
 | Linux with `/dev/shm` | cache files | macOS/BSD are not supported |
 | `git` | branch + status | invoked directly, no shell |
 | A Nerd Font + truecolor terminal | icons and Dracula colors | e.g. Ghostty, kitty, WezTerm |
@@ -41,15 +41,30 @@ Narrow terminals never wrap. Segments shrink through predefined stages and the l
 
 ## Install
 
+Everyone runs their own copy — install it per developer, not once for the box, so you're free to modify your own. Pick whichever option fits; both end up at `~/.claude/statusline`, so the settings block below is identical either way and you can switch later.
+
+### Option A — prebuilt binary (no toolchain)
+
 ```sh
-git clone <this repo> ~/Projects/claude-statusline
+curl -L -o ~/.claude/statusline https://github.com/jonesnc/claude-statusline/releases/latest/download/statusline-linux-x86_64
+chmod +x ~/.claude/statusline
+```
+
+Built with `-microarch:native` on the ITADM server's Cascade Lake Xeon, so **it contains AVX-512 and will `SIGILL` on a CPU without it** — use Option B anywhere else. Needs glibc 2.35+. Does not auto-update: re-run the `curl` to pick up changes.
+
+### Option B — build from source (customizable, auto-updating)
+
+```sh
+git clone git@github.com:jonesnc/claude-statusline.git ~/Projects/claude-statusline
 cd ~/Projects/claude-statusline
 make install-odin
 ```
 
-That builds `statusline_odin` and copies it to `~/.claude/statusline`.
+That builds `statusline_odin` and copies it to `~/.claude/statusline`. Requires an Odin toolchain. In exchange you get [auto-update](#auto-update) and a tree you can edit.
 
-Then point Claude Code at it — in `~/.claude/settings.json`:
+### Point Claude Code at it
+
+In `~/.claude/settings.json`:
 
 ```json
 {
@@ -69,7 +84,7 @@ make odin     # produces ./statusline_odin
 make clean
 ```
 
-Build flags are `-o:speed -no-bounds-check -disable-assert -microarch:native`.
+Build flags are `-o:speed -no-bounds-check -disable-assert -microarch:native`. `-microarch:native` targets the CPU you build on — that's why the released binary is AVX-512 and machine-specific. Drop it if you need a portable build.
 
 If `odin build` complains it cannot find the `base` collection, the Makefile already resolves `ODIN_ROOT` via `odin root` and falls back to `/usr/lib/odin`, `/usr/share/odin`, `~/Odin`, `~/odin`. Set `ODIN_ROOT` yourself if your install lives somewhere else:
 
@@ -79,7 +94,7 @@ make install-odin ODIN_ROOT=/path/to/odin
 
 ## Auto-update
 
-`make install-odin` writes the repo path to `~/.claude/statusline-src`. Once every 24h the statusline detaches a background process that runs `git pull --ff-only` and `make install-odin` in that directory, so a `git push` to your own copy propagates on its own.
+Source installs only. `make install-odin` writes the repo path to `~/.claude/statusline-src`. Once every 24h the statusline detaches a background process that runs `git pull --ff-only` and `make install-odin` in that directory, so a `git push` to your own copy propagates on its own. A downloaded binary has no pointer file, so it never updates itself.
 
 To disable it, delete the pointer file:
 
