@@ -2,7 +2,7 @@
 
 A fast, width-adaptive statusline for [Claude Code](https://claude.com/claude-code), written in Odin.
 
-One line, right-sized to your terminal: model, path, git branch + dirty counts, PR/CI state, context bar, quota levels, burn rate, and a quota-cap ETA. Everything is cached in `/dev/shm` and refreshed in detached background processes, so a render is ~200µs on a cache hit and never blocks your prompt.
+One line, right-sized to your terminal: model, path, git branch + dirty counts, context bar, quota levels, burn rate, and a quota-cap ETA. Everything is cached in `/dev/shm` and refreshed in detached background processes, so a render is ~200µs on a cache hit and never blocks your prompt.
 
 > This repo also contains a legacy C implementation (`statusline.c`, `Makefile.c-legacy`). It is no longer the one being developed — everything below is the Odin workflow.
 
@@ -15,7 +15,6 @@ Not everything below applies to both install options. **Option A needs no toolch
 | Linux with `/dev/shm` | both | cache files | macOS/BSD are not supported |
 | A Nerd Font + truecolor terminal | both | icons and Dracula colors | e.g. Ghostty, kitty, WezTerm |
 | `git` | both | branch + status | invoked directly, no shell; outside a repo those segments are just absent |
-| `gh` | both, optional | PR number, review state, CI status | segment is skipped if missing |
 | `curl` | both, optional | Opus weekly quota window | other quota figures come from Claude Code's own JSON |
 | glibc 2.35+, AVX-512 CPU | **Option A only** | running the prebuilt binary | it is built `-microarch:native` on the ITADM box; an older glibc or a CPU without AVX-512 needs Option B |
 | [Odin compiler](https://odin-lang.org/docs/install/) | **Option B only** | builds the binary | `odin` must be on `PATH`; there is no system-wide install on the ITADM box, so you install it yourself |
@@ -100,7 +99,7 @@ Render against synthetic JSON:
 echo '{"current_dir":"'$PWD'","display_name":"Opus 5","total_duration_ms":120000}' | ./statusline_odin
 ```
 
-Check the layout logic at six terminal widths across five scenarios:
+Check the layout logic at six terminal widths across four scenarios:
 
 ```sh
 ./statusline_odin --demo
@@ -114,25 +113,13 @@ make bench
 
 ## What it looks like
 
-Narrow terminals never wrap. Segments shrink through predefined stages and the lowest-priority ones drop out entirely. `./statusline_odin --demo` renders all five scenarios at six widths with a column ruler, the measured width in brackets, and a `fit:` log naming every shrink and drop it applied — the screenshots below are that output.
+Narrow terminals never wrap. Segments shrink through predefined stages and the lowest-priority ones drop out entirely. `./statusline_odin --demo` renders all four scenarios at six widths with a column ruler, the measured width in brackets, and a `fit:` log naming every shrink and drop it applied — the screenshots below are that output.
 
-**Dirty worktree, PR awaiting review.** Orange branch = uncommitted work; orange PR background = review required. By 132 cols the path, branch and PR have all shrunk; by 80 the duration, reset countdown and ETA are gone.
+**Clean `main`.** Green branch, no counters — nothing to report, so nothing takes up space, and the full path survives all the way down to 132 cols.
 
-![--demo: dirty worktree with a PR awaiting review, six widths](docs/screenshots/demo-worktree-pr-awaiting-review.png)
+![--demo: clean main checkout, six widths](docs/screenshots/demo-clean-main-no-pr.png)
 
-**CI failing, approved.** Review state and CI state are independent and shown independently: green background says approved, the red `✗2` says two checks failed. At 132 cols the PR number goes and the bare red ✗ stays — the failure survives longer than the identity, because it's the part that needs acting on.
-
-![--demo: failing CI on an approved PR, six widths](docs/screenshots/demo-ci-failing-approved.png)
-
-**Clean `main`, no PR.** Green branch, no counters, no PR segment — nothing to report, so nothing takes up space, and the full path survives all the way down to 132 cols.
-
-![--demo: clean main checkout with no PR, six widths](docs/screenshots/demo-clean-main-no-pr.png)
-
-**Context critical, quota over pace.** The bar goes red at 93% and the `CTX HIGH` banner appears; 5h sits at 61% but is colored by *projection*, and the battery ETA says the cap arrives in 2h41m. At 132 cols the banner keeps its slot as a bare icon rather than dropping — it's marked non-droppable.
-
-![--demo: context critical with quota over pace, six widths](docs/screenshots/demo-context-critical-quota-over-pace.png)
-
-**No git repo, vim insert mode.** Outside a repo the branch, counters and PR segments simply don't exist; the green pencil at far left is vim insert mode.
+**No git repo, vim insert mode.** Outside a repo the branch and counter segments simply don't exist; the green pencil at far left is vim insert mode.
 
 ![--demo: no git repo, vim insert mode, six widths](docs/screenshots/demo-no-git-repo-insert-mode.png)
 
@@ -159,8 +146,6 @@ Identity sits flush left, budget flush right, whitespace between them. Each icon
 | <img src="docs/icons/modified.png" height="18" alt=""> | **modified** | Orange. |
 | <img src="docs/icons/untracked.png" height="18" alt=""> | **untracked** | Cyan. |
 | <img src="docs/icons/stash.png" height="18" alt=""> | **stashes** | Purple. |
-| `#257` | **PR** | The PR number for the current branch. Background carries *review* state: green approved, orange review-required, dark undecided. Not a link — Claude Code's own bottom line already gives you one. |
-| <img src="docs/icons/staged.png" height="18" alt=""> `✗` `●` `⊘` | **CI** | Passing / failing / pending / draft. Failing also shows a count of failed checks. |
 
 ### Right — what it's costing you
 
@@ -202,7 +187,6 @@ All caches are self-invalidating and cleaned up periodically; deleting them is a
 /dev/shm/statusline-usage-shared    account-wide quota cache
 /dev/shm/statusline-cleanup.<uid>   cleanup-interval sentinel
 /dev/shm/claude-git-<hash>          per-repo git status
-/dev/shm/claude-pr-<hash>           per-worktree+branch PR/CI status
 ```
 
 ## Uninstall
