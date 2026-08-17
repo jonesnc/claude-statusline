@@ -142,17 +142,49 @@ Segments are priority-ranked. When the terminal is narrow they shrink through
 predefined stages (full → abbreviated → icon-only) and low-priority ones drop
 entirely, so the line never wraps.
 
-- **vim mode** — icon only, when Claude Code's vim mode is on; color carries the mode
-- **model** — abbreviated name, plus a brain glyph when extended thinking is on
-- **path** — abbreviated cwd; elided to `…` when the directory name duplicates the branch
-- **branch** — green when clean, orange when dirty; worktrees get their own icon
-- **git counters** — ahead/behind, staged, modified, untracked, stashes
-- **PR** — number (OSC8-hyperlinked), CI glyph; review state rides in the background color
-- **context bar** — 10-cell → 5-cell → bare percentage, with a `CTX HIGH` / `COMPACT NOW` banner past 88% / 94%
-- **quota** — 5h and 7d levels, colored by *projected* end-of-window usage; Opus weekly appears above 50%
-- **reset** — countdown to the next window reset
-- **burn** — tokens per minute
-- **ETA** — time until the 5h window hits 100% at the current pace
+Identity sits flush left, budget flush right, whitespace between them. Each icon below is shown as it actually renders, on the background color it actually sits on.
+
+### Left — what you're working on
+
+| Icon | Segment | What it tells you |
+|:---:|---|---|
+| <img src="docs/icons/vim-insert.png" height="18" alt=""> <img src="docs/icons/vim-normal.png" height="18" alt=""> | **vim mode** | Shown only when vim mode is on. Green pencil = insert, dark vim logo = normal. |
+| — | **model** | Always abbreviated (`Op5`). Never shows the full display name. |
+| <img src="docs/icons/brain.png" height="18" alt=""> | **thinking** | Trails the model when extended thinking is on. First thing dropped when space runs short. |
+| <img src="docs/icons/folder.png" height="18" alt=""> | **path** | Abbreviated cwd. Collapses to `…` when the directory name duplicates the branch — the branch segment already says it. |
+| <img src="docs/icons/branch.png" height="18" alt=""> <img src="docs/icons/branch-dirty.png" height="18" alt=""> | **branch** | Green when clean, orange when dirty. |
+| <img src="docs/icons/worktree.png" height="18" alt=""> | **branch (worktree)** | Replaces the branch icon in a linked worktree. |
+| `↑` `↓` | **ahead / behind** | Commits not pushed (green) and not pulled (red). |
+| <img src="docs/icons/staged.png" height="18" alt=""> | **staged** | Green. |
+| <img src="docs/icons/modified.png" height="18" alt=""> | **modified** | Orange. |
+| <img src="docs/icons/untracked.png" height="18" alt=""> | **untracked** | Cyan. |
+| <img src="docs/icons/stash.png" height="18" alt=""> | **stashes** | Purple. |
+| `#257` | **PR** | The number is an OSC8 hyperlink to the PR, costing zero cells. Background carries *review* state: green approved, orange review-required, dark undecided. |
+| <img src="docs/icons/staged.png" height="18" alt=""> `✗` `●` `⊘` | **CI** | Passing / failing / pending / draft. Failing also shows a count of failed checks. |
+
+### Right — what it's costing you
+
+| Icon | Segment | What it tells you |
+|:---:|---|---|
+| <img src="docs/icons/tokens.png" height="18" alt=""> | **context tokens** | Current occupancy of the context window. |
+| `▰` `▱` | **context bar** | 10 cells → 5 cells → bare percentage as space runs out. Colored by zone: green, yellow at 65%, orange at 80%, red at 90%. |
+| — | **quota** | `5h` and `7d` levels. The number is the level; its *color* is the projection — where the window lands at your current pace. `op` appears for the Opus weekly cap once it passes 50%. |
+| <img src="docs/icons/reset.png" height="18" alt=""> | **reset** | Countdown to the next window reset. Always white: a reset is relief, not risk. |
+| <img src="docs/icons/clock.png" height="18" alt=""> | **duration** | Session wall-clock time. |
+| <img src="docs/icons/burn.png" height="18" alt=""> | **burn rate** | Tokens per minute. Shows `—/m` until it has two samples. |
+| <img src="docs/icons/battery.png" height="18" alt=""> | **quota ETA** | Time until the 5h window hits 100% at the current pace — the far-right field, and the one that answers "will I get cut off". Shows `—` when not yet computable. |
+| <img src="docs/icons/warn.png" height="18" alt=""> | **context warning** | `CTX HIGH` past 88%, `COMPACT NOW` past 94%. Non-droppable: it shrinks to the bare icon rather than disappearing. |
+
+### Color scale
+
+The same four colors mean the same thing everywhere: green fine, yellow worth knowing, orange act soon, red act now.
+
+| Field | Yellow | Orange | Red |
+|---|---|---|---|
+| context bar / % | 65% | 80% | 90% |
+| quota level (`5h`, `7d`) | — | 80% | 90% |
+| quota projection (drives `5h` color) | 105% | 140% | 200% |
+| quota ETA | under 3h | under 1h | under 15m |
 
 ## Environment variables
 
