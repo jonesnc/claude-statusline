@@ -8,20 +8,24 @@ One line, right-sized to your terminal: model, path, git branch + dirty counts, 
 
 ## Requirements
 
-| Thing | Why | Notes |
-|---|---|---|
-| [Odin compiler](https://odin-lang.org/docs/install/) | builds the binary | source install only; `odin` must be on `PATH`, and there is no system-wide install on the ITADM box |
-| Linux with `/dev/shm` | cache files | macOS/BSD are not supported |
-| `git` | branch + status | invoked directly, no shell |
-| A Nerd Font + truecolor terminal | icons and Dracula colors | e.g. Ghostty, kitty, WezTerm |
-| `gh` (optional) | PR number, review state, CI status | segment is skipped if missing |
-| `curl` (optional) | Opus weekly quota window | other quota figures come from Claude Code's own JSON |
+Not everything below applies to both install options. **Option A needs no toolchain — no Odin, no `make`, no compiler** — only the rows marked "both", plus its own runtime floor.
+
+| Thing | Needed for | Why | Notes |
+|---|---|---|---|
+| Linux with `/dev/shm` | both | cache files | macOS/BSD are not supported |
+| A Nerd Font + truecolor terminal | both | icons and Dracula colors | e.g. Ghostty, kitty, WezTerm |
+| `git` | both | branch + status | invoked directly, no shell; outside a repo those segments are just absent |
+| `gh` | both, optional | PR number, review state, CI status | segment is skipped if missing |
+| `curl` | both, optional | Opus weekly quota window | other quota figures come from Claude Code's own JSON |
+| glibc 2.35+, AVX-512 CPU | **Option A only** | running the prebuilt binary | it is built `-microarch:native` on the ITADM box; an older glibc or a CPU without AVX-512 needs Option B |
+| [Odin compiler](https://odin-lang.org/docs/install/) | **Option B only** | builds the binary | `odin` must be on `PATH`; there is no system-wide install on the ITADM box, so you install it yourself |
+| `make` | **Option B only** | drives the build and install | plus a working `~/.claude` directory to install into |
 
 ## Install
 
 Everyone runs their own copy — install it per developer, not once for the box, so you're free to modify your own. Pick whichever option fits; both end up at `~/.claude/statusline`, so the settings block below is identical either way and you can switch later.
 
-### Option A — prebuilt binary (no toolchain)
+### Option A — prebuilt binary (no toolchain, nothing to build)
 
 ```sh
 curl -L -o ~/.claude/statusline https://github.com/jonesnc/claude-statusline/releases/latest/download/statusline-linux-x86_64
