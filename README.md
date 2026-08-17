@@ -159,7 +159,7 @@ Identity sits flush left, budget flush right, whitespace between them. Each icon
 | <img src="docs/icons/modified.png" height="18" alt=""> | **modified** | Orange. |
 | <img src="docs/icons/untracked.png" height="18" alt=""> | **untracked** | Cyan. |
 | <img src="docs/icons/stash.png" height="18" alt=""> | **stashes** | Purple. |
-| `#257` | **PR** | The number is an OSC8 hyperlink to the PR, costing zero cells. Background carries *review* state: green approved, orange review-required, dark undecided. |
+| `#257` | **PR** | The PR number for the current branch. Background carries *review* state: green approved, orange review-required, dark undecided. Not a link — Claude Code's own bottom line already gives you one. |
 | <img src="docs/icons/staged.png" height="18" alt=""> `✗` `●` `⊘` | **CI** | Passing / failing / pending / draft. Failing also shows a count of failed checks. |
 
 ### Right — what it's costing you

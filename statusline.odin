@@ -2160,7 +2160,6 @@ PrCache :: struct #packed {
     _pad:                 u8,
     number:               i64,
     failed:               i64,
-    url:                  [128]u8,
 }
 
 PrStatus :: struct {
@@ -2169,7 +2168,6 @@ PrStatus :: struct {
     failed: i64,
     ci:     PrCi,
     review: PrReview,
-    url:    string,
 }
 
 get_pr_cache_path :: proc(path_buf: []u8, gitdir: string, branch: string) -> string {
@@ -2246,7 +2244,7 @@ fetch_pr_status_exit :: proc(
         posix.close(pipe_fds[1])
         argv := []cstring{
             "gh", "pr", "view", "--json",
-            "number,state,isDraft,statusCheckRollup,reviewDecision,url",
+            "number,state,isDraft,statusCheckRollup,reviewDecision",
             nil,
         }
         posix.execvp("gh", raw_data(argv))
@@ -2307,8 +2305,6 @@ fetch_pr_status_exit :: proc(
     cache.review = review
     cache.number = number
     cache.failed = failed
-    url := json_get_string(resp, "url")
-    copy(cache.url[:len(cache.url) - 1], url)
     write_pr_cache(gitdir, branch, cache)
     posix._exit(0)
 }
@@ -2324,7 +2320,6 @@ get_pr_status_cached :: proc(
     root: string,
     gitdir: string,
     branch: string,
-    url_buf: []u8,
 ) -> PrStatus {
     path_buf: [64]u8
     cache_path := get_pr_cache_path(path_buf[:], gitdir, branch)
@@ -2358,12 +2353,9 @@ get_pr_status_cached :: proc(
     }
 
     if !have || cache.has_pr == 0 do return {}
-    n := min(len(url_buf) - 1, len(cache.url))
-    copy(url_buf, cache.url[:n])
-    url := string(cstring(raw_data(url_buf)))
     return {
         valid = true, number = cache.number, failed = cache.failed,
-        ci = cache.ci, review = cache.review, url = url,
+        ci = cache.ci, review = cache.review,
     }
 }
 
@@ -3021,17 +3013,13 @@ build_line1 :: proc(l: ^SegList, state: ^DisplayState, gs: ^GitStatus, pr: ^PrSt
         case .REVIEW_REQUIRED: prbg = ANSI_BG_ORANGE; prfg = ANSI_FG_BLACK
         case .NONE:            prbg = ANSI_BG_DARK;   prfg = ANSI_FG_WHITE
         }
-        // OSC8 hyperlink around the PR number. Zero visible cells: verified
-        // that Bun.stringWidth({ambiguousIsNarrow:true}) — the exact call
-        // Claude Code measures with — counts OSC8 (BEL- or ST-terminated)
-        // as width 0 (Bun 1.3.14). display_width here skips OSC too.
-        num: string
-        if len(pr.url) > 0 {
-            num = fmt.tprintf("\x1b]8;;%s\x1b\\#%d\x1b]8;;\x1b\\",
-                pr.url, pr.number)
-        } else {
-            num = fmt.tprintf("#%d", pr.number)
-        }
+        // Plain number, no OSC8 hyperlink. The link wrapped this for free
+        // (zero cells -- Claude Code measures with Bun.stringWidth, which
+        // counts OSC8 as width 0), but free is not the same as useful: the
+        // link was not clickable where this actually runs, and Claude Code's
+        // own bottom line already carries a PR link. So it bought nothing and
+        // cost a URL through the fetch, the cache and the render.
+        num := fmt.tprintf("#%d", pr.number)
         add_seg(l, Seg{
             name = "pr", bg = prbg, fg = prfg,
             stages = {
@@ -3648,7 +3636,6 @@ demo_scenarios :: proc(now: i64) -> [5]DemoScenario {
     }
     base_pr := PrStatus{
         valid = true, number = 257, ci = .PASS, review = .REVIEW_REQUIRED,
-        url = "https://github.com/suu-itadm/portal/pull/257",
     }
 
     s := [5]DemoScenario{
@@ -3656,8 +3643,7 @@ demo_scenarios :: proc(now: i64) -> [5]DemoScenario {
         {"clean main checkout, no PR", base_state, base_gs, {}},
         {"CI failing, approved", base_state, base_gs,
             {valid = true, number = 9829, ci = .FAIL, failed = 2,
-             review = .APPROVED,
-             url = "https://github.com/suu-itadm/mysuu-portal/pull/9829"}},
+             review = .APPROVED}},
         {"context critical + quota over pace", base_state, base_gs, base_pr},
         {"no git repo, insert mode", base_state, {}, {}},
     }
@@ -3807,7 +3793,6 @@ main :: proc() {
     // resolved root, so every subdir of a repo shares one entry.
     gs: GitStatus
     pr: PrStatus
-    pr_url_buf: [128]u8
     git_bufs: GitPathsBuf
     branch_buf: [128]u8
     if len(state.cwd) > 0 {
@@ -3821,8 +3806,7 @@ main :: proc() {
                 gs.modified, gs.staged, gs.untracked,
                     gs.ahead, gs.behind, gs.cache_state =
                     get_git_status_cached(gp.root, gp.gitdir)
-                pr = get_pr_status_cached(
-                    gp.root, gp.gitdir, gs.branch, pr_url_buf[:])
+                pr = get_pr_status_cached(gp.root, gp.gitdir, gs.branch)
             }
         }
     }
