@@ -2170,6 +2170,16 @@ DebugTimings :: struct {
     t_build:   time.Tick,
 }
 
+// Snapshot of the width math from the most recent build, for the debug log --
+// see the SLACK/probe discussion in build_statusline_cols. Set once at the
+// end of that proc; read by write_debug_log. Not thread-relevant, this binary
+// is single-shot per invocation.
+BuildDebug :: struct {
+    cols, budget, w1, w2: int,
+    line:                 string, // full plain (ANSI-stripped) rendered line
+}
+last_build_debug: BuildDebug
+
 /* -------------------------------------------------------------------------- */
 /* Stdin Reader                                                               */
 /* -------------------------------------------------------------------------- */
@@ -2410,7 +2420,17 @@ is_wide_rune :: proc(r: rune) -> bool {
          0x1F300 ..= 0x1F64F, // Emoji (most render wide)
          0x1F900 ..= 0x1F9FF,
          0x20000 ..= 0x2FFFD, // CJK Ext B+
-         0x30000 ..= 0x3FFFD:
+         0x30000 ..= 0x3FFFD,
+         // Supplementary PUA-A: the "md-" Material Design Icons block three
+         // of our own glyphs live in (ICON_RESET F0450, ICON_QUOTA_ETA
+         // F0083, ICON_BRAIN F09D1) -- distinct from the BMP PUA block
+         // (0xE000-0xF8FF, all our OTHER icons) which really does render at
+         // 1 cell. The quota-cap ETA field, which uses ICON_QUOTA_ETA, was
+         // the one observed getting hard-truncated by Claude Code even when
+         // our own math said it fit -- consistent with CC rendering this
+         // specific block at 2 cells while we counted 1. Real width fix,
+         // not a margin: this replaces guessing SLACK bigger.
+         0xF0000 ..= 0xFFFFD:
         return true
     }
     return false
@@ -2467,6 +2487,48 @@ display_width :: proc(s: string) -> int {
         w += is_wide_rune(r) ? 2 : 1
     }
     return w
+}
+
+// Same escape-skipping as display_width, but returns the visible text instead
+// of a count -- for the debug-log probe, where a human needs to read the
+// glyphs, not just know how many cells they cost.
+strip_ansi :: proc(buf: []u8, s: string) -> string {
+    n := 0
+    i := 0
+    for i < len(s) {
+        c := s[i]
+        if c == 0x1b {
+            if i + 1 < len(s) && s[i + 1] == '[' {
+                j := i + 2
+                for j < len(s) && !(s[j] >= 0x40 && s[j] <= 0x7e) do j += 1
+                i = j < len(s) ? j + 1 : len(s)
+                continue
+            }
+            if i + 1 < len(s) && s[i + 1] == ']' {
+                j := i + 2
+                for j < len(s) {
+                    if s[j] == 0x07 { j += 1; break }
+                    if s[j] == 0x1b && j + 1 < len(s) && s[j + 1] == '\\' {
+                        j += 2
+                        break
+                    }
+                    j += 1
+                }
+                i = j
+                continue
+            }
+            i += 1
+            continue
+        }
+        r, size := utf8.decode_rune_in_string(s[i:])
+        if size <= 0 do size = 1
+        if n + size <= len(buf) {
+            copy(buf[n:], s[i:i + size])
+            n += size
+        }
+        i += size
+    }
+    return string(buf[:n])
 }
 
 // ---- segment table
@@ -3089,13 +3151,18 @@ build_statusline_cols :: proc(
     // Claude Code truncates the RIGHT edge, which is exactly where quota and
     // context live. Left-aligned the same error is invisible.
     CAP_W :: 1
-    // Claude Code truncates a few cells before COLUMNS -- it reserves edge
-    // columns that v2.1.170 did not (that era's note in this repo says zero).
-    // Deduced, not guessed: 13 Ambiguous glyphs are on a typical line, so if CC
-    // were miscounting them as 2 cells the overflow would be ~12 and most of the
-    // right end would vanish. Observed loss is 1-3 cells, i.e. a small constant.
-    // The gap absorbs this for free at any realistic width.
-    SLACK :: 3
+    // The real cause of the earlier cutoff was found and fixed at the
+    // source: ICON_QUOTA_ETA/ICON_RESET/ICON_BRAIN live in Supplementary
+    // PUA-A (see is_wide_rune) and Claude Code renders that block at 2
+    // cells; we were counting 1. is_wide_rune now counts them correctly, so
+    // measure_line's width should match what CC actually draws instead of
+    // needing a blind margin to cover the gap. SLACK stays only as a true
+    // safety net for whatever CC quirk we haven't found yet -- 1 is the
+    // floor (a bare cap cell of rounding), not a re-guessed cover for this
+    // specific bug. If a probe log (STATUSLINE_DEBUG=1) ever shows a real
+    // cutoff again with this at 1, that means another glyph is misclassified
+    // -- fix is_wide_rune for it, don't just raise this number again.
+    SLACK :: 1
     budget := cols - CAP_W - SLACK
     if budget < 20 do budget = 20
 
@@ -3120,6 +3187,21 @@ build_statusline_cols :: proc(
         break
     }
     render_line(buf, &l2, false)
+
+    // Snapshot for the debug-log probe (see write_debug_log): what we
+    // measured vs. what actually printed, so a real cutoff can be diagnosed
+    // from the log instead of guessed at from a screenshot.
+    plain_buf: [2048]u8
+    last_build_debug = BuildDebug{
+        cols   = cols,
+        budget = budget,
+        w1     = w1,
+        w2     = w2,
+        line   = strings.clone(
+            strip_ansi(plain_buf[:], string(buf.data[:buf.len])),
+            context.temp_allocator,
+        ),
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -3229,6 +3311,27 @@ write_debug_log :: proc(
             raw_data(debug_buf[:]),
             uint(len(debug_str)),
         )
+
+        // Probe: the plain rendered line plus a ruler under it, so a real
+        // cutoff can be pinpointed by cell number instead of guessed at from
+        // a screenshot. `tail -f` this file live, compare against what
+        // Claude Code actually rendered, and read off where they diverge.
+        d := &last_build_debug
+        probe_buf: [2560]u8
+        ruler_buf: [512]u8
+        ruler_n := 0
+        for i in 0 ..< min(d.cols, len(ruler_buf)) {
+            ruler_buf[i] = i % 10 == 0 ? '0' + u8((i / 10) % 10) : '.'
+            ruler_n += 1
+        }
+        probe_str := fmt.bprintf(
+            probe_buf[:],
+            "probe: cols=%d budget=%d w1=%d w2=%d gap=%d\n  %s\n  %s\n",
+            d.cols, d.budget, d.w1, d.w2, d.budget - d.w1 - d.w2,
+            d.line,
+            string(ruler_buf[:ruler_n]),
+        )
+        posix.write(log_fd, raw_data(probe_buf[:]), uint(len(probe_str)))
         posix.close(log_fd)
     }
 }
