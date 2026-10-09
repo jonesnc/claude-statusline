@@ -16,6 +16,7 @@
 package main
 
 import "core:fmt"
+import "core:math"
 import "core:os"
 import "core:strconv"
 import "core:strings"
@@ -874,11 +875,37 @@ abbreviate_model :: proc(abbrev_buf: []u8, model: string) -> string {
 /* Context Bar (Compact block style)                                          */
 /* -------------------------------------------------------------------------- */
 
-// DO NOT change these to block characters (\u2588 / \u2591 / \u2593). Tried on 2026-08-03 and
-// rejected outright: "NO NO NO never use bars, keep the boxes". The boxes are
-// the intended look for this bar.
-FILLED_BLOCK :: "\u25b0"  // filled rectangle
-EMPTY_BLOCK :: "\u25b1"  // empty (outlined) rectangle
+// Nerd Font v3 progress glyphs (Fira Code U+EE00-EE05): a rounded pill,
+// start/middle/end cells each in an outlined (empty) and solid (filled) form.
+// Every cell -- filled or outlined -- takes the gradient colour of its
+// position, so the empty outline previews the ramp. Chosen 2026-10-09 from a
+// demo; full-strength colours also survive Ghostty's minimum-contrast, which
+// had washed the earlier dim braille track to uniform gray. No partial
+// glyphs exist, so the fill moves in whole cells.
+FIRA_EMPTY := [3]string{"\uee00", "\uee01", "\uee02"}
+FIRA_FULL := [3]string{"\uee03", "\uee04", "\uee05"}
+
+RGB :: [3]f64
+mix_rgb :: proc(a, b: RGB, t: f64) -> RGB {
+    return a + (b - a) * t
+}
+
+// Green -> yellow -> red across the bar, t in [0, 1]. The sqrt front-loads
+// the ramp: real sessions rarely pass ~40% of a 1M window, so a linear ramp
+// left the bar green almost always. Now 5% is already tinting, 25% is yellow.
+heat_rgb :: proc(x: f64) -> RGB {
+    GREEN :: RGB{80, 220, 120}
+    YELLOW :: RGB{240, 210, 80}
+    RED :: RGB{250, 90, 80}
+    t := math.sqrt(clamp(x, 0, 1))
+    if t < 0.5 do return mix_rgb(GREEN, YELLOW, t * 2)
+    return mix_rgb(YELLOW, RED, (t - 0.5) * 2)
+}
+
+put_rgb :: proc(buf: []u8, layer: int, c: RGB) -> int {
+    s := fmt.bprintf(buf, "\x1b[%d;2;%d;%d;%dm", layer, int(c[0]), int(c[1]), int(c[2]))
+    return len(s)
+}
 
 // Color for the percentage label (matches leading edge).
 //
@@ -901,7 +928,6 @@ make_context_bar :: proc(
 ) -> string {
     clamped := min(pct, 100)
     WIDTH := width
-    // Number of filled cells (rounded)
     filled := int((clamped * i64(WIDTH) + 50) / 100)
 
     pos := 0
@@ -920,22 +946,13 @@ make_context_bar :: proc(
         pos += len(s)
     }
 
-    // Bar: WIDTH cells of filled / empty rectangles with color zones
+    // Bar: colour keyed on the cell's centre so 5- and 10-wide bars share
+    // one gradient.
     for cell in 0 ..< WIDTH {
-        if cell < filled {
-            // Color by the percentage this cell represents so 5- and
-            // 10-wide bars share one gradient.
-            color := pct_label_color(i64(cell * 100 / WIDTH + 5))
-            copy(bar_buf[pos:], color)
-            pos += len(color)
-            copy(bar_buf[pos:], FILLED_BLOCK)
-            pos += len(FILLED_BLOCK)
-        } else {
-            copy(bar_buf[pos:], ANSI_FG_WHITE)
-            pos += len(ANSI_FG_WHITE)
-            copy(bar_buf[pos:], EMPTY_BLOCK)
-            pos += len(EMPTY_BLOCK)
-        }
+        part := cell == 0 ? 0 : cell == WIDTH - 1 ? 2 : 1
+        pos += put_rgb(bar_buf[pos:], 38, heat_rgb((f64(cell) + 0.5) / f64(WIDTH)))
+        glyph := cell < filled ? FIRA_FULL[part] : FIRA_EMPTY[part]
+        pos += copy(bar_buf[pos:], glyph)
     }
 
     // Percentage label
@@ -2852,8 +2869,8 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
     // runs right-to-left visually from the screen edge -- emitting ctx
     // first puts it at the group's far LEFT, furthest from the edge.
     // Context bar: 10-cell -> 5-cell -> bare percentage
-    bar10_buf: [512]u8
-    bar5_buf: [512]u8
+    bar10_buf: [1024]u8
+    bar5_buf: [1024]u8
     bar10 := make_context_bar(bar10_buf[:], state.used_pct, state.input_tokens, 10)
     bar5 := make_context_bar(bar5_buf[:], state.used_pct, state.input_tokens, 5)
     add_seg(l, Seg{
