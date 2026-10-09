@@ -89,6 +89,29 @@ ICON_RESET     :: "\U000F0450"   //  circular arrow — window resets
 // height-bound: it renders large and it responds to adjust-icon-height. The
 // metaphor -- charge running out -- also fits a depleting quota.
 ICON_QUOTA_ETA :: "\U000F0083"  // md-battery-alert
+
+// md-circle-slice-1..8: a pie filled in eighths, for a percentage in one cell.
+pie_icon :: proc(pct: i64) -> string {
+    SLICES :: [8]string{
+        "\U000F0A9E", "\U000F0A9F", "\U000F0AA0", "\U000F0AA1",
+        "\U000F0AA2", "\U000F0AA3", "\U000F0AA4", "\U000F0AA5",
+    }
+    s := SLICES
+    return s[clamp((pct * 8 + 99) / 100, 1, 8) - 1]
+}
+
+// md-battery-10..90 / md-battery for the share of the 5h quota left; the
+// same tall narrow family as ICON_QUOTA_ETA, which stays for under 10%.
+battery_icon :: proc(left_pct: i64) -> string {
+    LEVELS :: [9]string{
+        "\U000F007A", "\U000F007B", "\U000F007C", "\U000F007D", "\U000F007E",
+        "\U000F007F", "\U000F0080", "\U000F0081", "\U000F0082",
+    }
+    if left_pct < 10 do return ICON_QUOTA_ETA
+    if left_pct >= 95 do return "\U000F0079"
+    l := LEVELS
+    return l[min((left_pct + 5) / 10, 9) - 1]
+}
 ICON_BRAIN     :: "\U000F09D1"   // md-brain (extended thinking on)
 ICON_TOKENS    :: "\uF1C0"   //  database — context window occupancy
 ICON_BURN      :: "\uF06D"   //  flame — token burn rate
@@ -2879,8 +2902,8 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
             strings.clone(bar10, context.temp_allocator),
             strings.clone(bar5, context.temp_allocator),
             // Unpadded, same reasoning as the token count above.
-            fmt.tprintf("%s%d%%", pct_label_color(min(state.used_pct, 100)),
-                min(state.used_pct, 100)),
+            fmt.tprintf("%s%s%d%%", pct_label_color(min(state.used_pct, 100)),
+                pie_icon(min(state.used_pct, 100)), min(state.used_pct, 100)),
         },
         n_stages = 3, priority = 100, droppable = false,
     })
@@ -2920,13 +2943,13 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
         add_seg(l, Seg{
             name = "quota", bg = ANSI_BG_COMMENT, fg = "",
             stages = {
-                fmt.tprintf("%s5h %s%s%d%% %s7d %s%s%d%%",
-                    ANSI_FG_WHITE, ANSI_BOLD, c5, five,
+                fmt.tprintf("%s5h %s%s%s%d%% %s7d %s%s%s%d%%",
+                    ANSI_FG_WHITE, ANSI_BOLD, c5, pie_icon(five), five,
 
-                    ANSI_FG_WHITE, ANSI_BOLD, c7, seven),
+                    ANSI_FG_WHITE, ANSI_BOLD, c7, pie_icon(seven), seven),
                 // Shrink: drop 7d, keep 5h (the window you can actually hit).
-                fmt.tprintf("%s5h %s%s%d%%", ANSI_FG_WHITE, ANSI_BOLD, c5,
-                    five),
+                fmt.tprintf("%s5h %s%s%s%d%%", ANSI_FG_WHITE, ANSI_BOLD, c5,
+                    pie_icon(five), five),
                 "",
             },
             n_stages = 2, priority = 90, droppable = false,
@@ -3042,11 +3065,11 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
             // Normal weight. Bold made this field shout even while white and
             // far from the cap; the colour ramp alone carries the urgency.
             eta_txt = fmt.tprintf("%s%s%s", eta_color(eta_secs),
-                ICON_QUOTA_ETA,
+                battery_icon(100 - i64(state.five_hour_pct + 0.5)),
                 strings.clone(e, context.temp_allocator))
         } else {
             eta_txt = fmt.tprintf("%s%s%s\u2014", ANSI_FG_WHITE,
-                ICON_QUOTA_ETA, ANSI_FG_COMMENT)
+                battery_icon(100 - i64(state.five_hour_pct + 0.5)), ANSI_FG_COMMENT)
         }
         add_seg(l, seg1("eta", ANSI_BG_DARK, "", eta_txt, 44))
     }
