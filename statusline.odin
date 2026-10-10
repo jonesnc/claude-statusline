@@ -3216,6 +3216,30 @@ build_statusline_cols :: proc(
     w1 := measure_line(&l1)
     w2 := measure_line(&l2, false)
     gap := budget - w1 - w2
+
+    // Grow the context bar into spare room. The fitter only ever shrinks, so a
+    // wide terminal used to show the same 10 cells as a narrow one beside a
+    // vast gap. Half the spare gap goes to the bar, so the two groups never
+    // touch, and the bar stops at BAR_MAX_W where more cells add no precision.
+    BAR_MIN_W :: 10
+    BAR_MAX_W :: 40
+    MIN_GAP   :: 4
+    if gap > MIN_GAP {
+        for i in 0 ..< l2.n {
+            s := &l2.segs[i]
+            if s.name != "ctx" || s.dropped || s.stage != 0 do continue
+            extra := min((gap - MIN_GAP) / 2, BAR_MAX_W - BAR_MIN_W)
+            if extra > 0 {
+                wide_buf: [4096]u8
+                wide := make_context_bar(wide_buf[:], state.used_pct,
+                    state.input_tokens, BAR_MIN_W + extra)
+                s.stages[0] = strings.clone(wide, context.temp_allocator)
+                w2 = measure_line(&l2, false)
+                gap = budget - w1 - w2
+            }
+            break
+        }
+    }
     if gap < 1 do gap = 1
 
     render_line(buf, &l1)
