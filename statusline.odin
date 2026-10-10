@@ -2446,6 +2446,11 @@ must be verified with --demo, which drives this exact code path.
 // future 2-cell glyph doesn't silently break the width math.
 is_wide_rune :: proc(r: rune) -> bool {
     switch r {
+    // md-circle-slice-1..8 (pie_icon) sit inside Supplementary PUA-A but
+    // Claude Code draws them at 1 cell: counting them as 2 left a blank
+    // cell per pie at the right edge. Must precede the PUA-A range below.
+    case 0xF0A9E ..= 0xF0AA5:
+        return false
     case 0x1100 ..= 0x115F,   // Hangul Jamo
          0x2E80 ..= 0x303E,   // CJK Radicals .. CJK Symbols
          0x3041 ..= 0x33FF,   // Hiragana .. CJK Compat
