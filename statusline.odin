@@ -286,7 +286,6 @@ JsonFields :: struct {
     pr_review_state:       string,
     effort_level:          string,
     fast_mode:             bool,
-    session_name:          string,
 }
 
 // Skip spaces/tabs, then return the `{...}` object at pos (empty if null).
@@ -606,12 +605,6 @@ json_parse_all :: proc(json: string) -> JsonFields {
                     fields.pr_number = obj_i64(obj, "\"number\":")
                     fields.pr_review_state = obj_str(obj, "\"review_state\":")
                 }
-                continue
-            }
-        case 's':
-            if klen = try_key(json, i, "\"session_name\":"); klen > 0 {
-                i += klen
-                fields.session_name = json_parse_string_at(json, &i)
                 continue
             }
         case 'f':
@@ -2291,7 +2284,6 @@ DisplayState :: struct {
     pr_review_state:    string,
     effort_level:       string,
     fast_mode:          bool,
-    session_name:       string,
 }
 
 DebugTimings :: struct {
@@ -2376,7 +2368,6 @@ resolve_state :: proc(
         state.pr_review_state  = f.pr_review_state
         state.effort_level     = f.effort_level
         state.fast_mode        = f.fast_mode
-        state.session_name     = f.session_name
 
         // Quota from stdin JSON (per-render fresh) — primary source; the
         // background OAuth fetch cache is only a fallback (see main).
@@ -2995,21 +2986,6 @@ build_line1 :: proc(l: ^SegList, state: ^DisplayState, gs: ^GitStatus) {
             joined := strings.join(bits[:], " ", context.temp_allocator)
             add_seg(l, seg1("gitstat", ANSI_BG_DARK, "", joined, 45))
         }
-    }
-
-    // Session name from /rename. First to drop: it is a label, not state.
-    if len(state.session_name) > 0 {
-        n := state.session_name
-        add_seg(l, Seg{
-            name = "session", bg = ANSI_BG_DARK, fg = ANSI_FG_PINK,
-            stages = {
-                n,
-                trunc_runes(n, 12) != n \
-                    ? fmt.tprintf("%s…", trunc_runes(n, 12)) : n,
-                "",
-            },
-            n_stages = 2, priority = 30,
-        })
     }
 
     // Open PR for this branch (stdin `pr`), coloured by review state.
