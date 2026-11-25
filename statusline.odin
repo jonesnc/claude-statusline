@@ -113,6 +113,9 @@ battery_icon :: proc(left_pct: i64) -> string {
     return l[min((left_pct + 5) / 10, 9) - 1]
 }
 ICON_BRAIN     :: "\U000F09D1"   // md-brain (extended thinking on)
+ICON_FAST      :: "\uF0E7"       // fa-bolt (fast mode)
+ICON_PR        :: "\uF407"       // oct-git-pull-request
+ICON_CACHE     :: "\uF2DC"       // fa-snowflake (prompt cache)
 ICON_TOKENS    :: "\uF1C0"   //  database — context window occupancy
 ICON_BURN      :: "\uF06D"   //  flame — token burn rate
 
@@ -275,6 +278,48 @@ JsonFields :: struct {
     rl_five_hour_reset:    i64,
     rl_seven_day_pct:      f64,
     rl_seven_day_reset:    i64,
+    // v2.1.251+ prompt_cache, PR, effort, fast mode (all may be absent)
+    cache_seen:            bool,
+    cache_warm:            bool,
+    cache_expires_at:      i64,
+    pr_number:             i64,
+    pr_review_state:       string,
+    effort_level:          string,
+    fast_mode:             bool,
+    session_name:          string,
+}
+
+// Skip spaces/tabs, then return the `{...}` object at pos (empty if null).
+// Advances pos past it.
+scoped_object :: proc(json: string, pos: ^int) -> string {
+    i := pos^
+    for i < len(json) && (json[i] == ' ' || json[i] == '\t') do i += 1
+    pos^ = i
+    if i >= len(json) || json[i] != '{' do return ""
+    end := json_object_end(json, i)
+    pos^ = end
+    return json[i:end]
+}
+
+// Value after `key` inside a scoped object, as a bool literal / i64 / string.
+obj_bool :: proc(obj, key: string) -> bool {
+    k := strings.index(obj, key)
+    if k < 0 do return false
+    j := k + len(key)
+    for j < len(obj) && (obj[j] == ' ' || obj[j] == '\t') do j += 1
+    return j < len(obj) && obj[j] == 't'
+}
+obj_i64 :: proc(obj, key: string) -> i64 {
+    k := strings.index(obj, key)
+    if k < 0 do return 0
+    j := k + len(key)
+    return json_parse_i64_at(obj, &j)
+}
+obj_str :: proc(obj, key: string) -> string {
+    k := strings.index(obj, key)
+    if k < 0 do return ""
+    j := k + len(key)
+    return json_parse_string_at(obj, &j)
 }
 
 // Parse a string value at cursor (past ':'). Returns
@@ -545,7 +590,47 @@ json_parse_all :: proc(json: string) -> JsonFields {
                 }
                 continue
             }
+        case 'p':
+            if klen = try_key(json, i, "\"prompt_cache\":"); klen > 0 {
+                i += klen
+                if obj := scoped_object(json, &i); len(obj) > 0 {
+                    fields.cache_seen = true
+                    fields.cache_warm = obj_bool(obj, "\"warm\":")
+                    fields.cache_expires_at = obj_i64(obj, "\"expires_at\":")
+                }
+                continue
+            }
+            if klen = try_key(json, i, "\"pr\":"); klen > 0 {
+                i += klen
+                if obj := scoped_object(json, &i); len(obj) > 0 {
+                    fields.pr_number = obj_i64(obj, "\"number\":")
+                    fields.pr_review_state = obj_str(obj, "\"review_state\":")
+                }
+                continue
+            }
+        case 's':
+            if klen = try_key(json, i, "\"session_name\":"); klen > 0 {
+                i += klen
+                fields.session_name = json_parse_string_at(json, &i)
+                continue
+            }
+        case 'f':
+            if klen = try_key(json, i, "\"fast_mode\":"); klen > 0 {
+                i += klen
+                j := i
+                for j < len(json) && (json[j] == ' ' || json[j] == '\t') do j += 1
+                fields.fast_mode = j < len(json) && json[j] == 't'
+                i = j
+                continue
+            }
         case 'e':
+            if klen = try_key(json, i, "\"effort\":"); klen > 0 {
+                i += klen
+                if obj := scoped_object(json, &i); len(obj) > 0 {
+                    fields.effort_level = obj_str(obj, "\"level\":")
+                }
+                continue
+            }
             if klen = try_key(json, i, "\"exceeds_200k_tokens\":"); klen > 0 {
                 i += klen
                 // value is a bare literal: skip space, check for 't'
@@ -2199,6 +2284,14 @@ DisplayState :: struct {
     exceeds_200k:       bool,
     vim_mode:           string,
     thinking_enabled:   bool,
+    cache_seen:         bool,
+    cache_warm:         bool,
+    cache_expires_at:   i64,
+    pr_number:          i64,
+    pr_review_state:    string,
+    effort_level:       string,
+    fast_mode:          bool,
+    session_name:       string,
 }
 
 DebugTimings :: struct {
@@ -2227,21 +2320,28 @@ last_build_debug: BuildDebug
 STDIN_TIMEOUT_MS :: 50
 
 read_stdin :: proc() -> (string, bool) {
-    @(static) input_buf: [8192]u8
+    @(static) input_buf: [32768]u8
 
     pfds := [1]posix.pollfd{
         {fd = 0, events = {.IN}},
     }
     if posix.poll(raw_data(&pfds), 1, STDIN_TIMEOUT_MS) >
         0 {
-        // Single read - JSON is <4KB, arrives atomically
-        n := posix.read(
-            0,
-            raw_data(&input_buf),
-            len(input_buf) - 1,
-        )
-        if n <= 0 do return "", true
-        return string(input_buf[:n]), false
+        // Read to EOF: with prompt_cache the JSON can pass PIPE_BUF (4KB)
+        // and arrive in several chunks.
+        total := 0
+        for total < len(input_buf) - 1 {
+            n := posix.read(
+                0,
+                raw_data(input_buf[total:]),
+                uint(len(input_buf) - 1 - total),
+            )
+            if n <= 0 do break
+            total += int(n)
+            if posix.poll(raw_data(&pfds), 1, STDIN_TIMEOUT_MS) <= 0 do break
+        }
+        if total == 0 do return "", true
+        return string(input_buf[:total]), false
     }
     return "", true
 }
@@ -2269,6 +2369,14 @@ resolve_state :: proc(
         json_in_tok        := f.total_input_tokens
         state.vim_mode      = f.mode
         state.thinking_enabled = f.thinking_enabled
+        state.cache_seen       = f.cache_seen
+        state.cache_warm       = f.cache_warm
+        state.cache_expires_at = f.cache_expires_at
+        state.pr_number        = f.pr_number
+        state.pr_review_state  = f.pr_review_state
+        state.effort_level     = f.effort_level
+        state.fast_mode        = f.fast_mode
+        state.session_name     = f.session_name
 
         // Quota from stdin JSON (per-render fresh) — primary source; the
         // background OAuth fetch cache is only a fallback (see main).
@@ -2592,7 +2700,7 @@ Seg :: struct {
 }
 
 SegList :: struct {
-    segs: [12]Seg,
+    segs: [16]Seg,
     n:    int,
 }
 
@@ -2773,6 +2881,17 @@ build_line1 :: proc(l: ^SegList, state: ^DisplayState, gs: ^GitStatus) {
     short := strings.clone(
         abbreviate_model(short_buf[:], state.model), context.temp_allocator)
     brain := state.thinking_enabled ? fmt.tprintf(" %s", ICON_BRAIN) : ""
+    // Effort as one letter (l/m/h/x/M), fast mode as a bolt.
+    eff := ""
+    switch state.effort_level {
+    case "low":    eff = "l"
+    case "medium": eff = "m"
+    case "high":   eff = "h"
+    case "xhigh":  eff = "x"
+    case "max":    eff = "M"
+    }
+    if len(eff) > 0 do short = fmt.tprintf("%s·%s", short, eff)
+    if state.fast_mode do short = fmt.tprintf("%s %s", short, ICON_FAST)
     add_seg(l, Seg{
         name = "model", bg = ANSI_BG_PURPLE, fg = ANSI_FG_BLACK,
         stages = {
@@ -2876,6 +2995,34 @@ build_line1 :: proc(l: ^SegList, state: ^DisplayState, gs: ^GitStatus) {
             joined := strings.join(bits[:], " ", context.temp_allocator)
             add_seg(l, seg1("gitstat", ANSI_BG_DARK, "", joined, 45))
         }
+    }
+
+    // Session name from /rename. First to drop: it is a label, not state.
+    if len(state.session_name) > 0 {
+        n := state.session_name
+        add_seg(l, Seg{
+            name = "session", bg = ANSI_BG_DARK, fg = ANSI_FG_PINK,
+            stages = {
+                n,
+                trunc_runes(n, 12) != n \
+                    ? fmt.tprintf("%s…", trunc_runes(n, 12)) : n,
+                "",
+            },
+            n_stages = 2, priority = 30,
+        })
+    }
+
+    // Open PR for this branch (stdin `pr`), coloured by review state.
+    if state.pr_number > 0 {
+        bg := ANSI_BG_COMMENT
+        switch state.pr_review_state {
+        case "approved":          bg = ANSI_BG_GREEN
+        case "changes_requested": bg = ANSI_BG_RED
+        case "pending":           bg = ANSI_BG_YELLOW
+        }
+        fg := bg == ANSI_BG_COMMENT ? ANSI_FG_WHITE : ANSI_FG_BLACK
+        add_seg(l, seg1("pr", bg, fg,
+            fmt.tprintf("%s %d", ICON_PR, state.pr_number), 50))
     }
 
 }
@@ -3022,6 +3169,23 @@ build_line2 :: proc(l: ^SegList, state: ^DisplayState) {
                     strings.clone(cd, context.temp_allocator)),
                 40))
         }
+    }
+
+    // Prompt cache: countdown to expiry while warm, dim snowflake when cold.
+    if state.cache_seen {
+        now := current_time_sec()
+        txt: string
+        if state.cache_warm && state.cache_expires_at > now {
+            left := state.cache_expires_at - now
+            cd_buf: [16]u8
+            cd := format_countdown(cd_buf[:], left)
+            col := left < 60 ? ANSI_FG_ORANGE : ANSI_FG_CYAN
+            txt = fmt.tprintf("%s%s%s", col, ICON_CACHE,
+                strings.clone(cd, context.temp_allocator))
+        } else {
+            txt = fmt.tprintf("%s%s cold", ANSI_FG_COMMENT, ICON_CACHE)
+        }
+        add_seg(l, seg1("cache", ANSI_BG_DARK, "", txt, 42))
     }
 
     if state.total_duration_ms > 0 {
