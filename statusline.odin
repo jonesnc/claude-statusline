@@ -1952,7 +1952,10 @@ get_git_status_cached :: proc(
     case .VALID:
         return cache.modified, cache.staged, cache.untracked,
             cache.ahead, cache.behind, .VALID
-    case .STALE:
+    case .STALE, .NONE:
+        // A miss also refreshes in the background instead of blocking ~5ms
+        // on git: the counters stay blank for one render (the branch name is
+        // read directly), and the next render picks up the fresh cache.
         bg_pid := posix.fork()
         if bg_pid == 0 {
             if posix.fork() == 0 {
@@ -1965,20 +1968,7 @@ get_git_status_cached :: proc(
             posix.waitpid(bg_pid, nil, {})
         }
         return cache.modified, cache.staged, cache.untracked,
-            cache.ahead, cache.behind, .STALE
-    case .NONE:
-        modified, staged, untracked, ahead, behind =
-            run_git_status(repo_path)
-        write_git_cache(
-            repo_path,
-            gitdir,
-            modified,
-            staged,
-            untracked,
-            ahead,
-            behind,
-        )
-        return modified, staged, untracked, ahead, behind, .NONE
+            cache.ahead, cache.behind, cache_state
     }
 
     return 0, 0, 0, 0, 0, .NONE
